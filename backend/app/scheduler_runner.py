@@ -27,21 +27,24 @@ def run_due_schedules(current: datetime | None = None) -> int:
             )
         )
         for schedule in schedules:
+            config = db.get(StrategyConfig, schedule.strategy_config_id)
+            if not config or not config.enabled:
+                continue
             decision = evaluate_schedule(
                 trigger_type=schedule.trigger_type,
                 run_time=schedule.run_time,
                 enabled=schedule.enabled,
                 last_scheduled_for=schedule.last_scheduled_for,
                 current=current,
-                trading_day_fn=calendar.is_trading_day,
+                trading_day_fn=lambda day: calendar.is_trading_day(
+                    day,
+                    allow_weekday_fallback=config.mode != "LIVE",
+                ),
             )
             if not decision.should_run:
                 continue
             schedule.last_scheduled_for = decision.window_key
             db.commit()
-            config = db.get(StrategyConfig, schedule.strategy_config_id)
-            if not config or not config.enabled:
-                continue
             run = (
                 execute_simulation_exit(db, config)
                 if schedule.trigger_type == "exit_evaluation"

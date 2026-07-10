@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .market_data import MarketDataError, ProviderRouter
+from .market_data import ProviderRouter
 from .market_cache import bar_cache_coverage, merge_bar_rows, read_bar_cache, write_bar_cache
 
 
@@ -35,11 +34,20 @@ def _hour_windows(entry_date: str, exit_date: str) -> CoverageWindows:
     )
 
 
-def _select_bar(rows: list[dict[str, Any]], *, start: str, end: str) -> dict[str, Any]:
-    for row in sorted(rows, key=lambda item: str(item.get("timestamp", ""))):
-        timestamp = str(row.get("timestamp", ""))
-        if start <= timestamp <= end:
-            return row
+def _select_bar(
+    rows: list[dict[str, Any]],
+    *,
+    start: str,
+    end: str,
+    selection: str = "first",
+) -> dict[str, Any]:
+    matches = [
+        row
+        for row in sorted(rows, key=lambda item: str(item.get("timestamp", "")))
+        if start <= str(row.get("timestamp", "")) <= end
+    ]
+    if matches:
+        return matches[-1] if selection == "last" else matches[0]
     raise ValueError(f"分钟线覆盖不足: {start} - {end}")
 
 
@@ -181,7 +189,12 @@ def run_recent_overnight_backtest(
                 primary_error = error
             last_error = error
             continue
-        entry_bar = _select_bar(rows, start=windows.entry_start, end=windows.entry_end)
+        entry_bar = _select_bar(
+            rows,
+            start=windows.entry_start,
+            end=windows.entry_end,
+            selection="last" if timeframe == "60m" else "first",
+        )
         exit_bar = _select_bar(rows, start=windows.exit_start, end=windows.exit_end)
         entry_price = float(entry_bar["close"])
         quantity = int(initial_cash // entry_price // 100) * 100
@@ -203,6 +216,8 @@ def run_recent_overnight_backtest(
             coverage=coverage,
             timeframe_used=timeframe,
         )
+    if preferred_timeframe == "1m" and primary_error and last_error is not primary_error:
+        raise ValueError(f"1m 不可用: {primary_error}; 60m 也不可用: {last_error}")
     if primary_error:
         raise ValueError(str(primary_error))
     if last_error:

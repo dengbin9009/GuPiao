@@ -266,7 +266,7 @@ class TushareProvider(MarketDataProvider):
 
 class MootdxProvider(MarketDataProvider):
     name = "mootdx"
-    capabilities = frozenset({"minute", "hour", "trading_calendar"})
+    capabilities = frozenset({"minute", "hour"})
 
     def __init__(self):
         try:

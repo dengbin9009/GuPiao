@@ -100,6 +100,9 @@ def main() -> None:
         services.build_broker_adapter = lambda *args, **kwargs: HealthyGatewayAdapter()
         try:
             stock = db.scalar(select(services.Stock).where(services.Stock.symbol == "000001.SZ"))
+            for candidate in db.scalars(select(services.Stock)).all():
+                candidate.change_pct = 4.9 if candidate.id == stock.id else 0.2
+                candidate.turnover_amount = 900_000_000 if candidate.id == stock.id else 10_000_000
             stock.quote_updated_at = services.now()
             success = execute_simulation_strategy(db, config)
             assert success.status == "completed"

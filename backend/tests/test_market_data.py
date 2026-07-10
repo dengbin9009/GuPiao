@@ -204,6 +204,14 @@ def test_mootdx_provider_reads_minute_bars_when_client_available():
     assert rows[0]["provider"] == "mootdx"
 
 
+def test_mootdx_provider_does_not_advertise_unsupported_trading_calendar():
+    from app.market_data import MootdxProvider
+
+    provider = MootdxProvider()
+
+    assert "trading_calendar" not in provider.capabilities
+
+
 def test_corporate_event_sync_creates_records(tmp_path):
     from sqlalchemy import create_engine, select
     from sqlalchemy.orm import Session

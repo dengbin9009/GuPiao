@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="/Users/dengbin/Code/github/GuPiao"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 BACKEND_DIR="$ROOT/backend"
 FRONTEND_DIR="$ROOT/frontend"
 ENV_FILE="$ROOT/.env"
-BACKEND_DB="$BACKEND_DIR/gupiao.db"
 RUN_DIR="$ROOT/.run"
 
 BACKEND_LOG="$BACKEND_DIR/.uvicorn.log"
@@ -17,15 +16,33 @@ WORKER_PID_FILE="$RUN_DIR/worker.pid"
 SCHEDULER_PID_FILE="$RUN_DIR/scheduler.pid"
 FRONTEND_PID_FILE="$RUN_DIR/frontend.pid"
 
-PYTHON_BIN="$BACKEND_DIR/.venv/bin/python"
-NODE_BIN="/Users/dengbin/.nvm/versions/node/v20.19.4/bin"
+PYTHON_BIN="${GUPIAO_PYTHON_BIN:-$BACKEND_DIR/.venv/bin/python}"
 
 echo "== GuPiao tonight observe mode =="
 
 mkdir -p "$ROOT/data/market" "$ROOT/data/backtests" "$ROOT/data/plugins" "$RUN_DIR"
 
-if [ ! -f "$PYTHON_BIN" ]; then
+if [ ! -x "$PYTHON_BIN" ]; then
   echo "Missing backend venv python: $PYTHON_BIN"
+  exit 1
+fi
+
+NODE_BIN="${GUPIAO_NODE_BIN:-}"
+if [ -z "$NODE_BIN" ]; then
+  for candidate in "$HOME"/.nvm/versions/node/v20.*/bin; do
+    if [ -x "$candidate/node" ]; then
+      NODE_BIN="$candidate"
+      break
+    fi
+  done
+fi
+if [ -z "$NODE_BIN" ] && command -v node >/dev/null 2>&1; then
+  if [ "$(node -p 'process.versions.node.split(`.`)[0]' 2>/dev/null || true)" = "20" ]; then
+    NODE_BIN="$(dirname "$(command -v node)")"
+  fi
+fi
+if [ -z "$NODE_BIN" ] || [ ! -x "$NODE_BIN/node" ]; then
+  echo "Node.js 20 is required"
   exit 1
 fi
 
@@ -45,10 +62,10 @@ CORS_ORIGINS=http://127.0.0.1:5173,http://localhost:5173,http://localhost:8080
 MARKET_DATA_PROVIDER=akshare
 TUSHARE_TOKEN=
 REALTIME_POLL_INTERVAL_SECONDS=5
-MARKET_DATA_STALE_AFTER_SECONDS=86400
+MARKET_DATA_STALE_AFTER_SECONDS=15
 CORPORATE_EVENT_PROVIDERS=cninfo,tushare,akshare
 CORPORATE_EVENT_SYNC_INTERVAL_SECONDS=300
-CORPORATE_EVENT_STALE_AFTER_SECONDS=172800
+CORPORATE_EVENT_STALE_AFTER_SECONDS=1800
 
 SIMULATION_INITIAL_CASH=100000
 SIMULATION_COMMISSION_RATE=0.0003
@@ -94,90 +111,131 @@ WECOM_WEBHOOK_URL=
 EOF
   echo "Created $ENV_FILE with random local credentials"
   echo "Administrator username: admin"
-  echo "Administrator password: $GENERATED_PASSWORD"
+  echo "Administrator password was written to the local .env file"
 fi
 
-for pid_file in "$BACKEND_PID_FILE" "$WORKER_PID_FILE" "$SCHEDULER_PID_FILE" "$FRONTEND_PID_FILE"; do
+set -a
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+set +a
+
+if [ "${LIVE_TRADING_ENABLED:-false}" != "false" ] || [ "${BROKER_ADAPTER:-simulation}" != "simulation" ]; then
+  echo "Observe mode requires LIVE_TRADING_ENABLED=false and BROKER_ADAPTER=simulation"
+  exit 1
+fi
+
+OBSERVE_INITIAL_CASH="${GUPIAO_OBSERVE_INITIAL_CASH:-100000}"
+if ! "$PYTHON_BIN" -c 'import sys; value = float(sys.argv[1]); raise SystemExit(0 if value > 0 else 1)' "$OBSERVE_INITIAL_CASH"; then
+  echo "GUPIAO_OBSERVE_INITIAL_CASH must be a positive number"
+  exit 1
+fi
+export SIMULATION_INITIAL_CASH="$OBSERVE_INITIAL_CASH"
+export MARKET_DATA_STALE_AFTER_SECONDS="${GUPIAO_OBSERVE_MARKET_STALE_SECONDS:-15}"
+export CORPORATE_EVENT_STALE_AFTER_SECONDS="${GUPIAO_OBSERVE_EVENT_STALE_SECONDS:-1800}"
+
+process_cwd() {
+  local pid="$1"
+  if [ -e "/proc/$pid/cwd" ]; then
+    readlink "/proc/$pid/cwd" 2>/dev/null || true
+  elif command -v lsof >/dev/null 2>&1; then
+    lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -n 1
+  fi
+}
+
+stop_managed_pid() {
+  local pid_file="$1"
+  local expected_dir="$2"
+  local pid=""
+  local cwd=""
   if [ -f "$pid_file" ]; then
     pid="$(cat "$pid_file" 2>/dev/null || true)"
-    if [ -n "${pid:-}" ]; then
-      kill "$pid" 2>/dev/null || true
+    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+      cwd="$(process_cwd "$pid")"
+      case "$cwd/" in
+        "$expected_dir/"*) kill "$pid" 2>/dev/null || true ;;
+        *) echo "Refusing to stop PID $pid: process is not owned by $expected_dir" ;;
+      esac
     fi
     rm -f "$pid_file"
   fi
-done
+}
 
-pkill -f "uvicorn app.main:app" 2>/dev/null || true
-pkill -f "python -m app.worker" 2>/dev/null || true
-pkill -f "python -m app.scheduler_runner" 2>/dev/null || true
-pkill -f "vite --host 127.0.0.1 --port 5173" 2>/dev/null || true
+stop_managed_pid "$BACKEND_PID_FILE" "$BACKEND_DIR"
+stop_managed_pid "$WORKER_PID_FILE" "$BACKEND_DIR"
+stop_managed_pid "$SCHEDULER_PID_FILE" "$BACKEND_DIR"
+stop_managed_pid "$FRONTEND_PID_FILE" "$FRONTEND_DIR"
 
-sleep 1
-
-/usr/bin/sqlite3 "$BACKEND_DB" <<'SQL'
-update simulation_accounts
-set initial_cash=100000,
-    cash_balance=100000,
-    available_cash=100000,
-    frozen_cash=0,
-    total_asset=100000,
-    realized_pnl=0,
-    unrealized_pnl=0
-where id=1;
-
-insert into simulation_account_ledgers (simulation_account_id,event_type,amount,balance_after,message,created_at)
-values (1,'adjustment',100000,100000,'tonight observe mode set to 10w',datetime('now'));
-
-insert or ignore into watchlist_items (stock_id,note,created_at)
-select id,'tonight observe default',datetime('now') from stocks where symbol='000001.SZ';
-
-update stocks
-set quote_updated_at=datetime('now'),
-    updated_at=datetime('now')
-where symbol='000001.SZ';
-
-update data_source_states
-set healthy=1,
-    last_checked_at=datetime('now'),
-    last_quote_at=datetime('now'),
-    last_error=NULL
-where provider in ('akshare','cninfo');
-
-update strategy_schedules set enabled=1 where strategy_config_id=2;
-SQL
-
-echo "Simulation account reset to 100000, watchlist prepared, quote timestamps refreshed, and strategy_config_id=2 schedules enabled"
-
-export $(grep -v '^#' "$ENV_FILE" | xargs)
+cd "$BACKEND_DIR"
+"$PYTHON_BIN" scripts/prepare_simulation_runtime.py
 
 start_bg() {
   local pid_file="$1"
   local log_file="$2"
   shift 2
   nohup "$@" > "$log_file" 2>&1 &
-  local pid=$!
-  echo "$pid" > "$pid_file"
-  echo "$pid"
+  LAST_PID=$!
+  STARTED_PIDS+=("$LAST_PID")
+  echo "$LAST_PID" > "$pid_file"
 }
 
+STARTED_PIDS=()
+cleanup_started() {
+  local pid
+  for pid in "${STARTED_PIDS[@]}"; do
+    kill "$pid" 2>/dev/null || true
+  done
+}
+trap cleanup_started EXIT INT TERM
+
 cd "$BACKEND_DIR"
-BACKEND_PID=$(start_bg "$BACKEND_PID_FILE" "$BACKEND_LOG" "$PYTHON_BIN" -m uvicorn app.main:app --host 127.0.0.1 --port 8000)
-WORKER_PID=$(start_bg "$WORKER_PID_FILE" "$WORKER_LOG" "$PYTHON_BIN" -m app.worker || true)
-SCHEDULER_PID=$(start_bg "$SCHEDULER_PID_FILE" "$SCHEDULER_LOG" "$PYTHON_BIN" -m app.scheduler_runner || true)
+start_bg "$BACKEND_PID_FILE" "$BACKEND_LOG" "$PYTHON_BIN" -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+BACKEND_PID=$LAST_PID
+start_bg "$WORKER_PID_FILE" "$WORKER_LOG" "$PYTHON_BIN" -m app.worker
+WORKER_PID=$LAST_PID
+start_bg "$SCHEDULER_PID_FILE" "$SCHEDULER_LOG" "$PYTHON_BIN" -m app.scheduler_runner
+SCHEDULER_PID=$LAST_PID
 
 cd "$FRONTEND_DIR"
 PATH="$NODE_BIN:$PATH"
-FRONTEND_PID=$(start_bg "$FRONTEND_PID_FILE" "$FRONTEND_LOG" npm run dev -- --host 127.0.0.1 --port 5173)
+start_bg "$FRONTEND_PID_FILE" "$FRONTEND_LOG" npm run dev -- --host 127.0.0.1 --port 5173 --strictPort
+FRONTEND_PID=$LAST_PID
 
 sleep 4
 
-if ! /usr/bin/curl -fsS http://127.0.0.1:8000/api/health >/dev/null 2>&1; then
-  echo "Backend health check failed, inspect $BACKEND_LOG"
+for process in "backend:$BACKEND_PID:$BACKEND_LOG" "worker:$WORKER_PID:$WORKER_LOG" "scheduler:$SCHEDULER_PID:$SCHEDULER_LOG" "frontend:$FRONTEND_PID:$FRONTEND_LOG"; do
+  IFS=: read -r name pid log_file <<< "$process"
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "$name failed to start; inspect $log_file"
+    exit 1
+  fi
+done
+
+/usr/bin/curl -fsS http://127.0.0.1:8000/api/health >/dev/null
+/usr/bin/curl -fsSI http://127.0.0.1:5173 >/dev/null
+
+if [ "${GUPIAO_ATTACHED:-false}" = "true" ]; then
+  VERIFY_SECONDS="${GUPIAO_VERIFY_SECONDS:-60}"
+  VERIFIED=false
+  ATTACHED_STARTED_AT=$SECONDS
+  while true; do
+    for process in "backend:$BACKEND_PID:$BACKEND_LOG" "worker:$WORKER_PID:$WORKER_LOG" "scheduler:$SCHEDULER_PID:$SCHEDULER_LOG" "frontend:$FRONTEND_PID:$FRONTEND_LOG"; do
+      IFS=: read -r name pid log_file <<< "$process"
+      if ! kill -0 "$pid" 2>/dev/null; then
+        echo "$name stopped; inspect $log_file"
+        exit 1
+      fi
+    done
+    if [ "$VERIFIED" = "false" ] && [ $((SECONDS - ATTACHED_STARTED_AT)) -ge "$VERIFY_SECONDS" ]; then
+      /usr/bin/curl -fsS http://127.0.0.1:8000/api/health >/dev/null
+      /usr/bin/curl -fsSI http://127.0.0.1:5173 >/dev/null
+      echo "Runtime verification passed after ${VERIFY_SECONDS}s"
+      VERIFIED=true
+    fi
+    sleep 5
+  done
 fi
 
-if ! /usr/bin/curl -fsSI http://127.0.0.1:5173 >/dev/null 2>&1; then
-  echo "Frontend health check failed, inspect $FRONTEND_LOG"
-fi
+trap - EXIT INT TERM
 
 echo "Backend PID:   $BACKEND_PID"
 echo "Worker PID:    $WORKER_PID"

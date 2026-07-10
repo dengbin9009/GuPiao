@@ -58,6 +58,17 @@ def sample_hourly_rows():
         },
         {
             "symbol": "000001.SZ",
+            "timestamp": "2026-06-24T15:00:00",
+            "open": 10.08,
+            "high": 10.18,
+            "low": 10.02,
+            "close": 10.15,
+            "volume": 280000,
+            "amount": 2842000,
+            "provider": "hour-provider",
+        },
+        {
+            "symbol": "000001.SZ",
             "timestamp": "2026-06-25T09:00:00",
             "open": 10.18,
             "high": 10.25,
@@ -262,5 +273,29 @@ def test_recent_backtest_falls_back_to_hourly_when_minute_unavailable(tmp_path: 
 
     assert result["timeframe_used"] == "60m"
     assert result["data_source"] == "provider+cache"
-    assert result["entry"]["timestamp"].startswith("2026-06-24T14:00")
+    assert result["entry"]["timestamp"].startswith("2026-06-24T15:00")
     assert result["exit"]["timestamp"].startswith("2026-06-25T09:00")
+
+
+def test_recent_backtest_reports_hourly_failure_after_minute_failure(tmp_path: Path):
+    from app.market_data import MarketDataError, ProviderRouter
+    from app.recent_overnight_backtest import run_recent_overnight_backtest
+
+    class BrokenProvider:
+        name = "broken"
+        capabilities = frozenset({"minute", "hour"})
+
+        def health(self):
+            return True, None
+
+        def bars(self, *, timeframe, **_):
+            raise MarketDataError(f"{timeframe} 上游不可用")
+
+    with pytest.raises(ValueError, match="60m 也不可用"):
+        run_recent_overnight_backtest(
+            symbol="000001.SZ",
+            entry_date="2026-06-24",
+            exit_date="2026-06-25",
+            cache_root=tmp_path / "market",
+            provider=ProviderRouter([BrokenProvider()]),
+        )

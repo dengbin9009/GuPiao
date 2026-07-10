@@ -31,8 +31,11 @@ class TradingCalendarService:
             raise MarketDataError(f"交易日历获取失败: {'; '.join(failures)}")
         return []
 
-    def is_trading_day(self, day: date) -> bool:
-        days = self.trading_days(start=day, end=day)
+    def is_trading_day(self, day: date, *, allow_weekday_fallback: bool = True) -> bool:
+        try:
+            days = self.trading_days(start=day, end=day)
+        except MarketDataError:
+            return day.weekday() < 5 if allow_weekday_fallback else False
         if days:
             return day.isoformat() in days
-        return day.weekday() < 5
+        return day.weekday() < 5 if allow_weekday_fallback else False

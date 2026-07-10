@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -12,12 +13,11 @@ def write_bar_cache(path: Path, rows: list[dict[str, Any]]) -> None:
 
         pd.DataFrame(rows).to_parquet(path, index=False)
     except Exception:
-        lines = ["timestamp,open,high,low,close,volume,amount"]
-        lines.extend(
-            f"{row['timestamp']},{row['open']},{row['high']},{row['low']},{row['close']},{row['volume']},{row['amount']}"
-            for row in rows
-        )
-        path.write_text("\n".join(lines), encoding="utf-8")
+        fieldnames = sorted({key for row in rows for key in row})
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
 
 
 def read_bar_cache(path: Path) -> list[dict[str, Any]]:
@@ -28,23 +28,16 @@ def read_bar_cache(path: Path) -> list[dict[str, Any]]:
 
         return list(pd.read_parquet(path).to_dict(orient="records"))
     except Exception:
-        lines = path.read_text(encoding="utf-8").splitlines()
-        if len(lines) <= 1:
-            return []
         result: list[dict[str, Any]] = []
-        for line in lines[1:]:
-            timestamp, open_, high, low, close, volume, amount = line.split(",")
-            result.append(
-                {
-                    "timestamp": timestamp,
-                    "open": float(open_),
-                    "high": float(high),
-                    "low": float(low),
-                    "close": float(close),
-                    "volume": int(volume),
-                    "amount": float(amount),
-                }
-            )
+        with path.open(encoding="utf-8", newline="") as handle:
+            for row in csv.DictReader(handle):
+                normalized: dict[str, Any] = dict(row)
+                for key in ("open", "high", "low", "close", "amount"):
+                    if normalized.get(key) not in {None, ""}:
+                        normalized[key] = float(normalized[key])
+                if normalized.get("volume") not in {None, ""}:
+                    normalized["volume"] = int(float(normalized["volume"]))
+                result.append(normalized)
         return result
 
 

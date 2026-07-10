@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from pathlib import Path
+import sys
 
 
 def sample_rows():
@@ -31,6 +32,22 @@ def test_bar_cache_writes_parquet_and_reads_back(tmp_path: Path):
     assert target.exists()
     assert len(cached) == 5
     assert cached[0]["timestamp"] == rows[0]["timestamp"]
+
+
+def test_text_cache_fallback_preserves_provider(tmp_path: Path, monkeypatch):
+    from app.market_cache import read_bar_cache, write_bar_cache
+
+    rows = sample_rows()
+    rows[0]["symbol"] = "000001.SZ"
+    rows[0]["provider"] = "akshare-demo"
+    target = tmp_path / "cache.parquet"
+    monkeypatch.setitem(sys.modules, "pandas", None)
+
+    write_bar_cache(target, rows[:1])
+    cached = read_bar_cache(target)
+
+    assert cached[0]["symbol"] == "000001.SZ"
+    assert cached[0]["provider"] == "akshare-demo"
 
 
 def test_quote_staleness_uses_configured_threshold():
