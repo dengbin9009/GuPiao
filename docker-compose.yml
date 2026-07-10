@@ -1,0 +1,65 @@
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: gupiao
+      MYSQL_USER: gupiao
+      MYSQL_PASSWORD: change-me
+      MYSQL_ROOT_PASSWORD: root-change-me
+      TZ: Asia/Shanghai
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    build: ./backend
+    env_file: ${ENV_FILE:-.env}
+    environment:
+      DATABASE_URL: mysql+pymysql://gupiao:change-me@mysql:3306/gupiao
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  worker:
+    build: ./backend
+    command: ["python", "-m", "app.worker"]
+    env_file: ${ENV_FILE:-.env}
+    environment:
+      DATABASE_URL: mysql+pymysql://gupiao:change-me@mysql:3306/gupiao
+    volumes:
+      - ./data:/data
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  scheduler:
+    build: ./backend
+    command: ["python", "-m", "app.scheduler_runner"]
+    env_file: ${ENV_FILE:-.env}
+    environment:
+      DATABASE_URL: mysql+pymysql://gupiao:change-me@mysql:3306/gupiao
+    volumes:
+      - ./data:/data
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+
+volumes:
+  mysql-data:

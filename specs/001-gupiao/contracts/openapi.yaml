@@ -1,0 +1,1482 @@
+openapi: 3.1.0
+info:
+  title: GuPiao API
+  version: 0.1.0
+  description: API contract for the GuPiao A-share quantitative trading console.
+servers:
+  - url: /api
+security:
+  - sessionAuth: []
+components:
+  securitySchemes:
+    sessionAuth:
+      type: apiKey
+      in: cookie
+      name: gupiao_session
+  schemas:
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+        password:
+          type: string
+          format: password
+    Stock:
+      type: object
+      required: [symbol, code, exchange, name, status]
+      properties:
+        symbol:
+          type: string
+          example: 600519.SH
+        code:
+          type: string
+          example: "600519"
+        exchange:
+          type: string
+          enum: [SSE, SZSE, BSE]
+        name:
+          type: string
+          example: 贵州茅台
+        status:
+          type: string
+          enum: [active, suspended, st, delisted, unknown]
+        last_price:
+          type: number
+          nullable: true
+        change_pct:
+          type: number
+          nullable: true
+        quote_updated_at:
+          type: string
+          format: date-time
+          nullable: true
+    StockEvent:
+      type: object
+      required: [id, symbol, event_type, severity, title, source, source_event_id, published_at, fetched_at]
+      properties:
+        id:
+          type: integer
+        symbol:
+          type: string
+        event_type:
+          type: string
+          enum: [suspension, resumption, regulatory_investigation, material_litigation, shareholder_reduction, unlock, earnings_warning, major_announcement]
+        severity:
+          type: string
+          enum: [info, warning, critical]
+        title:
+          type: string
+        source:
+          type: string
+          enum: [cninfo, tushare, akshare]
+        source_event_id:
+          type: string
+        published_at:
+          type: string
+          format: date-time
+        effective_at:
+          type: string
+          format: date-time
+          nullable: true
+        unlock_free_float_pct:
+          type: number
+          nullable: true
+        raw_uri:
+          type: string
+          nullable: true
+        fetched_at:
+          type: string
+          format: date-time
+    WatchlistItem:
+      type: object
+      required: [id, stock]
+      properties:
+        id:
+          type: integer
+        stock:
+          $ref: "#/components/schemas/Stock"
+        note:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+    StrategyDefinition:
+      type: object
+      required: [key, name, type, enabled, required_timeframes]
+      properties:
+        key:
+          type: string
+          example: overnight_hold
+        name:
+          type: string
+          example: 一夜持股法
+        type:
+          type: string
+          enum: [built_in, plugin]
+        enabled:
+          type: boolean
+        required_timeframes:
+          type: array
+          items:
+            type: string
+            enum: [1d, 1m]
+        validation_error:
+          type: string
+          nullable: true
+    StrategyConfig:
+      type: object
+      required: [id, strategy_key, name, mode, parameters, enabled]
+      properties:
+        id:
+          type: integer
+        strategy_key:
+          type: string
+        name:
+          type: string
+        mode:
+          type: string
+          enum: [SIMULATION, LIVE]
+        parameters:
+          type: object
+          additionalProperties: true
+        enabled:
+          type: boolean
+    StrategySchedule:
+      type: object
+      required: [id, strategy_config_id, trigger_type, enabled, timezone, run_time, trading_day_only, misfire_policy]
+      properties:
+        id:
+          type: integer
+        strategy_config_id:
+          type: integer
+        trigger_type:
+          type: string
+          enum: [entry_evaluation, exit_evaluation, custom]
+        enabled:
+          type: boolean
+          default: false
+        timezone:
+          type: string
+          default: Asia/Shanghai
+        run_time:
+          type: string
+          example: "14:40:00"
+        trading_day_only:
+          type: boolean
+          default: true
+        misfire_policy:
+          type: string
+          enum: [skip]
+        next_run_at:
+          type: string
+          format: date-time
+          nullable: true
+    Order:
+      type: object
+      required: [id, account_id, mode, symbol, side, quantity, status, created_at]
+      properties:
+        id:
+          type: integer
+        account_id:
+          type: integer
+        mode:
+          type: string
+          enum: [SIMULATION, LIVE]
+        symbol:
+          type: string
+        side:
+          type: string
+          enum: [buy, sell]
+        quantity:
+          type: integer
+        limit_price:
+          type: number
+          nullable: true
+        status:
+          type: string
+          enum: [created, blocked, submitted, partially_filled, filled, canceled, rejected, failed]
+        created_at:
+          type: string
+          format: date-time
+    Fill:
+      type: object
+      required: [id, order_id, account_id, mode, symbol, quantity, price, filled_at]
+      properties:
+        id:
+          type: integer
+        order_id:
+          type: integer
+        account_id:
+          type: integer
+        mode:
+          type: string
+          enum: [SIMULATION, LIVE]
+        symbol:
+          type: string
+        quantity:
+          type: integer
+        price:
+          type: number
+        commission:
+          type: number
+        stamp_tax:
+          type: number
+        transfer_fee:
+          type: number
+        slippage_amount:
+          type: number
+        filled_at:
+          type: string
+          format: date-time
+    Position:
+      type: object
+      required: [id, account_id, mode, symbol, quantity, available_quantity, average_cost]
+      properties:
+        id:
+          type: integer
+        account_id:
+          type: integer
+        mode:
+          type: string
+          enum: [SIMULATION, LIVE]
+        symbol:
+          type: string
+        quantity:
+          type: integer
+        available_quantity:
+          type: integer
+        average_cost:
+          type: number
+        market_value:
+          type: number
+        unrealized_pnl:
+          type: number
+        updated_at:
+          type: string
+          format: date-time
+    StrategyRun:
+      type: object
+      required: [id, strategy_config_id, mode, status, started_at]
+      properties:
+        id:
+          type: integer
+        strategy_config_id:
+          type: integer
+        mode:
+          type: string
+          enum: [SIMULATION, LIVE]
+        status:
+          type: string
+          enum: [pending, running, completed, failed, paused]
+        started_at:
+          type: string
+          format: date-time
+        finished_at:
+          type: string
+          format: date-time
+          nullable: true
+        summary:
+          type: object
+          additionalProperties: true
+        error_message:
+          type: string
+          nullable: true
+    StrategyLog:
+      type: object
+      required: [id, strategy_run_id, level, message, created_at]
+      properties:
+        id:
+          type: integer
+        strategy_run_id:
+          type: integer
+        level:
+          type: string
+          enum: [info, warning, error]
+        message:
+          type: string
+        context:
+          type: object
+          additionalProperties: true
+        created_at:
+          type: string
+          format: date-time
+    BacktestRun:
+      type: object
+      required: [id, strategy_key, strategy_version, parameters, timeframe, start_date, end_date, initial_cash, status]
+      properties:
+        id:
+          type: integer
+        strategy_key:
+          type: string
+        strategy_version:
+          type: string
+        parameters:
+          type: object
+          additionalProperties: true
+        universe:
+          type: object
+          additionalProperties: true
+        benchmark_symbol:
+          type: string
+          default: 000300.SH
+        timeframe:
+          type: string
+          enum: [1d, 1m]
+        start_date:
+          type: string
+          format: date
+        end_date:
+          type: string
+          format: date
+        adjustment_mode:
+          type: string
+          enum: [qfq, hfq, none]
+          default: qfq
+        initial_cash:
+          type: number
+          default: 10000
+        cost_settings:
+          type: object
+          additionalProperties: true
+        status:
+          type: string
+          enum: [pending, running, completed, failed, canceled]
+        metrics:
+          type: object
+          additionalProperties:
+            type: number
+        equity_curve_uri:
+          type: string
+          nullable: true
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+        finished_at:
+          type: string
+          format: date-time
+          nullable: true
+        error_message:
+          type: string
+          nullable: true
+    BacktestTrade:
+      type: object
+      required: [id, backtest_run_id, symbol, side, quantity, signal_at, filled_at, fill_price]
+      properties:
+        id:
+          type: integer
+        backtest_run_id:
+          type: integer
+        symbol:
+          type: string
+        side:
+          type: string
+          enum: [buy, sell]
+        quantity:
+          type: integer
+        signal_at:
+          type: string
+          format: date-time
+        filled_at:
+          type: string
+          format: date-time
+        signal_price:
+          type: number
+        fill_price:
+          type: number
+        commission:
+          type: number
+        stamp_tax:
+          type: number
+        transfer_fee:
+          type: number
+        slippage_amount:
+          type: number
+        realized_pnl:
+          type: number
+          nullable: true
+        reason:
+          type: string
+    RiskSettings:
+      type: object
+      required:
+        - live_enabled
+        - emergency_stop_enabled
+        - max_order_notional_abs
+        - max_order_notional_pct
+        - max_position_pct
+        - max_total_exposure_pct
+        - daily_loss_limit_pct
+        - max_consecutive_errors
+      properties:
+        live_enabled:
+          type: boolean
+        emergency_stop_enabled:
+          type: boolean
+        max_order_notional_abs:
+          type: number
+        max_order_notional_pct:
+          type: number
+        max_position_pct:
+          type: number
+        max_total_exposure_pct:
+          type: number
+        daily_loss_limit_pct:
+          type: number
+        max_consecutive_errors:
+          type: integer
+        max_daily_orders:
+          type: integer
+          nullable: true
+    RiskEvent:
+      type: object
+      required: [id, mode, event_type, message, created_at]
+      properties:
+        id:
+          type: integer
+        mode:
+          type: string
+          enum: [SIMULATION, LIVE]
+        event_type:
+          type: string
+          enum: [blocked, reduced, paused, emergency_stop, limit_breached]
+        order_id:
+          type: integer
+          nullable: true
+        strategy_run_id:
+          type: integer
+          nullable: true
+        message:
+          type: string
+        context:
+          type: object
+          additionalProperties: true
+        created_at:
+          type: string
+          format: date-time
+    GatewayHealth:
+      type: object
+      required: [type, enabled, healthy]
+      properties:
+        type:
+          type: string
+          enum: [qmt, ptrade, futu_opend]
+        platform:
+          type: string
+          enum: [windows, macos, linux, broker_cloud]
+        enabled:
+          type: boolean
+        healthy:
+          type: boolean
+        last_checked_at:
+          type: string
+          format: date-time
+          nullable: true
+        last_error:
+          type: string
+          nullable: true
+    GatewayEvent:
+      type: object
+      required: [id, gateway_id, event_type, message, created_at]
+      properties:
+        id:
+          type: integer
+        gateway_id:
+          type: integer
+        event_type:
+          type: string
+          enum: [health_check, submit_order, cancel_order, query_account, error]
+        message:
+          type: string
+        context:
+          type: object
+          additionalProperties: true
+        created_at:
+          type: string
+          format: date-time
+    DataSourceState:
+      type: object
+      required: [provider, enabled, healthy]
+      properties:
+        provider:
+          type: string
+          enum: [akshare, tushare, cninfo]
+        enabled:
+          type: boolean
+        healthy:
+          type: boolean
+        capabilities:
+          type: array
+          items:
+            type: string
+            enum: [daily, minute, realtime, corporate_events]
+        last_quote_at:
+          type: string
+          format: date-time
+          nullable: true
+        stale_after_seconds:
+          type: integer
+        last_checked_at:
+          type: string
+          format: date-time
+          nullable: true
+        last_error:
+          type: string
+          nullable: true
+    SimulationAccount:
+      type: object
+      required:
+        - id
+        - name
+        - initial_cash
+        - cash_balance
+        - available_cash
+        - frozen_cash
+        - total_asset
+        - status
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+          example: 默认模拟账户
+        initial_cash:
+          type: number
+        cash_balance:
+          type: number
+        available_cash:
+          type: number
+        frozen_cash:
+          type: number
+        total_asset:
+          type: number
+        realized_pnl:
+          type: number
+        unrealized_pnl:
+          type: number
+        commission_rate:
+          type: number
+        min_commission:
+          type: number
+        stamp_tax_rate:
+          type: number
+        transfer_fee_rate:
+          type: number
+        slippage_bps:
+          type: number
+        status:
+          type: string
+          enum: [active, reset_pending, disabled]
+    SimulationAccountResetRequest:
+      type: object
+      required: [initial_cash]
+      properties:
+        initial_cash:
+          type: number
+        reason:
+          type: string
+    LiveTradingAccount:
+      type: object
+      required: [id, broker, account_alias, account_no_masked, gateway_id, currency, enabled, read_only]
+      properties:
+        id:
+          type: integer
+        broker:
+          type: string
+        account_alias:
+          type: string
+        account_no_masked:
+          type: string
+          example: "****1234"
+        gateway_id:
+          type: integer
+        currency:
+          type: string
+          enum: [CNY]
+        enabled:
+          type: boolean
+        read_only:
+          type: boolean
+        last_synced_at:
+          type: string
+          format: date-time
+          nullable: true
+    AccountSnapshot:
+      type: object
+      required: [id, mode, account_id, cash_balance, available_cash, frozen_cash, market_value, total_asset, captured_at]
+      properties:
+        id:
+          type: integer
+        mode:
+          type: string
+          enum: [SIMULATION, LIVE]
+        account_id:
+          type: integer
+        cash_balance:
+          type: number
+        available_cash:
+          type: number
+        frozen_cash:
+          type: number
+        market_value:
+          type: number
+        total_asset:
+          type: number
+        realized_pnl:
+          type: number
+        unrealized_pnl:
+          type: number
+        exposure:
+          type: number
+        source:
+          type: string
+          enum: [simulated_broker, qmt_gateway, ptrade, futu_opend, manual_sync]
+        captured_at:
+          type: string
+          format: date-time
+    MinuteBar:
+      type: object
+      required: [symbol, timestamp, open, high, low, close, volume, amount]
+      properties:
+        symbol:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+        open:
+          type: number
+        high:
+          type: number
+        low:
+          type: number
+        close:
+          type: number
+        volume:
+          type: number
+        amount:
+          type: number
+        provider:
+          type: string
+    RealtimeQuote:
+      type: object
+      required: [symbol, last_price, quote_at, stale]
+      properties:
+        symbol:
+          type: string
+        last_price:
+          type: number
+        bid_price:
+          type: number
+          nullable: true
+        ask_price:
+          type: number
+          nullable: true
+        volume:
+          type: number
+        amount:
+          type: number
+        quote_at:
+          type: string
+          format: date-time
+        stale:
+          type: boolean
+        provider:
+          type: string
+    NotificationChannel:
+      type: object
+      required: [id, type, name, enabled, recipient, event_types]
+      properties:
+        id:
+          type: integer
+        type:
+          type: string
+          enum: [email, wecom]
+        name:
+          type: string
+        enabled:
+          type: boolean
+        recipient:
+          type: string
+        event_types:
+          type: array
+          items:
+            type: string
+            enum: [order_success, order_failure, risk_block, circuit_breaker, gateway_offline, gateway_recovered, strategy_failure, daily_summary]
+        last_tested_at:
+          type: string
+          format: date-time
+          nullable: true
+    NotificationDelivery:
+      type: object
+      required: [id, channel_id, event_type, severity, subject, status, attempt_count, created_at]
+      properties:
+        id:
+          type: integer
+        channel_id:
+          type: integer
+        event_type:
+          type: string
+        severity:
+          type: string
+          enum: [info, warning, critical]
+        subject:
+          type: string
+        status:
+          type: string
+          enum: [pending, sent, failed, abandoned]
+        attempt_count:
+          type: integer
+        last_error:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        sent_at:
+          type: string
+          format: date-time
+          nullable: true
+paths:
+  /auth/login:
+    post:
+      security: []
+      summary: Log in as administrator
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "204":
+          description: Logged in
+        "401":
+          description: Invalid credentials
+  /auth/logout:
+    post:
+      summary: Log out
+      responses:
+        "204":
+          description: Logged out
+  /stocks/search:
+    get:
+      summary: Search A-share stocks
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Stock code, Chinese name, full pinyin, or pinyin initials.
+      responses:
+        "200":
+          description: Matching stocks
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Stock"
+  /stocks/{symbol}/events:
+    get:
+      summary: List normalized corporate events for a stock
+      parameters:
+        - name: symbol
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Corporate events ordered by publication time
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/StockEvent"
+  /watchlist:
+    get:
+      summary: List special watchlist stocks
+      responses:
+        "200":
+          description: Watchlist items
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/WatchlistItem"
+    post:
+      summary: Add stock to special watchlist
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [symbol]
+              properties:
+                symbol:
+                  type: string
+      responses:
+        "201":
+          description: Added
+        "409":
+          description: Already exists
+  /watchlist/{item_id}:
+    delete:
+      summary: Remove stock from watchlist
+      parameters:
+        - name: item_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "204":
+          description: Removed
+  /strategies:
+    get:
+      summary: List strategy definitions
+      responses:
+        "200":
+          description: Strategy definitions
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/StrategyDefinition"
+  /plugins/scan:
+    post:
+      summary: Scan the administrator trusted local plugin directory
+      responses:
+        "200":
+          description: Validated plugin strategy definitions
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/StrategyDefinition"
+  /strategy-configs:
+    get:
+      summary: List strategy configurations
+      responses:
+        "200":
+          description: Strategy configurations
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/StrategyConfig"
+    post:
+      summary: Create strategy configuration
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [strategy_key, name, mode, parameters]
+              properties:
+                strategy_key:
+                  type: string
+                name:
+                  type: string
+                mode:
+                  type: string
+                  enum: [SIMULATION, LIVE]
+                parameters:
+                  type: object
+                  additionalProperties: true
+      responses:
+        "201":
+          description: Created
+        "422":
+          description: Invalid strategy parameters
+  /strategy-configs/{config_id}/run:
+    post:
+      summary: Start a strategy run
+      parameters:
+        - name: config_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "202":
+          description: Strategy run accepted
+        "403":
+          description: LIVE mode blocked
+        "422":
+          description: Strategy cannot be run
+  /strategy-schedules:
+    get:
+      summary: List strategy schedules
+      responses:
+        "200":
+          description: Strategy schedules
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/StrategySchedule"
+    post:
+      summary: Create a disabled-by-default trading-day schedule
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [strategy_config_id, trigger_type, run_time]
+              properties:
+                strategy_config_id:
+                  type: integer
+                trigger_type:
+                  type: string
+                  enum: [entry_evaluation, exit_evaluation, custom]
+                run_time:
+                  type: string
+                  example: "14:40:00"
+                enabled:
+                  type: boolean
+                  default: false
+      responses:
+        "201":
+          description: Created strategy schedule
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StrategySchedule"
+  /strategy-schedules/{schedule_id}:
+    put:
+      summary: Update a strategy schedule
+      parameters:
+        - name: schedule_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                trigger_type:
+                  type: string
+                  enum: [entry_evaluation, exit_evaluation, custom]
+                run_time:
+                  type: string
+                enabled:
+                  type: boolean
+      responses:
+        "200":
+          description: Updated strategy schedule
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StrategySchedule"
+    delete:
+      summary: Delete a strategy schedule
+      parameters:
+        - name: schedule_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "204":
+          description: Deleted strategy schedule
+  /strategy-runs:
+    get:
+      summary: List strategy runs
+      parameters:
+        - name: mode
+          in: query
+          schema:
+            type: string
+            enum: [SIMULATION, LIVE]
+      responses:
+        "200":
+          description: Strategy runs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/StrategyRun"
+  /strategy-runs/{run_id}/logs:
+    get:
+      summary: List strategy run logs
+      parameters:
+        - name: run_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Strategy logs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/StrategyLog"
+  /backtests:
+    get:
+      summary: List backtest runs
+      responses:
+        "200":
+          description: Backtest runs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/BacktestRun"
+    post:
+      summary: Start a historical backtest
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [strategy_key, parameters, timeframe, start_date, end_date]
+              properties:
+                strategy_key:
+                  type: string
+                parameters:
+                  type: object
+                  additionalProperties: true
+                universe:
+                  type: object
+                  additionalProperties: true
+                benchmark_symbol:
+                  type: string
+                  default: 000300.SH
+                timeframe:
+                  type: string
+                  enum: [1d, 1m]
+                start_date:
+                  type: string
+                  format: date
+                end_date:
+                  type: string
+                  format: date
+                adjustment_mode:
+                  type: string
+                  enum: [qfq, hfq, none]
+                  default: qfq
+                initial_cash:
+                  type: number
+                  default: 10000
+      responses:
+        "202":
+          description: Backtest accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BacktestRun"
+  /backtests/{backtest_id}:
+    get:
+      summary: Get a backtest run and metrics
+      parameters:
+        - name: backtest_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Backtest run
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BacktestRun"
+  /backtests/{backtest_id}/trades:
+    get:
+      summary: List backtest trades
+      parameters:
+        - name: backtest_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Backtest trades
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/BacktestTrade"
+  /orders:
+    get:
+      summary: List orders
+      parameters:
+        - name: mode
+          in: query
+          schema:
+            type: string
+            enum: [SIMULATION, LIVE]
+      responses:
+        "200":
+          description: Orders
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Order"
+  /fills:
+    get:
+      summary: List fills
+      parameters:
+        - name: mode
+          in: query
+          schema:
+            type: string
+            enum: [SIMULATION, LIVE]
+        - name: account_id
+          in: query
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Fills
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Fill"
+  /positions:
+    get:
+      summary: List positions
+      parameters:
+        - name: mode
+          in: query
+          schema:
+            type: string
+            enum: [SIMULATION, LIVE]
+        - name: account_id
+          in: query
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Positions
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Position"
+  /simulation/account:
+    get:
+      summary: Get or create the default simulation account
+      responses:
+        "200":
+          description: Default simulation account
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SimulationAccount"
+  /simulation/account/reset:
+    post:
+      summary: Reset the default simulation account
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SimulationAccountResetRequest"
+      responses:
+        "200":
+          description: Reset simulation account
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SimulationAccount"
+        "409":
+          description: Reset blocked by active runs or open orders
+  /live/accounts:
+    get:
+      summary: List masked LIVE trading account mappings
+      responses:
+        "200":
+          description: LIVE trading accounts
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/LiveTradingAccount"
+  /live/accounts/sync:
+    post:
+      summary: Sync LIVE trading accounts from the configured gateway
+      responses:
+        "200":
+          description: Synced LIVE trading accounts
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/LiveTradingAccount"
+        "503":
+          description: Gateway unavailable
+  /accounts/snapshots:
+    get:
+      summary: List account snapshots
+      parameters:
+        - name: mode
+          in: query
+          schema:
+            type: string
+            enum: [SIMULATION, LIVE]
+        - name: account_id
+          in: query
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Account snapshots
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/AccountSnapshot"
+  /notifications/channels:
+    get:
+      summary: List email and Enterprise WeChat channels
+      responses:
+        "200":
+          description: Notification channels
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/NotificationChannel"
+    post:
+      summary: Create a notification channel using a secret reference
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type, name, recipient, secret_ref, event_types]
+              properties:
+                type:
+                  type: string
+                  enum: [email, wecom]
+                name:
+                  type: string
+                recipient:
+                  type: string
+                secret_ref:
+                  type: string
+                event_types:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        "201":
+          description: Created notification channel
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NotificationChannel"
+  /notifications/channels/{channel_id}/test:
+    post:
+      summary: Send a test notification
+      parameters:
+        - name: channel_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "202":
+          description: Test delivery queued
+  /notifications/deliveries:
+    get:
+      summary: List notification delivery attempts
+      responses:
+        "200":
+          description: Notification delivery history
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/NotificationDelivery"
+  /risk/settings:
+    get:
+      summary: Get risk settings
+      responses:
+        "200":
+          description: Risk settings
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RiskSettings"
+    put:
+      summary: Update risk settings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RiskSettings"
+      responses:
+        "200":
+          description: Updated risk settings
+  /risk/events:
+    get:
+      summary: List risk events
+      parameters:
+        - name: mode
+          in: query
+          schema:
+            type: string
+            enum: [SIMULATION, LIVE]
+      responses:
+        "200":
+          description: Risk events
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/RiskEvent"
+  /risk/emergency-stop:
+    post:
+      summary: Enable emergency stop
+      responses:
+        "204":
+          description: Emergency stop enabled
+  /gateways:
+    get:
+      summary: List configured broker gateways
+      responses:
+        "200":
+          description: Gateway states
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/GatewayHealth"
+  /gateways/{gateway_id}/health:
+    get:
+      summary: Get selected broker gateway health
+      parameters:
+        - name: gateway_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Gateway health
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GatewayHealth"
+  /gateway/events:
+    get:
+      summary: List gateway events
+      responses:
+        "200":
+          description: Gateway events
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/GatewayEvent"
+  /market-data/sources:
+    get:
+      summary: List market data source states
+      responses:
+        "200":
+          description: Market data source states
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/DataSourceState"
+  /market-data/bars:
+    get:
+      summary: Query daily or minute bars
+      parameters:
+        - name: symbol
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: timeframe
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [1d, 1m]
+        - name: start
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date-time
+        - name: end
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date-time
+      responses:
+        "200":
+          description: Market bars
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/MinuteBar"
+  /market-data/quotes:
+    get:
+      summary: Query fresh tail-session real-time quotes
+      parameters:
+        - name: symbols
+          in: query
+          required: true
+          schema:
+            type: array
+            items:
+              type: string
+      responses:
+        "200":
+          description: Real-time quotes with freshness state
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/RealtimeQuote"
