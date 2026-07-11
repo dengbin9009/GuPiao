@@ -95,6 +95,7 @@ def refresh_quotes(db: Session, provider: Any, symbols: list[str]) -> SyncResult
     updated = 0
     missing: list[str] = []
     timestamp = now()
+    quote_timestamps: list[datetime] = []
     for symbol in symbols:
         stock = db.scalar(select(Stock).where(Stock.symbol == symbol))
         if not stock:
@@ -112,8 +113,10 @@ def refresh_quotes(db: Session, provider: Any, symbols: list[str]) -> SyncResult
         stock.turnover_amount = float(_value(row, "amount", "turnover_amount", "成交额", default=0))
         quote_at = _value(row, "quote_at", "trade_time")
         stock.quote_updated_at = quote_at if isinstance(quote_at, datetime) else timestamp
+        quote_timestamps.append(stock.quote_updated_at)
         updated += 1
-    _mark_provider(db, provider.name, healthy=True, quote_at=timestamp)
+    latest_quote_at = max(quote_timestamps) if quote_timestamps else None
+    _mark_provider(db, provider.name, healthy=True, quote_at=latest_quote_at)
     db.commit()
     return SyncResult(updated=updated, missing=missing)
 
@@ -152,6 +155,20 @@ def sync_corporate_events(db: Session, rows: Iterable[dict[str, Any]]) -> SyncRe
         created += 1
     db.commit()
     return SyncResult(created=created, updated=updated)
+
+
+def mark_provider_failure(db: Session, provider: str, error: Exception | str) -> None:
+    state = db.scalar(select(DataSourceState).where(DataSourceState.provider == provider))
+    if state:
+        state.healthy = False
+        state.last_checked_at = now()
+        state.last_error = str(error)[:1000]
+        db.commit()
+
+
+def mark_provider_success(db: Session, provider: str) -> None:
+    _mark_provider(db, provider, healthy=True)
+    db.commit()
 
 
 def _mark_provider(

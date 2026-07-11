@@ -2,15 +2,18 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, event, inspect as sa_inspect
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .database import Base
 
+SHANGHAI = ZoneInfo("Asia/Shanghai")
+
 
 def now() -> datetime:
-    return datetime.now().astimezone()
+    return datetime.now(SHANGHAI)
 
 
 class TimestampMixin:

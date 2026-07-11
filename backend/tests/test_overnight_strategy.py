@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime
+from types import SimpleNamespace
+from zoneinfo import ZoneInfo
+
 
 def candidate(symbol="000001.SZ", **overrides):
     row = {
@@ -63,3 +67,27 @@ def test_overnight_candidate_selection_orders_by_intraday_return_then_turnover()
     result = evaluate_candidates(rows, OVERNIGHT_DEFAULTS, critical_event_symbols=set())
 
     assert [item["symbol"] for item in result.accepted] == ["000003.SZ", "000002.SZ", "000001.SZ"]
+
+
+def test_universe_builder_treats_change_pct_as_percentage_points():
+    from app.overnight_strategy import build_universe_candidates
+
+    stock = SimpleNamespace(
+        symbol="000001.SZ",
+        code="000001",
+        name="平安银行",
+        exchange="SZSE",
+        status="active",
+        last_price=10.0,
+        change_pct=0.5,
+        turnover_amount=200_000_000,
+        quote_updated_at=None,
+        created_at=None,
+    )
+
+    rows = build_universe_candidates(
+        [stock],
+        current=datetime(2026, 7, 10, 14, 40, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert rows[0]["intraday_return"] == 0.005

@@ -12,6 +12,8 @@ htmlcov/
 node_modules/
 dist/
 *.db
+*.db-shm
+*.db-wal
 *.log
 data/market/*.parquet
 data/backtests/*.parquet

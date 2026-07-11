@@ -4,7 +4,7 @@ from pathlib import Path
 from datetime import timedelta
 
 import pytest
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import Session
 
 from app.config import Settings
@@ -20,14 +20,15 @@ from app.models import (
     SimulationAccount,
     SimulationAccountLedger,
     Stock,
+    StockEvent,
     WatchlistItem,
     StrategyConfig,
     StrategyDefinition,
-    StrategyRun,
     now,
 )
 from app.security import create_session, hash_password, read_session, verify_password
 from app.services import (
+    _critical_event_symbols,
     create_backtest,
     execute_simulation_exit,
     execute_simulation_strategy,
@@ -46,6 +47,16 @@ def db(tmp_path: Path):
     with Session(engine) as session:
         seed_database(session, Settings(database_url=f"sqlite:///{tmp_path / 'test.db'}"))
         yield session
+
+
+def make_event_data_fresh(db: Session) -> None:
+    source = db.scalar(
+        select(DataSourceState).where(DataSourceState.provider == "akshare_events")
+    )
+    source.enabled = True
+    source.healthy = True
+    source.last_checked_at = now()
+    db.commit()
 
 
 def test_model_count_and_seed(db: Session):
@@ -82,9 +93,10 @@ def test_password_and_signed_session():
 
 
 def test_simulation_run_creates_fill_position_and_t1_lock(db: Session):
+    make_event_data_fresh(db)
     definition = db.scalar(select(StrategyDefinition).where(StrategyDefinition.key == "overnight_hold"))
     stock = db.scalar(select(Stock).where(Stock.symbol == "000001.SZ"))
-    stock.change_pct = 0.049
+    stock.change_pct = 4.9
     stock.turnover_amount = 900_000_000
     stock.last_price = 10.01
     stock.quote_updated_at = now()
@@ -113,14 +125,15 @@ def test_simulation_run_creates_fill_position_and_t1_lock(db: Session):
 
 
 def test_simulation_run_selects_best_universe_candidate_not_first_watchlist(db: Session):
+    make_event_data_fresh(db)
     definition = db.scalar(select(StrategyDefinition).where(StrategyDefinition.key == "overnight_hold"))
     leading = db.scalar(select(Stock).where(Stock.symbol == "000001.SZ"))
     stronger = db.scalar(select(Stock).where(Stock.symbol == "300750.SZ"))
-    stronger.change_pct = 0.041
+    stronger.change_pct = 4.1
     stronger.turnover_amount = 900_000_000
     stronger.last_price = 10.56
     stronger.quote_updated_at = now()
-    leading.change_pct = 0.018
+    leading.change_pct = 1.8
     leading.turnover_amount = 200_000_000
     leading.quote_updated_at = now()
     db.add(WatchlistItem(stock_id=leading.id, note="自选第一只"))
@@ -144,7 +157,7 @@ def test_simulation_run_selects_best_universe_candidate_not_first_watchlist(db: 
     assert run.summary["selected_symbol"] == "300750.SZ"
 
 
-def test_live_run_without_selected_account_fails_closed(db: Session):
+def test_live_run_requires_runtime_switch_even_when_database_is_enabled(db: Session):
     definition = db.scalar(select(StrategyDefinition).where(StrategyDefinition.key == "overnight_hold"))
     live_risk = db.scalar(select(RiskSettings).where(RiskSettings.mode == "LIVE"))
     live_risk.live_enabled = True
@@ -160,14 +173,15 @@ def test_live_run_without_selected_account_fails_closed(db: Session):
     run = execute_simulation_strategy(db, config)
 
     assert run.status == "failed"
-    assert "真实盘账户" in run.error_message
+    assert "运行配置" in run.error_message
     assert db.scalar(select(Order).where(Order.mode == "LIVE")) is None
 
 
 def test_simulation_exit_sells_available_next_session_position(db: Session):
+    make_event_data_fresh(db)
     definition = db.scalar(select(StrategyDefinition).where(StrategyDefinition.key == "overnight_hold"))
     stock = db.scalar(select(Stock).where(Stock.symbol == "000001.SZ"))
-    stock.change_pct = 0.049
+    stock.change_pct = 4.9
     stock.turnover_amount = 900_000_000
     stock.last_price = 10.01
     stock.quote_updated_at = now()
@@ -181,7 +195,10 @@ def test_simulation_exit_sells_available_next_session_position(db: Session):
     db.commit()
     execute_simulation_strategy(db, config)
     position = db.scalar(select(Position))
-    position.available_quantity = position.quantity
+    db.execute(
+        text("UPDATE fills SET filled_at = :filled_at WHERE id = (SELECT MAX(id) FROM fills)"),
+        {"filled_at": now() - timedelta(days=1)},
+    )
     db.commit()
 
     run = execute_simulation_exit(db, config)
@@ -194,11 +211,75 @@ def test_simulation_exit_sells_available_next_session_position(db: Session):
     assert sell_fill.stamp_tax > 0
 
 
+def test_simulation_exit_keeps_same_day_purchase_locked(db: Session):
+    make_event_data_fresh(db)
+    definition = db.scalar(
+        select(StrategyDefinition).where(StrategyDefinition.key == "overnight_hold")
+    )
+    stock = db.scalar(select(Stock).where(Stock.symbol == "000001.SZ"))
+    stock.change_pct = 4.9
+    stock.turnover_amount = 900_000_000
+    stock.last_price = 10.01
+    stock.quote_updated_at = now()
+    config = StrategyConfig(
+        strategy_definition_id=definition.id,
+        name="测试当日锁定",
+        mode="SIMULATION",
+        parameters={},
+    )
+    db.add(config)
+    db.commit()
+    execute_simulation_strategy(db, config)
+
+    run = execute_simulation_exit(db, config)
+
+    position = db.scalar(select(Position))
+    assert position.quantity > 0
+    assert position.available_quantity == 0
+    assert run.summary["reason"] == "没有可卖持仓"
+
+
+def test_simulation_exit_retries_when_position_quote_is_stale(db: Session):
+    make_event_data_fresh(db)
+    definition = db.scalar(
+        select(StrategyDefinition).where(StrategyDefinition.key == "overnight_hold")
+    )
+    stock = db.scalar(select(Stock).where(Stock.symbol == "000001.SZ"))
+    stock.change_pct = 4.9
+    stock.turnover_amount = 900_000_000
+    stock.last_price = 10.01
+    stock.quote_updated_at = now()
+    config = StrategyConfig(
+        strategy_definition_id=definition.id,
+        name="测试退出过期行情",
+        mode="SIMULATION",
+        parameters={},
+    )
+    db.add(config)
+    db.commit()
+    execute_simulation_strategy(db, config)
+    db.execute(
+        text("UPDATE fills SET filled_at = :filled_at WHERE id = (SELECT MAX(id) FROM fills)"),
+        {"filled_at": now() - timedelta(days=1)},
+    )
+    stock.quote_updated_at = now() - timedelta(seconds=120)
+    db.commit()
+
+    run = execute_simulation_exit(db, config)
+
+    position = db.scalar(select(Position))
+    assert position.quantity > 0
+    assert len(list(db.scalars(select(Order)))) == 1
+    assert run.summary["accepted"] == 0
+    assert run.summary["retryable"] is True
+    assert "行情已过期" in run.summary["reason"]
+
+
 def test_overnight_strategy_rejects_stale_corporate_events(db: Session):
     definition = db.scalar(select(StrategyDefinition).where(StrategyDefinition.key == "overnight_hold"))
     source = db.scalar(select(DataSourceState).where(DataSourceState.provider == "cninfo"))
     stock = db.scalar(select(Stock).where(Stock.symbol == "000001.SZ"))
-    stock.change_pct = 0.049
+    stock.change_pct = 4.9
     stock.turnover_amount = 900_000_000
     stock.last_price = 10.01
     stock.quote_updated_at = now()
@@ -217,6 +298,187 @@ def test_overnight_strategy_rejects_stale_corporate_events(db: Session):
     assert run.summary["accepted"] == 0
     assert "公司事件" in run.summary["reason"]
     assert db.scalar(select(Order)) is None
+
+
+def test_overnight_strategy_accepts_fresh_fallback_event_source(db: Session):
+    definition = db.scalar(
+        select(StrategyDefinition).where(StrategyDefinition.key == "overnight_hold")
+    )
+    cninfo = db.scalar(
+        select(DataSourceState).where(DataSourceState.provider == "cninfo")
+    )
+    fallback = db.scalar(
+        select(DataSourceState).where(DataSourceState.provider == "akshare_events")
+    )
+    stock = db.scalar(select(Stock).where(Stock.symbol == "000001.SZ"))
+    stock.change_pct = 4.9
+    stock.turnover_amount = 900_000_000
+    stock.last_price = 10.01
+    stock.quote_updated_at = now()
+    cninfo.healthy = False
+    fallback.healthy = True
+    fallback.last_checked_at = now()
+    config = StrategyConfig(
+        strategy_definition_id=definition.id,
+        name="测试公告后备源",
+        mode="SIMULATION",
+        parameters={"event_risk_enabled": True},
+    )
+    db.add(config)
+    db.commit()
+
+    run = execute_simulation_strategy(db, config)
+
+    assert run.summary["accepted"] == 1
+    assert db.scalar(select(Order)) is not None
+
+
+def test_critical_event_filter_only_uses_recent_announcements(db: Session):
+    current = now()
+    stock = db.scalar(select(Stock).where(Stock.symbol == "000001.SZ"))
+    db.add_all(
+        [
+            StockEvent(
+                stock_id=stock.id,
+                event_type="material_litigation",
+                severity="critical",
+                title="历史诉讼公告",
+                source="akshare",
+                source_event_id="old-critical",
+                published_at=current - timedelta(days=8),
+            ),
+            StockEvent(
+                stock_id=stock.id,
+                event_type="material_litigation",
+                severity="critical",
+                title="近期诉讼公告",
+                source="akshare",
+                source_event_id="recent-critical",
+                published_at=current - timedelta(days=1),
+            ),
+        ]
+    )
+    db.commit()
+
+    assert _critical_event_symbols(db, current=current) == {"000001.SZ"}
+
+    recent = db.scalar(
+        select(StockEvent).where(StockEvent.source_event_id == "recent-critical")
+    )
+    recent.published_at = current - timedelta(days=8)
+    db.commit()
+
+    assert _critical_event_symbols(db, current=current) == set()
+
+
+def test_event_risk_blocks_specified_types_and_large_unlocks(db: Session):
+    current = now()
+    stocks = list(db.scalars(select(Stock).order_by(Stock.id).limit(4)))
+    db.add_all(
+        [
+            StockEvent(
+                stock_id=stocks[0].id,
+                event_type="shareholder_reduction",
+                severity="warning",
+                title="股东减持公告",
+                source="akshare",
+                source_event_id="reduction-risk",
+                published_at=current,
+            ),
+            StockEvent(
+                stock_id=stocks[1].id,
+                event_type="resumption",
+                severity="info",
+                title="复牌公告",
+                source="akshare",
+                source_event_id="resumption-risk",
+                published_at=current,
+            ),
+            StockEvent(
+                stock_id=stocks[2].id,
+                event_type="unlock",
+                severity="warning",
+                title="限售股上市公告",
+                source="akshare",
+                source_event_id="small-unlock",
+                published_at=current,
+                unlock_free_float_pct=0.05,
+            ),
+            StockEvent(
+                stock_id=stocks[3].id,
+                event_type="unlock",
+                severity="warning",
+                title="大比例限售股上市公告",
+                source="akshare",
+                source_event_id="large-unlock",
+                published_at=current,
+                unlock_free_float_pct=0.051,
+            ),
+        ]
+    )
+    db.commit()
+
+    blocked = _critical_event_symbols(db, current=current)
+
+    assert stocks[0].symbol in blocked
+    assert stocks[1].symbol in blocked
+    assert stocks[2].symbol not in blocked
+    assert stocks[3].symbol in blocked
+
+
+def test_simulation_exit_only_sells_positions_owned_by_config(db: Session):
+    make_event_data_fresh(db)
+    definition = db.scalar(
+        select(StrategyDefinition).where(StrategyDefinition.key == "overnight_hold")
+    )
+    first_stock = db.scalar(select(Stock).where(Stock.symbol == "000001.SZ"))
+    second_stock = db.scalar(select(Stock).where(Stock.symbol == "300750.SZ"))
+
+    def prepare_candidate(target: Stock) -> None:
+        for item in db.scalars(select(Stock)):
+            item.change_pct = 4.9 if item.id == target.id else 0.2
+            item.turnover_amount = 900_000_000 if item.id == target.id else 10_000_000
+            item.last_price = 10.01
+            item.quote_updated_at = now()
+        db.commit()
+
+    first_config = StrategyConfig(
+        strategy_definition_id=definition.id,
+        name="配置一",
+        mode="SIMULATION",
+        parameters={},
+    )
+    second_config = StrategyConfig(
+        strategy_definition_id=definition.id,
+        name="配置二",
+        mode="SIMULATION",
+        parameters={},
+    )
+    db.add_all([first_config, second_config])
+    db.commit()
+
+    prepare_candidate(first_stock)
+    execute_simulation_strategy(db, first_config)
+    prepare_candidate(second_stock)
+    execute_simulation_strategy(db, second_config)
+    db.execute(
+        text("UPDATE fills SET filled_at = :filled_at"),
+        {"filled_at": now() - timedelta(days=1)},
+    )
+    db.commit()
+
+    run = execute_simulation_exit(db, first_config)
+
+    assert run.summary["accepted"] == 1
+    assert run.summary["sold"][0]["symbol"] == first_stock.symbol
+    first_position = db.scalar(
+        select(Position).where(Position.stock_id == first_stock.id)
+    )
+    second_position = db.scalar(
+        select(Position).where(Position.stock_id == second_stock.id)
+    )
+    assert first_position.quantity == 0
+    assert second_position.quantity > 0
 
 
 def test_strategy_parameter_validation_rejects_wrong_type(db: Session):
@@ -243,9 +505,10 @@ def test_simulation_ledger_records_release_and_adjustment(db: Session):
 
 
 def test_fill_and_ledger_are_append_only(db: Session):
+    make_event_data_fresh(db)
     definition = db.scalar(select(StrategyDefinition).where(StrategyDefinition.key == "overnight_hold"))
     stock = db.scalar(select(Stock).where(Stock.symbol == "000001.SZ"))
-    stock.change_pct = 0.049
+    stock.change_pct = 4.9
     stock.turnover_amount = 900_000_000
     stock.last_price = 10.01
     stock.quote_updated_at = now()

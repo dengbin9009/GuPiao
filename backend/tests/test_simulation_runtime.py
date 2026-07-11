@@ -9,7 +9,11 @@ from sqlalchemy.orm import Session
 from app.config import Settings
 from app.database import Base
 from app.models import (
+    Administrator,
+    BrokerGateway,
     DataSourceState,
+    LiveTradingAccount,
+    RiskSettings,
     SimulationAccount,
     SimulationAccountLedger,
     StrategyConfig,
@@ -17,6 +21,7 @@ from app.models import (
     Stock,
     WatchlistItem,
 )
+from app.security import verify_password
 
 
 def test_prepare_simulation_runtime_is_idempotent(
@@ -70,6 +75,7 @@ def test_prepare_simulation_runtime_is_idempotent(
     assert all(stock.turnover_amount is None for stock in stocks)
     assert all(stock.quote_updated_at is None for stock in stocks)
     assert data_sources
+    assert "mootdx" in {source.provider for source in data_sources}
     assert all(not source.healthy for source in data_sources)
     assert all(source.last_quote_at is None for source in data_sources)
 
@@ -112,6 +118,79 @@ def test_prepare_simulation_runtime_adjusts_existing_account_once(
     assert adjustments[0].amount == 90_000
 
 
+def test_prepare_simulation_runtime_syncs_admin_password_from_settings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from app.services import seed_database
+    from app.simulation_runtime import prepare_simulation_runtime
+
+    db_url = f"sqlite:///{tmp_path / 'credentials.db'}"
+    engine = create_engine(db_url)
+    Base.metadata.create_all(engine)
+    monkeypatch.setenv("GUPIAO_ADMIN_PASSWORD", "old-password")
+    with Session(engine) as db:
+        seed_database(
+            db,
+            Settings(database_url=db_url),
+        )
+        monkeypatch.setenv("GUPIAO_ADMIN_PASSWORD", "new-password")
+        prepare_simulation_runtime(
+            db,
+            Settings(
+                database_url=db_url,
+                live_enabled=False,
+                broker_adapter="simulation",
+            ),
+        )
+        admin = db.scalar(select(Administrator).where(Administrator.username == "admin"))
+
+        assert verify_password("new-password", admin.password_hash)
+        assert not verify_password("old-password", admin.password_hash)
+
+
+def test_prepare_simulation_runtime_forces_database_live_state_closed(tmp_path: Path):
+    from app.services import seed_database
+    from app.simulation_runtime import prepare_simulation_runtime
+
+    db_url = f"sqlite:///{tmp_path / 'force-live-closed.db'}"
+    engine = create_engine(db_url)
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        settings = Settings(
+            database_url=db_url,
+            live_enabled=False,
+            broker_adapter="simulation",
+        )
+        seed_database(db, settings)
+        risk = db.scalar(select(RiskSettings).where(RiskSettings.mode == "LIVE"))
+        simulation_risk = db.scalar(
+            select(RiskSettings).where(RiskSettings.mode == "SIMULATION")
+        )
+        gateway = db.scalar(select(BrokerGateway).where(BrokerGateway.type == "qmt"))
+        risk.live_enabled = True
+        simulation_risk.emergency_stop_enabled = True
+        account = LiveTradingAccount(
+            broker="test",
+            account_alias="测试账户",
+            account_no_masked="******0001",
+            gateway_id=gateway.id,
+            enabled=True,
+            read_only=False,
+            market_permissions=["A_SHARE"],
+            account_capabilities=["orders"],
+        )
+        db.add(account)
+        db.commit()
+
+        prepare_simulation_runtime(db, settings)
+
+        assert risk.live_enabled is False
+        assert simulation_risk.emergency_stop_enabled is False
+        assert account.enabled is False
+        assert account.read_only is True
+
+
 @pytest.mark.parametrize(
     ("live_enabled", "broker_adapter"),
     [(True, "simulation"), (False, "qmt")],
@@ -148,11 +227,11 @@ def test_observe_start_script_is_relocatable_and_uses_runtime_bootstrap():
     assert script.index("scripts/prepare_simulation_runtime.py") < script.index("start_bg()")
     assert "LIVE_TRADING_ENABLED=false" in script
     assert "BROKER_ADAPTER=simulation" in script
-    assert "MARKET_DATA_STALE_AFTER_SECONDS=15" in script
+    assert "MARKET_DATA_STALE_AFTER_SECONDS=60" in script
     assert "CORPORATE_EVENT_STALE_AFTER_SECONDS=1800" in script
     assert "MARKET_DATA_STALE_AFTER_SECONDS=86400" not in script
     assert "CORPORATE_EVENT_STALE_AFTER_SECONDS=172800" not in script
-    assert 'export MARKET_DATA_STALE_AFTER_SECONDS="${GUPIAO_OBSERVE_MARKET_STALE_SECONDS:-15}"' in script
+    assert 'export MARKET_DATA_STALE_AFTER_SECONDS="${GUPIAO_OBSERVE_MARKET_STALE_SECONDS:-60}"' in script
     assert 'export CORPORATE_EVENT_STALE_AFTER_SECONDS="${GUPIAO_OBSERVE_EVENT_STALE_SECONDS:-1800}"' in script
     assert "GUPIAO_OBSERVE_INITIAL_CASH:-100000" in script
     assert 'export SIMULATION_INITIAL_CASH="$OBSERVE_INITIAL_CASH"' in script

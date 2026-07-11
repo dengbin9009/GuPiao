@@ -4,6 +4,10 @@ import csv
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
+
+
+SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 def write_bar_cache(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -94,7 +98,8 @@ def quote_is_stale(
 ) -> bool:
     if quote_at is None:
         return True
-    current = current or datetime.now().astimezone()
+    current = current or datetime.now(SHANGHAI)
     if quote_at.tzinfo is None:
         quote_at = quote_at.replace(tzinfo=current.tzinfo)
-    return (current - quote_at).total_seconds() > stale_after_seconds
+    age_seconds = (current - quote_at).total_seconds()
+    return age_seconds < 0 or age_seconds > stale_after_seconds

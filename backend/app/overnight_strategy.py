@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Iterable
 
 
@@ -40,7 +40,7 @@ def build_universe_candidates(
             listing_days = max((current - created).days, min_listing_days)
         last_price = float(getattr(stock, "last_price", 0) or 0)
         change_pct = float(getattr(stock, "change_pct", 0) or 0)
-        intraday_return = change_pct / 100 if abs(change_pct) > 1 else change_pct
+        intraday_return = change_pct / 100
         rows.append(
             {
                 "symbol": symbol,

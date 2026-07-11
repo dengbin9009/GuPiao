@@ -74,6 +74,14 @@ def test_stale_event_data_fails_closed():
             current=current,
         )
 
+    with pytest.raises(StaleDataError, match="未来"):
+        ensure_fresh(
+            "公司事件",
+            updated_at=current + timedelta(seconds=1),
+            stale_after_seconds=1800,
+            current=current,
+        )
+
 
 def test_akshare_quote_refresh_updates_timestamp(tmp_path):
     from sqlalchemy import create_engine, select
@@ -103,7 +111,22 @@ def test_akshare_quote_refresh_updates_timestamp(tmp_path):
 
             def quotes(self, symbols):
                 assert symbols == ["000001.SZ"]
-                return [{"代码": "000001", "最新价": 12.34, "涨跌幅": 1.25, "成交额": 123456789}]
+                return [
+                    {
+                        "代码": "000001",
+                        "最新价": 12.34,
+                        "涨跌幅": 1.25,
+                        "成交额": 123456789,
+                        "quote_at": datetime(
+                            2026,
+                            7,
+                            10,
+                            14,
+                            40,
+                            tzinfo=ZoneInfo("Asia/Shanghai"),
+                        ),
+                    }
+                ]
 
         result = refresh_quotes(session, QuoteProvider(), ["000001.SZ"])
         stock = session.scalar(select(Stock).where(Stock.symbol == "000001.SZ"))
@@ -111,9 +134,11 @@ def test_akshare_quote_refresh_updates_timestamp(tmp_path):
 
         assert result.updated == 1
         assert stock.last_price == 12.34
-        assert stock.quote_updated_at is not None
+        assert stock.quote_updated_at.hour == 14
+        assert stock.quote_updated_at.minute == 40
         assert source.healthy
-        assert source.last_quote_at is not None
+        assert source.last_quote_at.hour == 14
+        assert source.last_quote_at.minute == 40
 
 
 def test_stock_master_sync_generates_pinyin_metadata(tmp_path):
@@ -202,6 +227,101 @@ def test_mootdx_provider_reads_minute_bars_when_client_available():
     assert rows[0]["timestamp"].startswith("2026-06-24T14:45:00")
     assert rows[0]["close"] == 10.05
     assert rows[0]["provider"] == "mootdx"
+
+
+def test_mootdx_provider_reads_realtime_quotes_with_server_time():
+    from app.market_data import MootdxProvider
+
+    calls = []
+
+    class Client:
+        def quotes(self, *, symbol, market):
+            calls.append((symbol, market))
+            code = symbol[0]
+            return [
+                {
+                    "code": code,
+                    "price": 10.45,
+                    "last_close": 10.49,
+                    "amount": 999_718_272,
+                    "servertime": "15:29:53.736",
+                }
+            ]
+
+    provider = MootdxProvider()
+    provider.Quotes = object()
+    provider.client = Client()
+    provider.import_error = None
+
+    rows = provider.quotes(["000001.SZ", "600519.SH"])
+
+    assert "realtime" in provider.capabilities
+    assert calls == [(["000001"], 0), (["600519"], 1)]
+    assert [row["代码"] for row in rows] == ["000001", "600519"]
+    assert rows[0]["最新价"] == 10.45
+    assert rows[0]["涨跌幅"] == pytest.approx(-0.3813, abs=0.0001)
+    assert rows[0]["成交额"] == 999_718_272
+    assert rows[0]["quote_at"].strftime("%H:%M:%S") == "15:29:53"
+    assert rows[0]["quote_at"].tzinfo.key == "Asia/Shanghai"
+
+
+def test_akshare_event_provider_normalizes_real_announcements():
+    from app.market_data import AKShareEventProvider
+
+    class Client:
+        @staticmethod
+        def stock_notice_report(**kwargs):
+            if kwargs != {"symbol": "全部", "date": "20260710"}:
+                return []
+            return [
+                {
+                    "代码": "000001",
+                    "公告标题": "关于重大诉讼事项的公告",
+                    "公告日期": "2026-07-10",
+                    "网址": "https://example.test/AN202607101234567890.html",
+                }
+            ]
+
+    provider = AKShareEventProvider(client=Client())
+    rows = provider.events(
+        symbols=["000001.SZ"],
+        start="2026-07-03",
+        end="2026-07-10",
+    )
+
+    assert rows[0]["source"] == "akshare"
+    assert rows[0]["source_event_id"] == "AN202607101234567890"
+    assert rows[0]["symbol"] == "000001.SZ"
+    assert rows[0]["event_type"] == "material_litigation"
+    assert rows[0]["published_at"].isoformat().startswith("2026-07-10")
+    assert rows[0]["published_at"].tzinfo.key == "Asia/Shanghai"
+
+
+def test_akshare_event_provider_extracts_unlock_percentage_from_title():
+    from app.market_data import AKShareEventProvider
+
+    class Client:
+        @staticmethod
+        def stock_notice_report(**kwargs):
+            if kwargs["date"] != "20260710":
+                return []
+            return [
+                {
+                    "代码": "000001",
+                    "公告标题": "限售股上市流通，占流通股本6.2%",
+                    "公告日期": "2026-07-10",
+                    "网址": "https://example.test/unlock.html",
+                }
+            ]
+
+    rows = AKShareEventProvider(client=Client()).events(
+        symbols=["000001.SZ"],
+        start="2026-07-10",
+        end="2026-07-10",
+    )
+
+    assert rows[0]["event_type"] == "unlock"
+    assert rows[0]["unlock_free_float_pct"] == pytest.approx(0.062)
 
 
 def test_mootdx_provider_does_not_advertise_unsupported_trading_calendar():

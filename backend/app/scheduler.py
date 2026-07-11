@@ -34,15 +34,15 @@ def evaluate_schedule(
     window_key = f"{current.date().isoformat()}:{trigger_type}:{run_time}"
     if not enabled:
         return ScheduleDecision(False, window_key, "调度未启用")
-    if not trading_day_fn(current.date()):
-        return ScheduleDecision(False, window_key, "非交易日")
     if last_scheduled_for == window_key:
         return ScheduleDecision(False, window_key, "本窗口已执行")
     target = time.fromisoformat(run_time)
-    seconds = abs(
-        (current.hour * 3600 + current.minute * 60 + current.second)
+    seconds = (
+        current.hour * 3600 + current.minute * 60 + current.second
         - (target.hour * 3600 + target.minute * 60 + target.second)
     )
-    if seconds > tolerance_seconds:
+    if seconds < 0 or seconds > tolerance_seconds:
         return ScheduleDecision(False, window_key, "不在有效执行窗口")
+    if not trading_day_fn(current.date()):
+        return ScheduleDecision(False, window_key, "非交易日")
     return ScheduleDecision(True, window_key, "允许执行")

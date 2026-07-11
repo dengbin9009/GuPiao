@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 from .config import get_settings
-from .market_data import AKShareProvider, MootdxProvider, ProviderRouter, TushareProvider
+from .market_data import (
+    AKShareEventProvider,
+    AKShareProvider,
+    MootdxProvider,
+    ProviderRouter,
+    TushareProvider,
+)
 from .trading_calendar import TradingCalendarService
 
 
@@ -15,3 +21,7 @@ def market_router() -> ProviderRouter:
 
 def trading_calendar_service() -> TradingCalendarService:
     return TradingCalendarService(market_router().providers)
+
+
+def corporate_event_router() -> ProviderRouter:
+    return ProviderRouter([AKShareEventProvider()])

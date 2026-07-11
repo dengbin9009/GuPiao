@@ -24,6 +24,35 @@ def test_qmt_without_url_is_unhealthy():
     assert not adapter.health().healthy
 
 
+def test_live_runtime_requires_both_environment_switches():
+    from app.config import Settings, live_runtime_is_open
+
+    assert not live_runtime_is_open(
+        Settings(live_enabled=False, broker_adapter="qmt")
+    )
+    assert not live_runtime_is_open(
+        Settings(live_enabled=True, broker_adapter="simulation")
+    )
+    assert live_runtime_is_open(
+        SimpleNamespace(live_enabled=True, broker_adapter="qmt")
+    )
+
+
+def test_live_api_mode_enable_is_blocked_by_runtime_gate(db=None):
+    from fastapi import HTTPException
+
+    from app.main import LiveModeUpdate, update_live_mode
+
+    with pytest.raises(HTTPException) as exc_info:
+        update_live_mode(
+            LiveModeUpdate(enabled=True, confirmation="ENABLE LIVE"),
+            None,
+            db,
+        )
+
+    assert exc_info.value.status_code == 403
+
+
 def test_schedule_is_idempotent_and_time_bounded():
     current = datetime(2026, 6, 22, 14, 40, 20, tzinfo=ZoneInfo("Asia/Shanghai"))
     first = evaluate_schedule(
@@ -52,6 +81,21 @@ def test_schedule_is_idempotent_and_time_bounded():
     assert not late.should_run
 
 
+def test_schedule_does_not_run_before_target_time():
+    current = datetime(2026, 6, 22, 14, 39, 40, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    decision = evaluate_schedule(
+        trigger_type="entry_evaluation",
+        run_time="14:40:00",
+        enabled=True,
+        last_scheduled_for=None,
+        current=current,
+    )
+
+    assert not decision.should_run
+    assert decision.reason == "不在有效执行窗口"
+
+
 def test_schedule_uses_calendar_provider_when_supplied():
     current = datetime(2026, 6, 22, 14, 40, 20, tzinfo=ZoneInfo("Asia/Shanghai"))
     denied = evaluate_schedule(
@@ -64,6 +108,40 @@ def test_schedule_uses_calendar_provider_when_supplied():
     )
     assert not denied.should_run
     assert denied.reason == "非交易日"
+
+
+def test_scheduler_only_retries_explicit_transient_data_failures():
+    from app.scheduler_runner import (
+        retry_is_due,
+        schedule_run_needs_retry,
+        schedule_tolerance_seconds,
+    )
+
+    assert schedule_run_needs_retry(
+        SimpleNamespace(status="completed", summary={"retryable": True})
+    )
+    assert not schedule_run_needs_retry(
+        SimpleNamespace(status="completed", summary={"accepted": 0, "reason": "没有候选股"})
+    )
+    assert not schedule_run_needs_retry(
+        SimpleNamespace(status="failed", summary={})
+    )
+    current = datetime(2026, 7, 13, 14, 40, 5, tzinfo=ZoneInfo("Asia/Shanghai"))
+    assert retry_is_due(None, current=current)
+    assert not retry_is_due(
+        current.replace(second=20),
+        current=current,
+    )
+    assert retry_is_due(
+        current.replace(second=5, tzinfo=None),
+        current=current,
+    )
+    exit_schedule = SimpleNamespace(
+        trigger_type="exit_evaluation",
+        run_time="09:35:00",
+    )
+    config = SimpleNamespace(parameters={"latest_exit_time": "10:00:00"})
+    assert schedule_tolerance_seconds(exit_schedule, config) == 1500
 
 
 def test_notification_delivery_retries_up_to_success():

@@ -6,20 +6,19 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import BackgroundTasks, Cookie, Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi import BackgroundTasks, Cookie, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, or_, select
 from sqlalchemy.orm import Session
 
-from .config import Settings, get_settings
+from .config import Settings, get_settings, live_runtime_is_open
 from .database import Base, SessionLocal, apply_runtime_migrations, engine, get_db
-from .data_sync import refresh_quotes, sync_stock_master
-from .data_sync import sync_corporate_events
+from .data_sync import sync_stock_master
 from .brokers import build_broker_adapter
 from .live_trading import sync_live_accounts as sync_broker_accounts
-from .market_data import AKShareProvider, MarketDataError, ProviderRouter, TushareProvider
-from .market_cache import quote_is_stale, read_bar_cache, refresh_bar_cache, write_bar_cache
+from .market_data import MarketDataError
+from .market_cache import quote_is_stale, read_bar_cache, refresh_bar_cache
 from .models import (
     AccountSnapshot,
     Administrator,
@@ -49,16 +48,13 @@ from .models import (
     now,
 )
 from .notifications import deliver_channel
-from .worker import poll_watchlist_quotes
+from .worker import poll_corporate_events, poll_watchlist_quotes
 from .providers import market_router, trading_calendar_service
 from .security import create_session, read_session, verify_password
-from .trading_calendar import TradingCalendarService
 from .services import (
-    OVERNIGHT_DEFAULTS,
     create_backtest,
     execute_simulation_strategy,
     generated_bars,
-    scan_plugins,
     seed_database,
     serialize,
     snapshot_account,
@@ -70,21 +66,12 @@ from .services import (
 settings = get_settings()
 
 
-def event_rows_for_symbols(symbols: list[str]) -> list[dict[str, Any]]:
-    timestamp = now()
-    rows: list[dict[str, Any]] = []
-    for symbol in symbols:
-        rows.append(
-            {
-                "source": "cninfo",
-                "source_event_id": f"demo-{symbol}-{timestamp:%Y%m%d}",
-                "symbol": symbol,
-                "title": "演示事件同步",
-                "event_type": "major_announcement",
-                "published_at": timestamp,
-            }
+def require_live_runtime_open() -> None:
+    if not live_runtime_is_open(settings):
+        raise HTTPException(
+            status_code=403,
+            detail="运行配置未启用真实盘，LIVE 写操作已禁止",
         )
-    return rows
 
 
 @asynccontextmanager
@@ -283,13 +270,10 @@ def list_watchlist(_: Administrator = Depends(require_admin), db: Session = Depe
 
 @app.post("/api/watchlist/refresh")
 def refresh_watchlist(_: Administrator = Depends(require_admin), db: Session = Depends(get_db)):
-    stocks = list(db.scalars(select(Stock).join(WatchlistItem, WatchlistItem.stock_id == Stock.id)))
-    try:
-        provider = market_router().select("realtime")
-        result = refresh_quotes(db, provider, [stock.symbol for stock in stocks])
-    except MarketDataError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    return {"updated": result.updated, "missing": result.missing}
+    result = poll_watchlist_quotes()
+    if result["errors"]:
+        raise HTTPException(status_code=503, detail="实时行情提供方全部不可用")
+    return result
 
 
 @app.post("/api/market-data/stocks/sync")
@@ -304,17 +288,10 @@ def sync_stocks(_: Administrator = Depends(require_admin), db: Session = Depends
 
 @app.post("/api/market-data/events/sync")
 def sync_events(_: Administrator = Depends(require_admin), db: Session = Depends(get_db)):
-    symbols = [item.symbol for item in db.scalars(select(Stock).order_by(Stock.id).limit(20))]
-    if not symbols:
-        return {"provider": "cninfo", "created": 0, "updated": 0}
-    result = sync_corporate_events(db, event_rows_for_symbols(symbols))
-    source = db.scalar(select(DataSourceState).where(DataSourceState.provider == "cninfo"))
-    if source:
-        source.healthy = True
-        source.last_checked_at = now()
-        source.last_error = None
-        db.commit()
-    return {"provider": "cninfo", "created": result.created, "updated": result.updated}
+    result = poll_corporate_events()
+    if result["errors"]:
+        raise HTTPException(status_code=503, detail="公司公告提供方全部不可用")
+    return {"provider": "akshare_events", **result}
 
 
 @app.post("/api/watchlist", status_code=201)
@@ -362,6 +339,8 @@ def create_strategy_config(payload: StrategyConfigCreate, _: Administrator = Dep
         raise HTTPException(status_code=422, detail="策略不存在或不可用")
     if payload.mode not in {"SIMULATION", "LIVE"}:
         raise HTTPException(status_code=422, detail="交易模式无效")
+    if payload.mode == "LIVE":
+        require_live_runtime_open()
     try:
         parameters = validate_strategy_parameters(definition.parameter_schema, payload.parameters)
     except ValueError as exc:
@@ -401,6 +380,8 @@ def run_strategy(config_id: int, _: Administrator = Depends(require_admin), db: 
     config = db.get(StrategyConfig, config_id)
     if not config or not config.enabled:
         raise HTTPException(status_code=422, detail="策略配置不可运行")
+    if config.mode == "LIVE":
+        require_live_runtime_open()
     run = execute_simulation_strategy(db, config)
     if run.status == "failed" and config.mode == "LIVE":
         raise HTTPException(status_code=403, detail=run.error_message)
@@ -429,8 +410,11 @@ def schedules(_: Administrator = Depends(require_admin), db: Session = Depends(g
 def create_schedule(payload: ScheduleCreate, _: Administrator = Depends(require_admin), db: Session = Depends(get_db)):
     if payload.trigger_type not in {"entry_evaluation", "exit_evaluation", "custom"}:
         raise HTTPException(status_code=422, detail="调度触发类型无效")
-    if not db.get(StrategyConfig, payload.strategy_config_id):
+    config = db.get(StrategyConfig, payload.strategy_config_id)
+    if not config:
         raise HTTPException(status_code=404, detail="策略配置不存在")
+    if config.mode == "LIVE" and payload.enabled:
+        require_live_runtime_open()
     item = StrategySchedule(
         strategy_config_id=payload.strategy_config_id,
         trigger_type=payload.trigger_type,
@@ -448,6 +432,9 @@ def update_schedule(schedule_id: int, payload: ScheduleUpdate, _: Administrator 
     item = db.get(StrategySchedule, schedule_id)
     if not item:
         raise HTTPException(status_code=404, detail="调度不存在")
+    config = db.get(StrategyConfig, item.strategy_config_id)
+    if config and config.mode == "LIVE" and payload.enabled:
+        require_live_runtime_open()
     for key, value in payload.model_dump(exclude_none=True).items():
         setattr(item, key, value)
     db.commit()
@@ -591,6 +578,7 @@ def live_accounts(_: Administrator = Depends(require_admin), db: Session = Depen
 
 @app.post("/api/live/accounts/sync")
 def sync_live_accounts(_: Administrator = Depends(require_admin), db: Session = Depends(get_db)):
+    require_live_runtime_open()
     gateway = db.scalar(select(BrokerGateway).where(BrokerGateway.enabled.is_(True)).order_by(BrokerGateway.id))
     if not gateway:
         raise HTTPException(status_code=503, detail="没有已启用的真实盘适配器")
@@ -623,6 +611,8 @@ def update_live_account(
     account = db.get(LiveTradingAccount, account_id)
     if not account:
         raise HTTPException(status_code=404, detail="真实盘账户不存在")
+    if payload.enabled is True or payload.read_only is False:
+        require_live_runtime_open()
     if payload.enabled is not None:
         account.enabled = payload.enabled
     if payload.read_only is not None:
@@ -638,6 +628,8 @@ def update_live_mode(
     _: Administrator = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
+    if payload.enabled:
+        require_live_runtime_open()
     risk = db.scalar(select(RiskSettings).where(RiskSettings.mode == "LIVE"))
     if not risk:
         raise HTTPException(status_code=404, detail="真实盘风控配置不存在")
@@ -685,6 +677,8 @@ def get_risk_settings(_: Administrator = Depends(require_admin), db: Session = D
 @app.put("/api/risk/settings")
 def update_risk_settings(payload: dict[str, Any], _: Administrator = Depends(require_admin), db: Session = Depends(get_db)):
     mode = payload.pop("mode", "LIVE")
+    if mode == "LIVE" and payload.get("live_enabled") is True:
+        require_live_runtime_open()
     item = db.scalar(select(RiskSettings).where(RiskSettings.mode == mode))
     if not item:
         raise HTTPException(status_code=404, detail="风控配置不存在")

@@ -6,13 +6,13 @@ from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.inspection import inspect
 from sqlalchemy.orm import Session
 
 from .brokers import build_broker_adapter
 from .backtest_engine import BacktestEngine, BacktestRequest
-from .config import Settings, get_settings
+from .config import Settings, get_settings, live_runtime_is_open
 from .overnight_strategy import build_universe_candidates, select_best_candidate
 from .market_data import StaleDataError, ensure_fresh
 from .market_cache import quote_is_stale
@@ -26,8 +26,6 @@ from .models import (
     Fill,
     GatewayEvent,
     LiveTradingAccount,
-    NotificationChannel,
-    NotificationDelivery,
     Order,
     Position,
     RiskEvent,
@@ -170,37 +168,55 @@ def seed_database(db: Session, settings: Settings) -> None:
             )
         )
 
-    if not db.scalar(select(DataSourceState.id).limit(1)):
-        current = now()
-        db.add_all(
-            [
-                DataSourceState(
-                    provider="akshare",
-                    enabled=True,
-                    healthy=True,
-                    capabilities=["daily", "minute", "realtime", "corporate_events"],
-                    last_quote_at=current,
-                    stale_after_seconds=settings.market_stale_seconds,
-                    last_checked_at=current,
-                ),
-                DataSourceState(
-                    provider="tushare",
-                    enabled=bool(__import__("os").getenv("TUSHARE_TOKEN")),
-                    healthy=bool(__import__("os").getenv("TUSHARE_TOKEN")),
-                    capabilities=["daily", "minute", "corporate_events"],
-                    last_checked_at=current,
-                    last_error=None if __import__("os").getenv("TUSHARE_TOKEN") else "未配置 Tushare Token",
-                ),
-                DataSourceState(
-                    provider="cninfo",
-                    enabled=True,
-                    healthy=True,
-                    capabilities=["corporate_events"],
-                    stale_after_seconds=settings.corporate_event_stale_seconds,
-                    last_checked_at=current,
-                ),
-            ]
-        )
+    tushare_enabled = bool(__import__("os").getenv("TUSHARE_TOKEN"))
+    source_defaults = [
+        {
+            "provider": "akshare",
+            "enabled": True,
+            "healthy": False,
+            "capabilities": ["stock_master", "daily", "minute", "realtime"],
+            "stale_after_seconds": settings.market_stale_seconds,
+            "last_error": "等待首次行情探测",
+        },
+        {
+            "provider": "tushare",
+            "enabled": tushare_enabled,
+            "healthy": False,
+            "capabilities": ["stock_master", "daily", "minute", "corporate_events"],
+            "last_error": None if tushare_enabled else "未配置 Tushare Token",
+        },
+        {
+            "provider": "cninfo",
+            "enabled": False,
+            "healthy": False,
+            "capabilities": ["corporate_events"],
+            "stale_after_seconds": settings.corporate_event_stale_seconds,
+            "last_error": "未配置 CNINFO 抓取器",
+        },
+        {
+            "provider": "mootdx",
+            "enabled": True,
+            "healthy": False,
+            "capabilities": ["minute", "hour", "realtime"],
+            "stale_after_seconds": settings.market_stale_seconds,
+            "last_error": "等待首次行情探测",
+        },
+        {
+            "provider": "akshare_events",
+            "enabled": True,
+            "healthy": False,
+            "capabilities": ["corporate_events"],
+            "stale_after_seconds": settings.corporate_event_stale_seconds,
+            "last_error": "等待首次公告探测",
+        },
+    ]
+    for defaults in source_defaults:
+        if not db.scalar(
+            select(DataSourceState.id).where(
+                DataSourceState.provider == defaults["provider"]
+            )
+        ):
+            db.add(DataSourceState(**defaults))
 
     if not db.scalar(select(BrokerGateway.id).limit(1)):
         db.add_all(
@@ -354,8 +370,38 @@ def watchlist_payload(db: Session, item: WatchlistItem) -> dict[str, Any]:
     return {"id": item.id, "stock": stock_payload(stock), "note": item.note, "created_at": item.created_at.isoformat()}
 
 
-def _critical_event_symbols(db: Session) -> set[str]:
-    rows = db.scalars(select(StockEvent).where(StockEvent.severity == "critical")).all()
+def _critical_event_symbols(
+    db: Session,
+    *,
+    current: datetime | None = None,
+    lookback_days: int = 7,
+) -> set[str]:
+    current = current or now()
+    blocking_types = {
+        "suspension",
+        "resumption",
+        "regulatory_investigation",
+        "material_litigation",
+        "shareholder_reduction",
+        "earnings_warning",
+        "major_announcement",
+    }
+    rows = db.scalars(
+        select(StockEvent).where(
+            StockEvent.published_at >= current - timedelta(days=lookback_days),
+            StockEvent.published_at <= current,
+            or_(
+                StockEvent.event_type.in_(blocking_types),
+                and_(
+                    StockEvent.event_type == "unlock",
+                    or_(
+                        StockEvent.unlock_free_float_pct.is_(None),
+                        StockEvent.unlock_free_float_pct > 0.05,
+                    ),
+                ),
+            ),
+        )
+    ).all()
     if not rows:
         return set()
     stock_ids = {item.stock_id for item in rows}
@@ -371,7 +417,7 @@ def _select_overnight_stock(db: Session, config: StrategyConfig, *, current: dat
     selection = select_best_candidate(
         candidates,
         parameters,
-        critical_event_symbols=_critical_event_symbols(db),
+        critical_event_symbols=_critical_event_symbols(db, current=current),
     )
     summary = {
         "scanned": len(candidates),
@@ -428,12 +474,42 @@ def execute_simulation_strategy(db: Session, config: StrategyConfig) -> Strategy
 
     quote_at = stock.quote_updated_at
     if not quote_at:
-        return _complete_rejected_run(db, run, "行情时间缺失", stock.symbol, selection=selection_summary)
+        return _complete_rejected_run(
+            db,
+            run,
+            "行情时间缺失",
+            stock.symbol,
+            selection=selection_summary,
+            retryable=True,
+        )
     if quote_is_stale(quote_at, current=current, stale_after_seconds=get_settings().market_stale_seconds):
-        return _complete_rejected_run(db, run, "行情已过期", stock.symbol, selection=selection_summary)
+        return _complete_rejected_run(
+            db,
+            run,
+            "行情已过期",
+            stock.symbol,
+            selection=selection_summary,
+            retryable=True,
+        )
 
     if config.parameters.get("event_risk_enabled", OVERNIGHT_DEFAULTS["event_risk_enabled"]):
-        event_source = db.scalar(select(DataSourceState).where(DataSourceState.provider == "cninfo"))
+        event_sources = list(
+            db.scalars(
+                select(DataSourceState).where(
+                    DataSourceState.enabled.is_(True),
+                    DataSourceState.healthy.is_(True),
+                )
+            )
+        )
+        event_source = max(
+            (
+                source
+                for source in event_sources
+                if "corporate_events" in (source.capabilities or [])
+            ),
+            key=lambda source: source.last_checked_at or datetime.min.replace(tzinfo=current.tzinfo),
+            default=None,
+        )
         try:
             ensure_fresh(
                 "公司事件",
@@ -442,7 +518,15 @@ def execute_simulation_strategy(db: Session, config: StrategyConfig) -> Strategy
                 current=current,
             )
         except StaleDataError as exc:
-            return _complete_rejected_run(db, run, str(exc), stock.symbol, "stale_event_data", selection=selection_summary)
+            return _complete_rejected_run(
+                db,
+                run,
+                str(exc),
+                stock.symbol,
+                "stale_event_data",
+                selection=selection_summary,
+                retryable=True,
+            )
 
     max_notional = min(risk.max_order_notional_abs, account.total_asset * risk.max_order_notional_pct)
     quantity = math.floor(max_notional / stock.last_price / 100) * 100
@@ -622,9 +706,17 @@ def _complete_rejected_run(
     event_type: str = "blocked",
     *,
     selection: dict[str, Any] | None = None,
+    retryable: bool = False,
 ) -> StrategyRun:
     run.status = "completed"
-    run.summary = {"accepted": 0, "rejected": 1, "reason": message, "symbol": symbol, "selection": selection or {}}
+    run.summary = {
+        "accepted": 0,
+        "rejected": 1,
+        "reason": message,
+        "symbol": symbol,
+        "selection": selection or {},
+        "retryable": retryable,
+    }
     run.finished_at = now()
     db.add(
         RiskEvent(
@@ -672,15 +764,86 @@ def execute_simulation_exit(db: Session, config: StrategyConfig) -> StrategyRun:
     if not account or not risk or risk.emergency_stop_enabled:
         return _complete_rejected_run(db, run, "模拟账户不可用或已紧急停止", "")
 
-    positions = list(
+    current = now()
+    account_positions = list(
         db.scalars(
             select(Position).where(
                 Position.account_id == account.id,
                 Position.mode == "SIMULATION",
-                Position.available_quantity > 0,
+                Position.quantity > 0,
             )
         )
     )
+    config_available: dict[int, int] = {}
+    for position in account_positions:
+        cutoff = datetime.combine(
+            current.date(),
+            datetime.min.time(),
+            tzinfo=current.tzinfo,
+        )
+        previous_buy_quantity = db.scalar(
+            select(func.coalesce(func.sum(Fill.quantity), 0))
+            .join(Order, Fill.order_id == Order.id)
+            .where(
+                Fill.account_id == account.id,
+                Fill.mode == "SIMULATION",
+                Fill.stock_id == position.stock_id,
+                Order.side == "buy",
+                Fill.filled_at < cutoff,
+            )
+        ) or 0
+        sold_quantity = db.scalar(
+            select(func.coalesce(func.sum(Fill.quantity), 0))
+            .join(Order, Fill.order_id == Order.id)
+            .where(
+                Fill.account_id == account.id,
+                Fill.mode == "SIMULATION",
+                Fill.stock_id == position.stock_id,
+                Order.side == "sell",
+                Fill.filled_at <= current,
+            )
+        ) or 0
+        position.available_quantity = min(
+            position.quantity,
+            max(0, int(previous_buy_quantity - sold_quantity)),
+        )
+        config_buy_quantity = db.scalar(
+            select(func.coalesce(func.sum(Fill.quantity), 0))
+            .join(Order, Fill.order_id == Order.id)
+            .join(StrategyRun, Order.strategy_run_id == StrategyRun.id)
+            .where(
+                Fill.account_id == account.id,
+                Fill.mode == "SIMULATION",
+                Fill.stock_id == position.stock_id,
+                Order.side == "buy",
+                StrategyRun.strategy_config_id == config.id,
+                Fill.filled_at < cutoff,
+            )
+        ) or 0
+        config_sell_quantity = db.scalar(
+            select(func.coalesce(func.sum(Fill.quantity), 0))
+            .join(Order, Fill.order_id == Order.id)
+            .join(StrategyRun, Order.strategy_run_id == StrategyRun.id)
+            .where(
+                Fill.account_id == account.id,
+                Fill.mode == "SIMULATION",
+                Fill.stock_id == position.stock_id,
+                Order.side == "sell",
+                StrategyRun.strategy_config_id == config.id,
+                Fill.filled_at <= current,
+            )
+        ) or 0
+        config_available[position.id] = min(
+            position.available_quantity,
+            max(0, int(config_buy_quantity - config_sell_quantity)),
+        )
+    db.flush()
+
+    positions = [
+        position
+        for position in account_positions
+        if config_available.get(position.id, 0) > 0
+    ]
     if not positions:
         run.status = "completed"
         run.finished_at = now()
@@ -688,6 +851,29 @@ def execute_simulation_exit(db: Session, config: StrategyConfig) -> StrategyRun:
         db.add(StrategyLog(strategy_run_id=run.id, message="退出检查完成：没有可卖持仓", context={}))
         db.commit()
         return run
+
+    stale_symbols = []
+    for position in positions:
+        stock = db.get(Stock, position.stock_id)
+        if (
+            not stock
+            or not stock.last_price
+            or quote_is_stale(
+                stock.quote_updated_at,
+                current=current,
+                stale_after_seconds=get_settings().market_stale_seconds,
+            )
+        ):
+            stale_symbols.append(stock.symbol if stock else str(position.stock_id))
+    if stale_symbols:
+        return _complete_rejected_run(
+            db,
+            run,
+            f"退出行情已过期: {', '.join(stale_symbols[:5])}",
+            stale_symbols[0],
+            "stale_quote_data",
+            retryable=True,
+        )
 
     sold = []
     for position in positions:
@@ -702,7 +888,7 @@ def execute_simulation_exit(db: Session, config: StrategyConfig) -> StrategyRun:
                 )
             )
             continue
-        quantity = position.available_quantity
+        quantity = config_available[position.id]
         fill_price = stock.last_price * (1 - account.slippage_bps / 10_000)
         notional = fill_price * quantity
         commission = max(notional * account.commission_rate, account.min_commission)
@@ -826,6 +1012,9 @@ def _fail_live_run(
 
 
 def _execute_live_strategy(db: Session, config: StrategyConfig, run: StrategyRun) -> StrategyRun:
+    app_settings = get_settings()
+    if not live_runtime_is_open(app_settings):
+        return _fail_live_run(db, run, "运行配置未启用真实盘，禁止下单")
     risk = db.scalar(select(RiskSettings).where(RiskSettings.mode == "LIVE"))
     if not risk or not risk.live_enabled:
         return _fail_live_run(db, run, "真实盘未启用")
@@ -868,7 +1057,6 @@ def _execute_live_strategy(db: Session, config: StrategyConfig, run: StrategyRun
 
     current = now()
     quote_at = stock.quote_updated_at
-    app_settings = get_settings()
     if quote_is_stale(quote_at, current=current, stale_after_seconds=app_settings.market_stale_seconds):
         return _fail_live_run(db, run, "真实盘行情已过期，禁止下单", context={"symbol": stock.symbol, "selection": selection_summary})
 

@@ -13,6 +13,18 @@ from app.brokers import BrokerHealth
 
 
 def main() -> None:
+    class HealthyGatewayAdapter:
+        name = "QMT"
+
+        def health(self):
+            return BrokerHealth(True, "ok", ("accounts", "orders"))
+
+        def query_accounts(self):
+            return []
+
+        def place_order(self, order):
+            return {"broker_order_id": "BRK-1", "status": "submitted", "echo": order}
+
     db_path = Path(__file__).resolve().parents[1] / ".tmp-live-verify.db"
     if db_path.exists():
         db_path.unlink()
@@ -33,72 +45,67 @@ def main() -> None:
         db.commit()
         blocked = execute_simulation_strategy(db, config)
         assert blocked.status == "failed"
-        assert "真实盘账户" in blocked.error_message
-
-        gateway.enabled = True
-        gateway.healthy = True
-        account = LiveTradingAccount(
-            broker="qmt",
-            account_alias="主账户",
-            account_no_masked="******7890",
-            gateway_id=gateway.id,
-            enabled=True,
-            read_only=False,
-            market_permissions=["A_SHARE"],
-            account_capabilities=["orders", "positions"],
-        )
-        db.add(account)
-        db.flush()
-        db.add(
-            AccountSnapshot(
-                mode="LIVE",
-                account_id=account.id,
-                cash_balance=200000,
-                available_cash=200000,
-                frozen_cash=0,
-                market_value=0,
-                total_asset=200000,
-                realized_pnl=0,
-                unrealized_pnl=0,
-                exposure=0,
-                source="test",
-            )
-        )
-        db.commit()
-
-        account.read_only = True
-        db.commit()
-        readonly = execute_simulation_strategy(db, config)
-        assert readonly.status == "failed"
-        assert "只读" in readonly.error_message
-
-        account.read_only = False
-        gateway.healthy = False
-        db.commit()
-        unhealthy = execute_simulation_strategy(db, config)
-        assert unhealthy.status == "failed"
-        assert "网关" in unhealthy.error_message
-
-        class HealthyGatewayAdapter:
-            name = "QMT"
-
-            def health(self):
-                return BrokerHealth(True, "ok", ("accounts", "orders"))
-
-            def query_accounts(self):
-                return []
-
-            def place_order(self, order):
-                return {"broker_order_id": "BRK-1", "status": "submitted", "echo": order}
-
-        gateway.healthy = True
-        db.commit()
+        assert "运行配置" in blocked.error_message
 
         import app.services as services
 
+        original_runtime_gate = services.live_runtime_is_open
+        services.live_runtime_is_open = lambda _: True
+
         original_build = services.build_broker_adapter
-        services.build_broker_adapter = lambda *args, **kwargs: HealthyGatewayAdapter()
         try:
+            no_account = execute_simulation_strategy(db, config)
+            assert no_account.status == "failed"
+            assert "真实盘账户" in no_account.error_message
+
+            gateway.enabled = True
+            gateway.healthy = True
+            account = LiveTradingAccount(
+                broker="qmt",
+                account_alias="主账户",
+                account_no_masked="******7890",
+                gateway_id=gateway.id,
+                enabled=True,
+                read_only=False,
+                market_permissions=["A_SHARE"],
+                account_capabilities=["orders", "positions"],
+            )
+            db.add(account)
+            db.flush()
+            db.add(
+                AccountSnapshot(
+                    mode="LIVE",
+                    account_id=account.id,
+                    cash_balance=200000,
+                    available_cash=200000,
+                    frozen_cash=0,
+                    market_value=0,
+                    total_asset=200000,
+                    realized_pnl=0,
+                    unrealized_pnl=0,
+                    exposure=0,
+                    source="test",
+                )
+            )
+            db.commit()
+
+            account.read_only = True
+            db.commit()
+            readonly = execute_simulation_strategy(db, config)
+            assert readonly.status == "failed"
+            assert "只读" in readonly.error_message
+
+            account.read_only = False
+            gateway.healthy = False
+            db.commit()
+            unhealthy = execute_simulation_strategy(db, config)
+            assert unhealthy.status == "failed"
+            assert "网关" in unhealthy.error_message
+
+            gateway.healthy = True
+            db.commit()
+
+            services.build_broker_adapter = lambda *args, **kwargs: HealthyGatewayAdapter()
             stock = db.scalar(select(services.Stock).where(services.Stock.symbol == "000001.SZ"))
             for candidate in db.scalars(select(services.Stock)).all():
                 candidate.change_pct = 4.9 if candidate.id == stock.id else 0.2
@@ -108,6 +115,7 @@ def main() -> None:
             assert success.status == "completed"
             assert success.summary["broker_order_id"] == "BRK-1"
         finally:
+            services.live_runtime_is_open = original_runtime_gate
             services.build_broker_adapter = original_build
 
         print("live_guardrails_ok")

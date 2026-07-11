@@ -57,6 +57,7 @@ def test_quote_staleness_uses_configured_threshold():
 
     assert quote_is_stale(current - timedelta(seconds=16), current=current, stale_after_seconds=15)
     assert not quote_is_stale(current - timedelta(seconds=5), current=current, stale_after_seconds=15)
+    assert quote_is_stale(current + timedelta(minutes=1), current=current, stale_after_seconds=15)
 
 
 def test_minute_bar_cache_refresh_writes_named_file(tmp_path: Path):

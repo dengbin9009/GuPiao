@@ -2,7 +2,6 @@ from __future__ import annotations
 
 
 def test_recent_overnight_script_uses_router_without_select(monkeypatch):
-    from app import recent_overnight_backtest
     from scripts import backtest_recent_overnight as script
 
     class DummyRouter:

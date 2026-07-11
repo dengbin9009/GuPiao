@@ -38,6 +38,32 @@
 
 ```json
 {
+  "run_id": "2026-07-10-simulation-auto-runtime",
+  "pattern": "daily-triage",
+  "mode": "manual-approved-fix",
+  "iteration": 2,
+  "items_found": 20,
+  "actions_taken": 20,
+  "same_error_attempt": 0,
+  "escalations": 0,
+  "worktree": ".worktrees/restore-simulation-loop",
+  "safety": "LIVE=false; BROKER=simulation; 真实订单数为 0",
+  "outcome": "done-with-scheduled-observation",
+  "evidence": [
+    "Ruff、后端全套 103 passed、6 个验收脚本和前端 Node 20 构建通过",
+    "AKShare 股票主数据 5530 只，mootdx 行情 5203 只，公告记录 9059 条",
+    "scheduler 原子占用、租约恢复和端到端测试证明 14:40 到点创建 1 笔模拟订单且同窗口不重复",
+    "独立审查发现的 LIVE 硬门、旧库迁移、调度并发、退出重试、事件风险、锁恢复、公告周期和持仓归属问题均已修复并覆盖测试",
+    "LaunchAgent 四进程连续超过 90 秒；backend 与 frontend HTTP 健康，caffeinate 防睡眠有效",
+    "认证后总览、策略、计划、模拟账户、订单、持仓、数据源接口均返回 200",
+    "LIVE 环境与数据库双关闭，启用 LIVE API 返回 403，启用账户/计划/真实订单均为 0",
+    "当前为周六非交易日；下一合法入场窗口为 2026-07-13 14:40"
+  ]
+}
+```
+
+```json
+{
   "run_id": "2026-07-10-simulation-recovery",
   "pattern": "daily-triage",
   "mode": "L1-report-only",

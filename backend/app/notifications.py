@@ -121,11 +121,14 @@ def deliver_channel(
     message: str,
 ) -> DeliveryResult:
     if channel_type == "email":
-        sender = lambda: send_email(settings, recipient, subject, message)
+        def sender() -> None:
+            send_email(settings, recipient, subject, message)
     elif channel_type == "wecom":
         webhook_url = os.getenv(secret_ref, "") if secret_ref else ""
         webhook_url = webhook_url or settings.wecom_webhook_url
-        sender = lambda: send_wecom(webhook_url, f"{subject}\n{message}")
+
+        def sender() -> None:
+            send_wecom(webhook_url, f"{subject}\n{message}")
     else:
         return DeliveryResult(False, 0, "不支持的通知渠道")
     return deliver_with_retries(sender, max_attempts=3)

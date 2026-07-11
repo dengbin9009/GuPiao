@@ -7,7 +7,9 @@ from sqlalchemy.orm import Session
 
 from .config import Settings
 from .models import (
+    Administrator,
     DataSourceState,
+    LiveTradingAccount,
     RiskSettings,
     SimulationAccount,
     Stock,
@@ -16,6 +18,7 @@ from .models import (
     StrategySchedule,
     WatchlistItem,
 )
+from .security import hash_password, verify_password
 from .services import OVERNIGHT_DEFAULTS, adjust_simulation_cash, seed_database
 
 
@@ -34,9 +37,29 @@ def prepare_simulation_runtime(db: Session, settings: Settings) -> dict[str, Any
     _assert_simulation_only(settings)
     seed_database(db, settings)
 
+    administrator = db.scalar(
+        select(Administrator).where(
+            Administrator.username == settings.admin_username
+        )
+    )
+    if administrator and not verify_password(
+        settings.admin_password,
+        administrator.password_hash,
+    ):
+        administrator.password_hash = hash_password(settings.admin_password)
+
     live_risk = db.scalar(select(RiskSettings).where(RiskSettings.mode == "LIVE"))
-    if live_risk and live_risk.live_enabled:
-        raise RuntimeError("模拟盘观察模式拒绝启动：数据库中的真实盘仍处于启用状态")
+    if live_risk:
+        live_risk.live_enabled = False
+        live_risk.emergency_stop_enabled = True
+    for live_account in db.scalars(select(LiveTradingAccount)):
+        live_account.enabled = False
+        live_account.read_only = True
+    simulation_risk = db.scalar(
+        select(RiskSettings).where(RiskSettings.mode == "SIMULATION")
+    )
+    if simulation_risk:
+        simulation_risk.emergency_stop_enabled = False
 
     for source in db.scalars(select(DataSourceState)):
         source.healthy = False
@@ -54,6 +77,7 @@ def prepare_simulation_runtime(db: Session, settings: Settings) -> dict[str, Any
     account = db.scalar(select(SimulationAccount).limit(1))
     if account is None:
         raise RuntimeError("模拟盘初始化失败：缺少模拟账户")
+    account.status = "active"
     funding_delta = float(settings.simulation_initial_cash) - float(account.initial_cash)
     if funding_delta:
         adjust_simulation_cash(db, account, funding_delta, "模拟盘观察初始资金调整")

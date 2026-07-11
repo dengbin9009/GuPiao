@@ -3,6 +3,32 @@ from __future__ import annotations
 from datetime import date
 
 
+def test_schedule_skips_calendar_lookup_outside_execution_window():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from app.scheduler import evaluate_schedule
+
+    calls = 0
+
+    def trading_day_fn(_):
+        nonlocal calls
+        calls += 1
+        return True
+
+    decision = evaluate_schedule(
+        trigger_type="entry_evaluation",
+        run_time="14:40",
+        enabled=True,
+        last_scheduled_for=None,
+        current=datetime(2026, 7, 10, 21, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        trading_day_fn=trading_day_fn,
+    )
+
+    assert not decision.should_run
+    assert calls == 0
+
+
 class CalendarProvider:
     name = "calendar-provider"
     capabilities = frozenset({"trading_calendar"})

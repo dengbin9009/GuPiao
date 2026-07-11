@@ -143,6 +143,10 @@ class Settings:
         object.__setattr__(self, "wecom_webhook_url", os.getenv("WECOM_WEBHOOK_URL", self.wecom_webhook_url))
 
 
+def live_runtime_is_open(settings: Settings) -> bool:
+    return settings.live_enabled and settings.broker_adapter != "simulation"
+
+
 @lru_cache
 def get_settings() -> Settings:
     return Settings()

@@ -2,12 +2,18 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
+from urllib.parse import parse_qs, urlparse
 from typing import Any, Iterable
+from zoneinfo import ZoneInfo
+import re
 
 
 class MarketDataError(RuntimeError):
     pass
+
+
+SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 class StaleDataError(MarketDataError):
@@ -99,12 +105,15 @@ def ensure_fresh(
     stale_after_seconds: int,
     current: datetime | None = None,
 ) -> None:
-    current = current or datetime.now().astimezone()
+    current = current or datetime.now(SHANGHAI)
     if updated_at is None:
         raise StaleDataError(f"{label}数据缺失")
     if updated_at.tzinfo is None:
         updated_at = updated_at.replace(tzinfo=current.tzinfo)
-    if (current - updated_at).total_seconds() > stale_after_seconds:
+    age_seconds = (current - updated_at).total_seconds()
+    if age_seconds < 0:
+        raise StaleDataError(f"{label}数据时间在未来")
+    if age_seconds > stale_after_seconds:
         raise StaleDataError(f"{label}数据已过期")
 
 
@@ -178,7 +187,7 @@ class AKShareProvider(MarketDataProvider):
                         symbol=code,
                         period="daily",
                         start_date=(start or "19900101").replace("-", ""),
-                        end_date=(end or datetime.now().date().isoformat()).replace("-", ""),
+                        end_date=(end or datetime.now(SHANGHAI).date().isoformat()).replace("-", ""),
                         adjust="qfq",
                     )
                 )
@@ -266,7 +275,7 @@ class TushareProvider(MarketDataProvider):
 
 class MootdxProvider(MarketDataProvider):
     name = "mootdx"
-    capabilities = frozenset({"minute", "hour"})
+    capabilities = frozenset({"minute", "hour", "realtime"})
 
     def __init__(self):
         try:
@@ -341,7 +350,51 @@ class MootdxProvider(MarketDataProvider):
         return result
 
     def quotes(self, symbols: list[str]) -> list[dict[str, Any]]:
-        raise MarketDataError("mootdx 不提供实时行情")
+        quotes = self._quotes()
+        grouped: dict[int, list[str]] = {0: [], 1: []}
+        for symbol in symbols:
+            code, _, suffix = symbol.partition(".")
+            if suffix.upper() == "BJ":
+                continue
+            grouped[1 if suffix.upper() == "SH" else 0].append(code)
+        result: list[dict[str, Any]] = []
+        for market, codes in grouped.items():
+            for offset in range(0, len(codes), 80):
+                try:
+                    records = _records(
+                        quotes.quotes(symbol=codes[offset : offset + 80], market=market)
+                    )
+                except Exception as exc:
+                    raise MarketDataError(f"mootdx 实时行情获取失败: {exc}") from exc
+                for row in records:
+                    price = float(row.get("price", 0) or 0)
+                    previous_close = float(row.get("last_close", 0) or 0)
+                    server_time = str(row.get("servertime", "")).split(".")[0]
+                    quote_at = None
+                    if server_time:
+                        try:
+                            quote_at = datetime.combine(
+                                datetime.now(SHANGHAI).date(),
+                                datetime.strptime(server_time, "%H:%M:%S").time(),
+                                tzinfo=SHANGHAI,
+                            )
+                        except ValueError:
+                            quote_at = None
+                    change_pct = (
+                        (price - previous_close) / previous_close * 100
+                        if previous_close
+                        else 0.0
+                    )
+                    result.append(
+                        {
+                            "代码": str(row.get("code", "")),
+                            "最新价": price,
+                            "涨跌幅": change_pct,
+                            "成交额": float(row.get("amount", 0) or 0),
+                            "quote_at": quote_at,
+                        }
+                    )
+        return result
 
     def trading_days(self, *, start: str, end: str) -> list[str]:
         raise MarketDataError("mootdx 不提供交易日历")
@@ -360,3 +413,122 @@ class CNInfoEventProvider(CorporateEventProvider):
         if not self.fetcher:
             raise MarketDataError("CNINFO 抓取器未配置")
         return normalize_events(self.fetcher(symbols=symbols, start=start, end=end))
+
+
+class AKShareEventProvider(CorporateEventProvider):
+    name = "akshare_events"
+
+    def __init__(self, client=None):
+        if client is not None:
+            self.client = client
+            self.import_error = None
+            return
+        try:
+            import akshare as ak
+
+            self.client = ak
+            self.import_error = None
+        except ImportError as exc:
+            self.client = None
+            self.import_error = str(exc)
+
+    def health(self) -> tuple[bool, str | None]:
+        return self.client is not None, self.import_error
+
+    def events(
+        self,
+        *,
+        symbols: list[str],
+        start: str,
+        end: str,
+    ) -> list[dict[str, Any]]:
+        if not self.client:
+            raise MarketDataError("AKShare 未安装")
+        requested = set(symbols)
+        rows: list[dict[str, Any]] = []
+        current = datetime.fromisoformat(start).date()
+        end_date = datetime.fromisoformat(end).date()
+        while current <= end_date:
+            try:
+                records = _records(
+                    self.client.stock_notice_report(
+                        symbol="全部",
+                        date=current.strftime("%Y%m%d"),
+                    )
+                )
+            except Exception as exc:
+                raise MarketDataError(f"AKShare 公司公告获取失败: {exc}") from exc
+            for row in records:
+                code = str(row.get("代码", "")).zfill(6)
+                suffix = "SH" if code.startswith(("5", "6", "7")) else "SZ"
+                symbol = f"{code}.{suffix}"
+                if symbol not in requested:
+                    continue
+                title = str(row.get("公告标题", "")).strip()
+                raw_uri = str(row.get("网址", "")).strip()
+                event_id = _announcement_id(raw_uri) or f"{code}-{current:%Y%m%d}-{title}"
+                rows.append(
+                    {
+                        "source": "akshare",
+                        "source_event_id": event_id[:128],
+                        "symbol": symbol,
+                        "title": title,
+                        "event_type": _announcement_event_type(title),
+                        "unlock_free_float_pct": _unlock_percentage(title),
+                        "published_at": _announcement_datetime(
+                            row.get("公告日期"),
+                            current,
+                        ),
+                        "raw_uri": raw_uri or None,
+                    }
+                )
+            current = current.fromordinal(current.toordinal() + 1)
+        return normalize_events(rows)
+
+
+def _announcement_id(raw_uri: str) -> str:
+    if not raw_uri:
+        return ""
+    query_id = parse_qs(urlparse(raw_uri).query).get("announcementId", [""])[0]
+    if query_id:
+        return query_id
+    filename = urlparse(raw_uri).path.rsplit("/", 1)[-1].split(".", 1)[0]
+    return filename
+
+
+def _announcement_event_type(title: str) -> str:
+    rules = (
+        (("停牌",), "suspension"),
+        (("复牌",), "resumption"),
+        (("立案", "调查"), "regulatory_investigation"),
+        (("诉讼", "仲裁"), "material_litigation"),
+        (("减持",), "shareholder_reduction"),
+        (("解禁", "限售股上市"), "unlock"),
+        (("业绩预告", "业绩预警"), "earnings_warning"),
+        (("重大事项", "重大资产", "重大合同", "重大投资", "重大交易"), "major_announcement"),
+    )
+    for keywords, event_type in rules:
+        if any(keyword in title for keyword in keywords):
+            return event_type
+    return "announcement"
+
+
+def _unlock_percentage(title: str) -> float | None:
+    if _announcement_event_type(title) != "unlock":
+        return None
+    if not any(keyword in title for keyword in ("流通股", "流通股份")):
+        return None
+    values = [float(value) / 100 for value in re.findall(r"(\d+(?:\.\d+)?)%", title)]
+    return max(values) if values else None
+
+
+def _announcement_datetime(value: Any, fallback: date) -> datetime:
+    if isinstance(value, datetime):
+        return value.astimezone(SHANGHAI) if value.tzinfo else value.replace(tzinfo=SHANGHAI)
+    if isinstance(value, date):
+        return datetime.combine(value, datetime.min.time(), tzinfo=SHANGHAI)
+    try:
+        parsed = datetime.fromisoformat(str(value))
+        return parsed.astimezone(SHANGHAI) if parsed.tzinfo else parsed.replace(tzinfo=SHANGHAI)
+    except ValueError:
+        return datetime.combine(fallback, datetime.min.time(), tzinfo=SHANGHAI)
