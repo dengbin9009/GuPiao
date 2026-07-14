@@ -5,12 +5,13 @@ ARG INSTALL_AGENTS=false
 WORKDIR /app
 COPY pyproject.toml ./
 COPY app ./app
+RUN pip install --no-cache-dir uv
 RUN if [ "$INSTALL_AGENTS" = "true" ]; then \
       apt-get update && apt-get install -y --no-install-recommends git && \
-      pip install --no-cache-dir '.[market,agents]' && \
+      uv pip install --system --no-cache '.[market,agents]' && \
       apt-get purge -y git && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*; \
     else \
-      pip install --no-cache-dir '.[market]'; \
+      uv pip install --system --no-cache '.[market]'; \
     fi
 
 EXPOSE 8000

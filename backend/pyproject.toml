@@ -26,10 +26,15 @@ market = [
   "pyarrow>=17,<20",
 ]
 dev = [
-  "httpx>=0.25,<0.26",
+  "httpx==0.28.1",
   "pytest>=7.4,<9",
   "ruff>=0.6,<1",
 ]
+
+[tool.uv]
+# mootdx 0.11.7 still declares httpx<0.26, while its GuPiao integration is
+# covered against 0.28.1 and TradingAgents requires the newer HTTP stack.
+override-dependencies = ["httpx==0.28.1"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

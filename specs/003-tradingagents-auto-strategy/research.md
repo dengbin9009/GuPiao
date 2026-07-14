@@ -8,6 +8,10 @@ TradingAgents 是多智能体股票研究框架，包含市场、基本面、新
 
 GuPiao 不复制上游源代码，而是固定 Git 提交作为可选依赖。适配器在子进程中注册 `gupiao` 数据供应商，把固化日线、技术指标和公告提供给上游工具。Yahoo 基本面与最近 7 天新闻由独立受限子进程在 LLM 调用前抓取，剔除 Yahoo 价格派生字段后写入同一 SHA-256 快照；抓取失败写入不可用哨兵。分析子进程不再临场访问 Yahoo、FRED 或 Polymarket。
 
+## 依赖解析
+
+TradingAgents 的 Google 数据适配依赖 `httpx>=0.28.1`，而 `mootdx 0.11.7` 的包元数据仍声明 `httpx<0.26`。GuPiao 已使用 `mootdx 0.11.7 + httpx 0.28.1` 完成沪深行情刷新和全套回归测试，因此在 `tool.uv.override-dependencies` 中固定 `httpx==0.28.1`。本地与 Docker 均使用 `uv` 解析，依赖契约测试会防止该例外被意外移除。
+
 ## 隔离选择
 
 - 单股研究可能耗时数分钟，不能放入 5 秒插件沙箱。
