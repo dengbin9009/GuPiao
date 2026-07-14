@@ -241,6 +241,9 @@ def test_observe_start_script_is_relocatable_and_uses_runtime_bootstrap():
     assert "Refusing to stop PID" in script
     assert "GUPIAO_ATTACHED" in script
     assert "GUPIAO_VERIFY_SECONDS" in script
+    assert "GUPIAO_STARTUP_TIMEOUT_SECONDS" in script
+    assert "wait_for_http" in script
+    assert "sleep 4" not in script
     assert "verification passed" in script.lower()
     assert "--strictPort" in script
     assert script.index("trap cleanup_started EXIT INT TERM") < script.index(

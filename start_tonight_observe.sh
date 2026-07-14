@@ -205,18 +205,31 @@ PATH="$NODE_BIN:$PATH"
 start_bg "$FRONTEND_PID_FILE" "$FRONTEND_LOG" npm run dev -- --host 127.0.0.1 --port 5173 --strictPort
 FRONTEND_PID=$LAST_PID
 
-sleep 4
+wait_for_http() {
+  local name="$1"
+  local url="$2"
+  local timeout_seconds="$3"
+  local started_at=$SECONDS
 
-for process in "backend:$BACKEND_PID:$BACKEND_LOG" "worker:$WORKER_PID:$WORKER_LOG" "scheduler:$SCHEDULER_PID:$SCHEDULER_LOG" "tradingagents-worker:$TRADING_AGENTS_PID:$TRADING_AGENTS_LOG" "frontend:$FRONTEND_PID:$FRONTEND_LOG"; do
-  IFS=: read -r name pid log_file <<< "$process"
-  if ! kill -0 "$pid" 2>/dev/null; then
-    echo "$name failed to start; inspect $log_file"
-    exit 1
-  fi
-done
+  while ! /usr/bin/curl -fsS "$url" >/dev/null 2>&1; do
+    for process in "backend:$BACKEND_PID:$BACKEND_LOG" "worker:$WORKER_PID:$WORKER_LOG" "scheduler:$SCHEDULER_PID:$SCHEDULER_LOG" "tradingagents-worker:$TRADING_AGENTS_PID:$TRADING_AGENTS_LOG" "frontend:$FRONTEND_PID:$FRONTEND_LOG"; do
+      IFS=: read -r process_name pid log_file <<< "$process"
+      if ! kill -0 "$pid" 2>/dev/null; then
+        echo "$process_name failed to start; inspect $log_file"
+        return 1
+      fi
+    done
+    if [ $((SECONDS - started_at)) -ge "$timeout_seconds" ]; then
+      echo "$name did not become ready within ${timeout_seconds}s: $url"
+      return 1
+    fi
+    sleep 1
+  done
+}
 
-/usr/bin/curl -fsS http://127.0.0.1:8000/api/health >/dev/null
-/usr/bin/curl -fsSI http://127.0.0.1:5173 >/dev/null
+STARTUP_TIMEOUT_SECONDS="${GUPIAO_STARTUP_TIMEOUT_SECONDS:-45}"
+wait_for_http "backend" "http://127.0.0.1:8000/api/health" "$STARTUP_TIMEOUT_SECONDS"
+wait_for_http "frontend" "http://127.0.0.1:5173" "$STARTUP_TIMEOUT_SECONDS"
 
 if [ "${GUPIAO_ATTACHED:-false}" = "true" ]; then
   VERIFY_SECONDS="${GUPIAO_VERIFY_SECONDS:-60}"
