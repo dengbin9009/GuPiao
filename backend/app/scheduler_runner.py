@@ -13,6 +13,8 @@ from .models import StrategyConfig, StrategyRun, StrategySchedule, now
 from .providers import trading_calendar_service
 from .scheduler import evaluate_schedule
 from .services import execute_simulation_exit, execute_simulation_strategy, seed_database
+from .strategy_execution import execute_strategy_trigger
+from .trading_agents.runtime import seed_trading_agents_runtime
 
 LOGGER = logging.getLogger("gupiao.scheduler")
 RETRY_DELAY = timedelta(seconds=15)
@@ -32,6 +34,20 @@ def retry_is_due(next_run_at: datetime | None, *, current: datetime) -> bool:
 
 
 def schedule_tolerance_seconds(schedule, config: StrategyConfig) -> int:
+    if schedule.trigger_type == "agent_analysis":
+        run_time = wall_time.fromisoformat(schedule.run_time)
+        deadline_text = str((config.parameters or {}).get("analysis_deadline", "14:42"))
+        deadline = wall_time.fromisoformat(deadline_text)
+        run_seconds = run_time.hour * 3600 + run_time.minute * 60 + run_time.second
+        deadline_seconds = deadline.hour * 3600 + deadline.minute * 60 + deadline.second
+        return max(59, deadline_seconds - run_seconds)
+    if schedule.trigger_type == "agent_rebalance":
+        run_time = wall_time.fromisoformat(schedule.run_time)
+        latest_text = str((config.parameters or {}).get("latest_rebalance_time", "14:50"))
+        latest = wall_time.fromisoformat(latest_text)
+        run_seconds = run_time.hour * 3600 + run_time.minute * 60 + run_time.second
+        latest_seconds = latest.hour * 3600 + latest.minute * 60 + latest.second
+        return max(59, latest_seconds - run_seconds)
     if schedule.trigger_type != "exit_evaluation":
         return 59
     run_time = wall_time.fromisoformat(schedule.run_time)
@@ -176,10 +192,13 @@ def run_due_schedules(current: datetime | None = None) -> int:
                 )
                 continue
             try:
-                run = (
-                    execute_simulation_exit(db, config)
-                    if schedule.trigger_type == "exit_evaluation"
-                    else execute_simulation_strategy(db, config)
+                run = execute_strategy_trigger(
+                    db,
+                    config,
+                    schedule.trigger_type,
+                    current=current,
+                    overnight_entry_executor=execute_simulation_strategy,
+                    overnight_exit_executor=execute_simulation_exit,
                 )
             except Exception:
                 db.rollback()
@@ -223,6 +242,7 @@ def main() -> None:
     apply_runtime_migrations()
     with SessionLocal() as db:
         seed_database(db, get_settings())
+        seed_trading_agents_runtime(db, get_settings())
     LOGGER.info("自动调度已启动")
     while True:
         try:

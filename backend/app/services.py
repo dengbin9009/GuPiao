@@ -45,6 +45,7 @@ from .models import (
 from .risk import evaluate_order
 from .notifications import queue_notifications
 from .security import hash_password
+from .trading_agents import TRADING_AGENTS_DEFAULTS
 
 
 OVERNIGHT_DEFAULTS: dict[str, Any] = {
@@ -151,7 +152,11 @@ def seed_database(db: Session, settings: Settings) -> None:
             ]
         )
 
-    if not db.scalar(select(StrategyDefinition.id).limit(1)):
+    if not db.scalar(
+        select(StrategyDefinition.id).where(
+            StrategyDefinition.key == "overnight_hold"
+        )
+    ):
         db.add(
             StrategyDefinition(
                 key="overnight_hold",
@@ -165,6 +170,33 @@ def seed_database(db: Session, settings: Settings) -> None:
                 },
                 signal_schema={"side": ["buy", "sell"], "required": ["symbol", "reason"]},
                 required_timeframes=["1m"],
+            )
+        )
+
+    if not db.scalar(
+        select(StrategyDefinition.id).where(
+            StrategyDefinition.key == "trading_agents_auto"
+        )
+    ):
+        db.add(
+            StrategyDefinition(
+                key="trading_agents_auto",
+                name="TradingAgents AI 自动组合",
+                type="built_in",
+                version="0.3.1",
+                market="A_SHARE",
+                parameter_schema={
+                    "type": "object",
+                    "properties": {
+                        key: {"default": value}
+                        for key, value in TRADING_AGENTS_DEFAULTS.items()
+                    },
+                },
+                signal_schema={
+                    "side": ["buy", "sell", "hold"],
+                    "required": ["symbol", "target_weight", "reason"],
+                },
+                required_timeframes=["1d", "realtime"],
             )
         )
 
@@ -284,15 +316,47 @@ def seed_database(db: Session, settings: Settings) -> None:
                 ),
             ]
         )
+    default_account = db.scalar(
+        select(SimulationAccount).order_by(SimulationAccount.id).limit(1)
+    )
+    if default_account:
+        legacy_configs = list(
+            db.scalars(
+                select(StrategyConfig)
+                .join(StrategyDefinition)
+                .where(
+                    StrategyConfig.mode == "SIMULATION",
+                    StrategyConfig.simulation_account_id.is_(None),
+                    StrategyDefinition.key != "trading_agents_auto",
+                )
+            )
+        )
+        for legacy_config in legacy_configs:
+            legacy_config.simulation_account_id = default_account.id
     db.commit()
 
 
 def snapshot_account(db: Session, account: SimulationAccount) -> AccountSnapshot:
-    market_value = db.scalar(
-        select(func.coalesce(func.sum(Position.market_value), 0)).where(
-            Position.account_id == account.id, Position.mode == "SIMULATION"
+    market_value = 0.0
+    unrealized_pnl = 0.0
+    for position, last_price in db.execute(
+        select(Position, Stock.last_price)
+        .join(Stock, Stock.id == Position.stock_id)
+        .where(
+            Position.account_id == account.id,
+            Position.mode == "SIMULATION",
+            Position.quantity > 0,
         )
-    ) or 0
+    ):
+        price = float(last_price or 0)
+        position.market_value = position.quantity * price
+        position.unrealized_pnl = (
+            price - float(position.average_cost)
+        ) * position.quantity
+        market_value += position.market_value
+        unrealized_pnl += position.unrealized_pnl
+    account.unrealized_pnl = unrealized_pnl
+    account.total_asset = float(account.cash_balance) + market_value
     snapshot = AccountSnapshot(
         mode="SIMULATION",
         account_id=account.id,
@@ -302,7 +366,7 @@ def snapshot_account(db: Session, account: SimulationAccount) -> AccountSnapshot
         market_value=market_value,
         total_asset=account.total_asset,
         realized_pnl=account.realized_pnl,
-        unrealized_pnl=account.unrealized_pnl,
+        unrealized_pnl=unrealized_pnl,
         exposure=market_value / account.total_asset if account.total_asset else 0,
         source="simulated_broker",
     )
@@ -442,7 +506,11 @@ def execute_simulation_strategy(db: Session, config: StrategyConfig) -> Strategy
     if config.mode == "LIVE":
         return _execute_live_strategy(db, config, run)
 
-    account = db.scalar(select(SimulationAccount).limit(1))
+    account = (
+        db.get(SimulationAccount, config.simulation_account_id)
+        if config.simulation_account_id
+        else db.scalar(select(SimulationAccount).order_by(SimulationAccount.id).limit(1))
+    )
     risk = db.scalar(select(RiskSettings).where(RiskSettings.mode == "SIMULATION"))
     current = now()
     stock, selection_summary = _select_overnight_stock(db, config, current=current)
@@ -759,7 +827,11 @@ def execute_simulation_exit(db: Session, config: StrategyConfig) -> StrategyRun:
         db.commit()
         return run
 
-    account = db.scalar(select(SimulationAccount).limit(1))
+    account = (
+        db.get(SimulationAccount, config.simulation_account_id)
+        if config.simulation_account_id
+        else db.scalar(select(SimulationAccount).order_by(SimulationAccount.id).limit(1))
+    )
     risk = db.scalar(select(RiskSettings).where(RiskSettings.mode == "SIMULATION"))
     if not account or not risk or risk.emergency_stop_enabled:
         return _complete_rejected_run(db, run, "模拟账户不可用或已紧急停止", "")

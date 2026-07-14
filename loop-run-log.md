@@ -23,6 +23,32 @@
 }
 ```
 
+```json
+{
+  "run_id": "2026-07-14-tradingagents-auto-implementation",
+  "pattern": "daily-triage",
+  "mode": "manual-approved-fix",
+  "iteration": 3,
+  "items_found": 18,
+  "actions_taken": 18,
+  "same_error_attempt": 0,
+  "escalations": 0,
+  "worktree": ".worktrees/restore-simulation-loop",
+  "safety": "SIMULATION only; dry_run=true; AI schedules disabled; 真实订单数为 0",
+  "outcome": "done-with-external-readiness-gates",
+  "evidence": [
+    "Python 3.12.12 后端全套 176 passed，Ruff 全部通过，wheel 构建成功",
+    "Node 20 前端生产构建通过，共转换 1560 个模块",
+    "TradingAgents 固定依赖版本 0.3.1，提交 01477f9，Apache 2.0 说明已补充",
+    "LaunchAgent 托管的五个本地进程连续运行超过 5 分钟，后端健康端点与前端入口均返回 HTTP 200",
+    "TradingAgents 独立模拟账户初始资金 100000，两条 AI 自动计划关闭，真实订单和启用实盘账户均为 0",
+    "Docker Compose 配置通过；镜像构建被本机 dockerproxy.com 证书错误阻塞，未修改用户 Docker Desktop 配置",
+    "无 OpenAI 密钥时 readiness 失败关闭，自动计划无法启用，真实 API 演练等待管理员配置密钥",
+    "Yahoo 补充基本面和新闻在 LLM 调用前冻结进 SHA-256 快照，分析子进程不临场访问外部数据工具"
+  ]
+}
+```
+
 ## 记录规则
 
 - 第一周不得记录自动代码修复；`actions_taken` 应为 0。

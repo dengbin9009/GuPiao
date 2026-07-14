@@ -21,7 +21,8 @@ def render_schema() -> str:
         for index in table.indexes:
             statements.append(str(CreateIndex(index).compile(dialect=dialect)).rstrip() + ";")
     statements.append("SET FOREIGN_KEY_CHECKS = 1;")
-    return "\n\n".join(statements) + "\n"
+    rendered = "\n\n".join(statements) + "\n"
+    return "\n".join(line.rstrip() for line in rendered.splitlines()) + "\n"
 
 
 if __name__ == "__main__":

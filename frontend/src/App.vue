@@ -57,12 +57,34 @@ const realtimeStatus = ref([])
 const channels = ref([])
 const deliveries = ref([])
 const marketCalendar = ref(null)
+const simulationAccounts = ref([])
+const agentsReadiness = ref(null)
+const agentsProfiles = ref({ analysis_profiles: {}, position_mappings: {} })
+const agentsBatches = ref([])
+const selectedAgentsBatch = ref(null)
+const expandedAgentReportId = ref(null)
+const agentsForm = reactive({
+  analysis_profile: 'a_share_balanced', position_mapping: 'fixed_rating',
+  quick_model: 'gpt-5.4-mini', deep_model: 'gpt-5.2', prefilter_size: 100,
+  top_n: 10, max_positions: 5, max_llm_calls: 100, max_input_tokens: 1000000,
+  max_output_tokens: 150000, worker_concurrency: 2, candidate_timeout_seconds: 480,
+  max_position_pct: 0.2, max_total_exposure_pct: 0.6,
+  snapshot_quote_max_age_seconds: 600, daily_max_age_days: 7,
+  event_max_age_seconds: 1800, enrichment_enabled: true, enrichment_timeout_seconds: 45,
+  analysis_deadline: '14:42', rebalance_time: '14:45', latest_rebalance_time: '14:50',
+  dry_run: true, simulation_account_id: null
+})
 const backtestForm = reactive({ start_date: '2025-01-01', end_date: '2025-12-31', initial_cash: 10000 })
 const notificationForm = reactive({ type: 'email', name: '', recipient: '', secret_ref: '', event_types: ['order_failure', 'circuit_breaker'] })
 
 const formatMoney = (value) => new Intl.NumberFormat('zh-CN', { style: 'currency', currency: 'CNY', maximumFractionDigits: 2 }).format(value || 0)
 const formatPct = (value) => `${((value || 0) * 100).toFixed(2)}%`
 const shortTime = (value) => value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '—'
+const durationText = (start, end) => {
+  if (!start || !end) return '—'
+  const seconds = Math.max(0, Math.round((new Date(end) - new Date(start)) / 1000))
+  return seconds < 60 ? `${seconds} 秒` : `${Math.floor(seconds / 60)}分${seconds % 60}秒`
+}
 const activeTitle = computed(() => nav.find(([key]) => key === active.value)?.[1] || '总览')
 const runResult = (run) => run?.summary?.reason || run?.summary?.symbol || run?.error_message || '—'
 
@@ -75,12 +97,13 @@ const loadAll = async () => {
   loading.value = true
   error.value = ''
   try {
-    const [d, w, s, c, sch, r, b, a, o, p, rs, re, g, ds, rt, ch, nd, la, cal] = await Promise.all([
+    const [d, w, s, c, sch, r, b, a, o, p, rs, re, g, ds, rt, ch, nd, la, cal, sa, ar, ap, ab] = await Promise.all([
       api('/dashboard'), api('/watchlist'), api('/strategies'), api('/strategy-configs'),
       api('/strategy-schedules'), api('/strategy-runs'), api('/backtests'), api('/simulation/account'), api('/orders'),
       api('/positions'), api('/risk/settings'), api('/risk/events'), api('/gateways'),
       api('/market-data/sources'), api('/market-data/realtime-status'), api('/notifications/channels'), api('/notifications/deliveries'),
-      api('/live/accounts'), api('/market-data/calendar')
+      api('/live/accounts'), api('/market-data/calendar'), api('/simulation/accounts'),
+      api('/trading-agents/readiness'), api('/trading-agents/profiles'), api('/trading-agents/batches')
     ])
     dashboard.value = d; watchlist.value = w; strategies.value = s; strategyConfigs.value = c; strategySchedules.value = sch
     runs.value = r; backtests.value = b; account.value = a; orders.value = o; positions.value = p
@@ -89,6 +112,9 @@ const loadAll = async () => {
     channels.value = ch; deliveries.value = nd
     liveAccounts.value = la
     marketCalendar.value = cal
+    simulationAccounts.value = sa; agentsReadiness.value = ar; agentsProfiles.value = ap; agentsBatches.value = ab
+    const agentsConfig = c.find(item => item.strategy_key === 'trading_agents_auto')
+    if (agentsConfig) Object.assign(agentsForm, agentsConfig.parameters || {}, { simulation_account_id: agentsConfig.simulation_account_id })
     authenticated.value = true
   } catch (err) {
     if (String(err.message).includes('登录')) authenticated.value = false
@@ -162,7 +188,8 @@ const refreshRealtimeStatus = async () => {
 }
 
 const ensureConfig = async () => {
-  if (strategyConfigs.value[0]) return strategyConfigs.value[0]
+  const existing = strategyConfigs.value.find(item => item.strategy_key === 'overnight_hold')
+  if (existing) return existing
   const config = await api('/strategy-configs', {
     method: 'POST',
     body: JSON.stringify({
@@ -177,6 +204,44 @@ const ensureConfig = async () => {
   })
   strategyConfigs.value = await api('/strategy-configs')
   return config
+}
+
+const saveAgentsConfig = async () => {
+  try {
+    const { simulation_account_id, ...parameters } = agentsForm
+    await api('/trading-agents/config', {
+      method: 'PUT', body: JSON.stringify({ parameters, simulation_account_id })
+    })
+    await loadAll(); notify('TradingAgents 配置已保存')
+  } catch (err) { error.value = err.message; throw err }
+}
+
+const runAgentsBatch = async () => {
+  try {
+    await saveAgentsConfig()
+    await api('/trading-agents/batches', { method: 'POST', body: '{}' })
+    await loadAll(); notify('TradingAgents 分析批次已创建')
+  } catch (err) { error.value = err.message }
+}
+
+const selectAgentsBatch = async (id) => {
+  try { selectedAgentsBatch.value = await api(`/trading-agents/batches/${id}`); expandedAgentReportId.value = null }
+  catch (err) { error.value = err.message }
+}
+
+const cancelAgentsBatch = async (id) => {
+  try {
+    await api(`/trading-agents/batches/${id}/cancel`, { method: 'POST' })
+    await loadAll(); selectedAgentsBatch.value = null; notify('批次已取消')
+  } catch (err) { error.value = err.message }
+}
+
+const dryRunAgentsBatch = async (id) => {
+  try {
+    await api(`/trading-agents/batches/${id}/dry-run`, { method: 'POST' })
+    await loadAll(); selectedAgentsBatch.value = await api(`/trading-agents/batches/${id}`)
+    notify('无下单演练已完成')
+  } catch (err) { error.value = err.message }
 }
 
 const createStrategyConfig = async () => {
@@ -385,8 +450,58 @@ onMounted(async () => {
         </section>
         <section class="strategy-row" v-for="strategy in strategies" :key="strategy.id">
           <div class="strategy-main"><span class="strategy-icon"><TrendingUp :size="21" /></span><div><h2>{{ strategy.name }}</h2><p>{{ strategy.key }} · {{ strategy.version }} · {{ strategy.required_timeframes.join(' / ') }}</p></div></div>
-          <div class="strategy-stats"><span>入场窗口<b>14:45-14:55</b></span><span>次日退出<b>09:35-09:45</b></span><span>最大候选<b>3</b></span></div>
-          <button class="primary" @click="runStrategy"><Play :size="17" />运行模拟</button>
+          <div v-if="strategy.key === 'trading_agents_auto'" class="strategy-stats"><span>分析时间<b>13:30</b></span><span>调仓时间<b>14:45</b></span><span>最大持仓<b>5</b></span></div>
+          <div v-else class="strategy-stats"><span>入场窗口<b>14:45-14:55</b></span><span>次日退出<b>09:35-09:45</b></span><span>最大候选<b>3</b></span></div>
+          <button v-if="strategy.key === 'trading_agents_auto'" class="primary" :disabled="!agentsReadiness?.ready" @click="runAgentsBatch"><Play :size="17" />创建分析批次</button>
+          <button v-else class="primary" @click="runStrategy"><Play :size="17" />运行模拟</button>
+        </section>
+        <div class="split-grid agents-grid">
+          <section class="panel">
+            <div class="section-head"><div><h2>TradingAgents 配置</h2><span>独立模拟账户</span></div><Settings2 :size="19" /></div>
+            <div class="config-grid">
+              <label>分析档位<select v-model="agentsForm.analysis_profile"><option v-for="(profile, key) in agentsProfiles.analysis_profiles" :key="key" :value="key">{{ profile.label }}</option></select></label>
+              <label>仓位映射<select v-model="agentsForm.position_mapping"><option v-for="(label, key) in agentsProfiles.position_mappings" :key="key" :value="key">{{ label }}</option></select></label>
+              <label>模拟账户<select v-model.number="agentsForm.simulation_account_id"><option v-for="item in simulationAccounts" :key="item.id" :value="item.id" :disabled="!item.available_for_trading_agents">{{ item.name }} · {{ formatMoney(item.total_asset) }}{{ item.available_for_trading_agents ? '' : ' · 已占用' }}</option></select></label>
+              <label>快速模型<input v-model="agentsForm.quick_model" /></label>
+              <label>深度模型<input v-model="agentsForm.deep_model" /></label>
+              <label>Top N<input v-model.number="agentsForm.top_n" type="number" min="1" max="20" /></label>
+              <label>预筛数量<input v-model.number="agentsForm.prefilter_size" type="number" min="10" /></label>
+              <label>最大持仓<input v-model.number="agentsForm.max_positions" type="number" min="1" max="5" /></label>
+              <label>并发数<input v-model.number="agentsForm.worker_concurrency" type="number" min="1" max="8" /></label>
+              <label>单股超时<input v-model.number="agentsForm.candidate_timeout_seconds" type="number" min="60" step="30" /></label>
+              <label>调用预算<input v-model.number="agentsForm.max_llm_calls" type="number" min="1" /></label>
+              <label>输入 Token<input v-model.number="agentsForm.max_input_tokens" type="number" min="1000" step="1000" /></label>
+              <label>输出 Token<input v-model.number="agentsForm.max_output_tokens" type="number" min="1000" step="1000" /></label>
+              <label>补充数据超时<input v-model.number="agentsForm.enrichment_timeout_seconds" type="number" min="10" step="5" /></label>
+            </div>
+            <div class="control-row"><label class="check-control"><input v-model="agentsForm.enrichment_enabled" type="checkbox" />冻结 Yahoo 补充数据</label><label class="check-control"><input v-model="agentsForm.dry_run" type="checkbox" />无下单演练</label><button class="primary" @click="saveAgentsConfig"><Settings2 :size="16" />保存配置</button></div>
+          </section>
+          <section class="panel">
+            <div class="section-head"><div><h2>就绪状态</h2><span>自动计划默认关闭</span></div><Activity :size="19" /></div>
+            <div class="status-list">
+              <div><span>OpenAI 密钥</span><b :class="agentsReadiness?.openai_configured ? 'ok' : 'negative'">{{ agentsReadiness?.openai_configured ? '已配置' : '未配置' }}</b></div>
+              <div><span>固定依赖</span><b :class="agentsReadiness?.dependency_version_valid && agentsReadiness?.dependency_commit_valid ? 'ok' : 'negative'">{{ agentsReadiness?.dependency_version_valid && agentsReadiness?.dependency_commit_valid ? `v${agentsReadiness.dependency_version} · ${agentsReadiness.dependency_commit?.slice(0, 7)}` : agentsReadiness?.dependency_installed ? '版本或提交不符' : '未安装' }}</b></div>
+              <div><span>模拟盘隔离</span><b :class="agentsReadiness?.simulation_only ? 'ok' : 'negative'">{{ agentsReadiness?.simulation_only ? '通过' : '未通过' }}</b></div>
+              <div><span>完整演练</span><b :class="agentsReadiness?.dry_run_validated ? 'ok' : 'muted'">{{ agentsReadiness?.dry_run_validated ? `批次 #${agentsReadiness.last_dry_run_batch_id}` : '尚未完成' }}</b></div>
+              <div><span>自动调度</span><b :class="agentsReadiness?.automation_ready ? 'ok' : 'muted'">{{ agentsReadiness?.automation_ready ? '可以启用' : '保持关闭' }}</b></div>
+            </div>
+            <button class="primary wide" :disabled="!agentsReadiness?.ready" @click="runAgentsBatch"><Play :size="17" />创建分析批次</button>
+          </section>
+        </div>
+        <section class="panel">
+          <div class="section-head"><div><h2>TradingAgents 批次</h2><span>候选、评级、预算与订单审计</span></div><RefreshCw :size="19" /></div>
+          <div class="table-wrap"><table><thead><tr><th>ID</th><th>交易日</th><th>状态</th><th>档位</th><th>进度</th><th>调用</th><th>Token</th><th>耗时</th><th>订单</th></tr></thead><tbody>
+            <tr v-for="batch in agentsBatches" :key="batch.id" @click="selectAgentsBatch(batch.id)"><td>#{{ batch.id }}</td><td>{{ batch.trading_date }}</td><td><span :class="['tag', ['failed','blocked','cancelled'].includes(batch.status) ? 'danger-tag' : '']">{{ batch.status }}</span></td><td>{{ batch.analysis_profile }}</td><td>{{ batch.analysis_status_counts?.completed || 0 }}/{{ batch.required_symbols?.length || 0 }}</td><td>{{ batch.llm_calls }}</td><td>{{ (batch.tokens_in || 0) + (batch.tokens_out || 0) }}</td><td>{{ durationText(batch.started_at, batch.completed_at) }}</td><td>{{ batch.order_ids?.length || 0 }}</td></tr>
+            <tr v-if="!agentsBatches.length"><td colspan="9" class="empty">暂无 TradingAgents 批次</td></tr>
+          </tbody></table></div>
+        </section>
+        <section v-if="selectedAgentsBatch" class="panel">
+          <div class="section-head"><div><h2>批次 #{{ selectedAgentsBatch.id }}</h2><span>{{ selectedAgentsBatch.snapshot_sha256 || '无快照哈希' }}</span></div><div class="top-actions"><button v-if="selectedAgentsBatch.status === 'ready' && agentsForm.dry_run" class="primary" @click="dryRunAgentsBatch(selectedAgentsBatch.id)"><Play :size="15" />执行演练</button><button v-if="['pending','processing','ready'].includes(selectedAgentsBatch.status)" class="secondary" @click="cancelAgentsBatch(selectedAgentsBatch.id)"><X :size="15" />取消批次</button></div></div>
+          <div class="table-wrap"><table><thead><tr><th>排名</th><th>股票</th><th>评级</th><th>AI 仓位</th><th>调用</th><th>Token</th><th>耗时</th><th>状态</th><th>报告</th></tr></thead><tbody>
+            <template v-for="item in selectedAgentsBatch.analyses || []" :key="item.id"><tr><td>{{ item.rank || '持仓' }}</td><td><strong>{{ item.name }}</strong><small>{{ item.symbol }}</small></td><td>{{ item.rating || '—' }}</td><td>{{ item.ai_target_weight == null ? '—' : formatPct(item.ai_target_weight) }}</td><td>{{ item.stats?.llm_calls || 0 }}</td><td>{{ (item.stats?.tokens_in || 0) + (item.stats?.tokens_out || 0) }}</td><td>{{ durationText(item.started_at, item.finished_at) }}</td><td>{{ item.status }}</td><td><button class="secondary" :disabled="!item.report" @click="expandedAgentReportId = expandedAgentReportId === item.id ? null : item.id">{{ expandedAgentReportId === item.id ? '收起' : '查看' }}</button></td></tr><tr v-if="expandedAgentReportId === item.id"><td colspan="9"><pre class="agent-report">{{ item.report }}</pre></td></tr></template>
+          </tbody></table></div>
+          <div v-if="selectedAgentsBatch.portfolio_decision" class="decision-band"><span><strong>目标组合</strong><small>{{ selectedAgentsBatch.portfolio_decision.rationale }}</small></span><span v-for="(weight, symbol) in selectedAgentsBatch.portfolio_decision.target_weights" :key="symbol" class="tag">{{ symbol }} {{ formatPct(weight) }}</span></div>
+          <div v-if="selectedAgentsBatch.orders?.length" class="table-wrap"><table><thead><tr><th>订单</th><th>股票</th><th>方向</th><th>数量</th><th>状态</th><th>提交时间</th></tr></thead><tbody><tr v-for="order in selectedAgentsBatch.orders" :key="order.id"><td>#{{ order.id }}</td><td><strong>{{ order.name }}</strong><small>{{ order.symbol }}</small></td><td>{{ order.side === 'buy' ? '买入' : '卖出' }}</td><td>{{ order.quantity }}</td><td><span class="tag">{{ order.status }}</span></td><td>{{ shortTime(order.submitted_at) }}</td></tr></tbody></table></div>
         </section>
         <section class="panel">
           <div class="section-head"><div><h2>策略配置</h2><span>内置策略实例与模式</span></div><TrendingUp :size="19" /></div>

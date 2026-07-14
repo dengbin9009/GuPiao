@@ -107,11 +107,13 @@ def prepare_simulation_runtime(db: Session, settings: Settings) -> dict[str, Any
             mode="SIMULATION",
             parameters=dict(OVERNIGHT_DEFAULTS),
             enabled=True,
+            simulation_account_id=account.id,
         )
         db.add(config)
         db.flush()
     else:
         config.enabled = True
+        config.simulation_account_id = account.id
 
     schedule_specs = {
         "entry_evaluation": str(

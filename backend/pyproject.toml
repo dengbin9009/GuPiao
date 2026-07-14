@@ -2,7 +2,7 @@
 name = "gupiao-backend"
 version = "0.1.0"
 description = "GuPiao A-share quantitative trading API"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
   "fastapi>=0.115,<1",
   "uvicorn[standard]>=0.30,<1",
@@ -14,6 +14,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+agents = [
+  "tradingagents @ git+https://github.com/TauricResearch/TradingAgents.git@01477f9afb7a47b849ed4c9259d3a9a4738d9fda",
+]
 market = [
   "akshare>=1.16",
   "mootdx>=0.11",
@@ -34,7 +37,7 @@ pythonpath = ["."]
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py312"
 
 [build-system]
 requires = ["hatchling"]
@@ -42,3 +45,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["app"]
+
+[tool.hatch.metadata]
+allow-direct-references = true

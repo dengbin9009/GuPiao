@@ -63,6 +63,22 @@ class StockEvent(Base, TimestampMixin):
     fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
+class MarketDailyBar(Base):
+    __tablename__ = "market_daily_bars"
+    __table_args__ = (UniqueConstraint("stock_id", "trade_date"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    stock_id: Mapped[int] = mapped_column(ForeignKey("stocks.id"), index=True)
+    trade_date: Mapped[str] = mapped_column(String(10), index=True)
+    open: Mapped[float] = mapped_column(Float)
+    high: Mapped[float] = mapped_column(Float)
+    low: Mapped[float] = mapped_column(Float)
+    close: Mapped[float] = mapped_column(Float)
+    volume: Mapped[float] = mapped_column(Float, default=0)
+    amount: Mapped[float] = mapped_column(Float, default=0)
+    source: Mapped[str] = mapped_column(String(32))
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
 class WatchlistItem(Base):
     __tablename__ = "watchlist_items"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -107,6 +123,9 @@ class StrategyConfig(Base, TimestampMixin):
     mode: Mapped[str] = mapped_column(String(16), default="SIMULATION")
     parameters: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    simulation_account_id: Mapped[int | None] = mapped_column(
+        ForeignKey("simulation_accounts.id")
+    )
 
 
 class StrategySchedule(Base, TimestampMixin):
@@ -143,6 +162,83 @@ class StrategyLog(Base):
     level: Mapped[str] = mapped_column(String(16), default="info")
     message: Mapped[str] = mapped_column(Text)
     context: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class TradingAgentBatch(Base, TimestampMixin):
+    __tablename__ = "trading_agent_batches"
+    __table_args__ = (UniqueConstraint("strategy_config_id", "trading_date"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    strategy_config_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_configs.id"), index=True
+    )
+    simulation_account_id: Mapped[int] = mapped_column(
+        ForeignKey("simulation_accounts.id"), index=True
+    )
+    trading_date: Mapped[str] = mapped_column(String(10), index=True)
+    status: Mapped[str] = mapped_column(String(24), default="pending")
+    analysis_profile: Mapped[str] = mapped_column(String(32))
+    position_mapping: Mapped[str] = mapped_column(String(32))
+    quick_model: Mapped[str] = mapped_column(String(64))
+    deep_model: Mapped[str] = mapped_column(String(64))
+    prompt_version: Mapped[str] = mapped_column(String(32), default="1")
+    config_fingerprint: Mapped[str | None] = mapped_column(String(64), index=True)
+    candidate_symbols: Mapped[list[str]] = mapped_column(JSON, default=list)
+    holding_symbols: Mapped[list[str]] = mapped_column(JSON, default=list)
+    required_symbols: Mapped[list[str]] = mapped_column(JSON, default=list)
+    snapshot_sha256: Mapped[str | None] = mapped_column(String(64))
+    snapshot_uri: Mapped[str | None] = mapped_column(String(512))
+    llm_calls: Mapped[int] = mapped_column(Integer, default=0)
+    tokens_in: Mapped[int] = mapped_column(Integer, default=0)
+    tokens_out: Mapped[int] = mapped_column(Integer, default=0)
+    order_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
+    rebalance_run_id: Mapped[int | None] = mapped_column(ForeignKey("strategy_runs.id"))
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    worker_id: Mapped[str | None] = mapped_column(String(128))
+    analysis_deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    rebalance_after: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error_message: Mapped[str | None] = mapped_column(Text)
+
+
+class TradingAgentCandidateAnalysis(Base):
+    __tablename__ = "trading_agent_candidate_analyses"
+    __table_args__ = (UniqueConstraint("batch_id", "stock_id"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    batch_id: Mapped[int] = mapped_column(
+        ForeignKey("trading_agent_batches.id"), index=True
+    )
+    stock_id: Mapped[int] = mapped_column(ForeignKey("stocks.id"), index=True)
+    rank: Mapped[int | None] = mapped_column(Integer)
+    is_holding: Mapped[bool] = mapped_column(Boolean, default=False)
+    status: Mapped[str] = mapped_column(String(24), default="pending")
+    rating: Mapped[str | None] = mapped_column(String(24))
+    ai_target_weight: Mapped[float | None] = mapped_column(Float)
+    report_uri: Mapped[str | None] = mapped_column(String(512))
+    report: Mapped[str | None] = mapped_column(Text)
+    reasoning: Mapped[str | None] = mapped_column(Text)
+    stats: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error_message: Mapped[str | None] = mapped_column(Text)
+
+
+class TradingAgentPortfolioDecision(Base):
+    __tablename__ = "trading_agent_portfolio_decisions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    batch_id: Mapped[int] = mapped_column(
+        ForeignKey("trading_agent_batches.id"), unique=True, index=True
+    )
+    status: Mapped[str] = mapped_column(String(24), default="ready")
+    position_mapping: Mapped[str] = mapped_column(String(32))
+    target_weights: Mapped[dict[str, float]] = mapped_column(JSON, default=dict)
+    rankings: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    rationale: Mapped[str] = mapped_column(Text, default="")
+    model: Mapped[str] = mapped_column(String(64))
+    llm_calls: Mapped[int] = mapped_column(Integer, default=0)
+    tokens_in: Mapped[int] = mapped_column(Integer, default=0)
+    tokens_out: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 

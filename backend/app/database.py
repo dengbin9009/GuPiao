@@ -96,3 +96,45 @@ def apply_runtime_migrations(
                         "ADD COLUMN next_run_at DATETIME"
                     )
                 )
+        if "strategy_configs" in tables:
+            config_columns = {
+                row[1]
+                for row in conn.exec_driver_sql(
+                    "PRAGMA table_info(strategy_configs)"
+                )
+            }
+            if "simulation_account_id" not in config_columns:
+                conn.execute(
+                    text(
+                        "ALTER TABLE strategy_configs "
+                        "ADD COLUMN simulation_account_id INTEGER"
+                    )
+                )
+        if "trading_agent_batches" in tables:
+            batch_columns = {
+                row[1]
+                for row in conn.exec_driver_sql(
+                    "PRAGMA table_info(trading_agent_batches)"
+                )
+            }
+            if "order_ids" not in batch_columns:
+                conn.execute(
+                    text(
+                        "ALTER TABLE trading_agent_batches "
+                        "ADD COLUMN order_ids JSON DEFAULT '[]'"
+                    )
+                )
+            if "rebalance_run_id" not in batch_columns:
+                conn.execute(
+                    text(
+                        "ALTER TABLE trading_agent_batches "
+                        "ADD COLUMN rebalance_run_id INTEGER"
+                    )
+                )
+            if "config_fingerprint" not in batch_columns:
+                conn.execute(
+                    text(
+                        "ALTER TABLE trading_agent_batches "
+                        "ADD COLUMN config_fingerprint VARCHAR(64)"
+                    )
+                )

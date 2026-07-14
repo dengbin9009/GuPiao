@@ -112,6 +112,15 @@ button.danger-button { background: #bd3d36; border: 1px solid #bd3d36; color: #f
 .strategy-stats b { display: block; margin-top: 4px; color: #273238; font-size: 12px; }
 .form-band { align-items: end; }
 .form-band label { min-width: 150px; }
+.agents-grid { grid-template-columns: minmax(0, 1.35fr) minmax(280px, .65fr); }
+.config-grid { padding: 16px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.control-row { min-height: 58px; padding: 10px 16px; border-top: 1px solid #e5eaed; display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.check-control { display: flex; align-items: center; gap: 8px; }
+.check-control input { width: 17px; min-height: 17px; margin: 0; }
+.decision-band { padding: 13px 16px; border-top: 1px solid #e5eaed; display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.decision-band > span:first-child { flex: 1; min-width: 240px; }
+.decision-band small { display: block; margin-top: 4px; color: #7e8a90; font-size: 11px; white-space: normal; }
+.agent-report { margin: 0; max-height: 420px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: #344149; font: 12px/1.65 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .notification-form label:nth-child(3), .notification-form label:nth-child(4) { flex: 1; }
 .risk-banner { min-height: 72px; padding: 0 17px; border-radius: 7px; background: #fff6e5; border: 1px solid #ecd69f; display: flex; align-items: center; justify-content: space-between; }
 .risk-banner > div { display: flex; align-items: center; gap: 12px; color: #725815; }
@@ -128,6 +137,7 @@ button.danger-button { background: #bd3d36; border: 1px solid #bd3d36; color: #f
   .strategy-row { grid-template-columns: 1fr auto; }
   .strategy-stats { grid-column: 1 / -1; }
   .form-band { flex-wrap: wrap; }
+  .agents-grid { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 720px) {
@@ -147,6 +157,7 @@ button.danger-button { background: #bd3d36; border: 1px solid #bd3d36; color: #f
   .risk-banner { align-items: flex-start; gap: 14px; padding: 15px; flex-direction: column; }
   .toolbar-band { align-items: stretch; flex-direction: column; }
   .form-band label { min-width: 0; width: 100%; }
+  .config-grid { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 460px) {

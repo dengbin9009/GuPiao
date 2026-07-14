@@ -9,7 +9,7 @@ from typing import Any
 from fastapi import BackgroundTasks, Cookie, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, or_, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import Session
 
 from .config import Settings, get_settings, live_runtime_is_open
@@ -44,6 +44,9 @@ from .models import (
     StrategyLog,
     StrategyRun,
     StrategySchedule,
+    TradingAgentBatch,
+    TradingAgentCandidateAnalysis,
+    TradingAgentPortfolioDecision,
     WatchlistItem,
     now,
 )
@@ -63,6 +66,20 @@ from .services import (
     validate_strategy_parameters,
     watchlist_payload,
 )
+from .trading_agents.runtime import (
+    find_matching_dry_run,
+    seed_trading_agents_runtime,
+    simulation_account_is_available,
+)
+from .trading_agents.batches import create_batch
+from .trading_agents.config import (
+    ANALYSIS_PROFILES,
+    POSITION_MAPPINGS,
+    readiness as trading_agents_readiness,
+    validate_parameters as validate_trading_agents_parameters,
+)
+from .trading_agents.rebalance import rebalance_batch
+from .strategy_execution import execute_strategy_trigger
 settings = get_settings()
 
 
@@ -80,6 +97,7 @@ async def lifespan(_: FastAPI):
     apply_runtime_migrations()
     with SessionLocal() as db:
         seed_database(db, settings)
+        seed_trading_agents_runtime(db, settings)
     yield
 
 
@@ -188,6 +206,20 @@ class LiveAccountUpdate(BaseModel):
 class LiveModeUpdate(BaseModel):
     enabled: bool
     confirmation: str = ""
+
+
+class TradingAgentsBatchCreate(BaseModel):
+    strategy_config_id: int | None = None
+
+
+class TradingAgentsConfigUpdate(BaseModel):
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    simulation_account_id: int | None = None
+
+
+class SimulationAccountCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    initial_cash: float = Field(default=100_000, gt=0)
 
 
 @app.get("/api/health")
@@ -322,6 +354,252 @@ def list_strategies(_: Administrator = Depends(require_admin), db: Session = Dep
     return [serialize(item) for item in db.scalars(select(StrategyDefinition).order_by(StrategyDefinition.id))]
 
 
+def _trading_agents_config(db: Session, config_id: int | None = None) -> StrategyConfig:
+    query = (
+        select(StrategyConfig)
+        .join(StrategyDefinition)
+        .where(StrategyDefinition.key == "trading_agents_auto")
+    )
+    if config_id is not None:
+        query = query.where(StrategyConfig.id == config_id)
+    config = db.scalar(query.order_by(StrategyConfig.id).limit(1))
+    if not config:
+        raise HTTPException(status_code=404, detail="TradingAgents 策略配置不存在")
+    return config
+
+
+def _trading_agents_runtime_readiness(
+    db: Session,
+    config: StrategyConfig,
+) -> dict[str, Any]:
+    result = trading_agents_readiness(settings)
+    latest_dry_run = find_matching_dry_run(db, config)
+    automation_reasons = list(result["reasons"])
+    if config.mode != "SIMULATION" or not simulation_account_is_available(
+        db,
+        account_id=config.simulation_account_id,
+        strategy_config_id=config.id,
+    ):
+        automation_reasons.append("simulation_account_binding")
+    if not config.enabled:
+        automation_reasons.append("strategy_config_disabled")
+    if latest_dry_run is None:
+        automation_reasons.append("successful_dry_run")
+    if bool((config.parameters or {}).get("dry_run", True)):
+        automation_reasons.append("dry_run_mode_enabled")
+    return {
+        **result,
+        "strategy_config_id": config.id,
+        "simulation_account_id": config.simulation_account_id,
+        "dry_run_validated": latest_dry_run is not None,
+        "last_dry_run_batch_id": latest_dry_run.id if latest_dry_run else None,
+        "automation_ready": not automation_reasons,
+        "automation_reasons": automation_reasons,
+    }
+
+
+def _batch_payload(db: Session, batch: TradingAgentBatch, *, detail: bool = False):
+    result = serialize(batch)
+    result["analysis_status_counts"] = {
+        status: count
+        for status, count in db.execute(
+            select(
+                TradingAgentCandidateAnalysis.status,
+                func.count(TradingAgentCandidateAnalysis.id),
+            )
+            .where(TradingAgentCandidateAnalysis.batch_id == batch.id)
+            .group_by(TradingAgentCandidateAnalysis.status)
+        )
+    }
+    if not detail:
+        return result
+    analyses = list(
+        db.scalars(
+            select(TradingAgentCandidateAnalysis)
+            .where(TradingAgentCandidateAnalysis.batch_id == batch.id)
+            .order_by(
+                TradingAgentCandidateAnalysis.rank.is_(None),
+                TradingAgentCandidateAnalysis.rank,
+                TradingAgentCandidateAnalysis.id,
+            )
+        )
+    )
+    stocks = {
+        stock.id: stock
+        for stock in db.scalars(
+            select(Stock).where(Stock.id.in_({item.stock_id for item in analyses}))
+        )
+    } if analyses else {}
+    decision = db.scalar(
+        select(TradingAgentPortfolioDecision).where(
+            TradingAgentPortfolioDecision.batch_id == batch.id
+        )
+    )
+    result["analyses"] = [
+        serialize(item, symbol=stocks[item.stock_id].symbol, name=stocks[item.stock_id].name)
+        for item in analyses
+    ]
+    result["portfolio_decision"] = serialize(decision) if decision else None
+    orders = list(
+        db.scalars(
+            select(Order)
+            .where(Order.id.in_(batch.order_ids or []))
+            .order_by(Order.id)
+        )
+    )
+    order_stocks = {
+        stock.id: stock
+        for stock in db.scalars(
+            select(Stock).where(Stock.id.in_({item.stock_id for item in orders}))
+        )
+    } if orders else {}
+    result["orders"] = [
+        serialize(
+            item,
+            symbol=order_stocks[item.stock_id].symbol,
+            name=order_stocks[item.stock_id].name,
+        )
+        for item in orders
+    ]
+    return result
+
+
+@app.get("/api/trading-agents/readiness")
+def get_trading_agents_readiness(
+    _: Administrator = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    return _trading_agents_runtime_readiness(db, _trading_agents_config(db))
+
+
+@app.get("/api/trading-agents/profiles")
+def get_trading_agents_profiles(_: Administrator = Depends(require_admin)):
+    return {
+        "analysis_profiles": ANALYSIS_PROFILES,
+        "position_mappings": POSITION_MAPPINGS,
+    }
+
+
+@app.put("/api/trading-agents/config")
+def update_trading_agents_config(
+    payload: TradingAgentsConfigUpdate,
+    _: Administrator = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    config = _trading_agents_config(db)
+    try:
+        config.parameters = validate_trading_agents_parameters(payload.parameters)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if payload.simulation_account_id is not None:
+        account = db.get(SimulationAccount, payload.simulation_account_id)
+        if not account or account.status != "active":
+            raise HTTPException(status_code=422, detail="模拟账户不存在或不可用")
+        if not simulation_account_is_available(
+            db,
+            account_id=account.id,
+            strategy_config_id=config.id,
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="TradingAgents 必须绑定未被其他策略配置占用的独立账户",
+            )
+        config.simulation_account_id = account.id
+    config.mode = "SIMULATION"
+    for schedule in db.scalars(
+        select(StrategySchedule).where(
+            StrategySchedule.strategy_config_id == config.id,
+            StrategySchedule.trigger_type.in_(["agent_analysis", "agent_rebalance"]),
+        )
+    ):
+        schedule.enabled = False
+        schedule.last_scheduled_for = None
+        schedule.next_run_at = None
+    db.commit()
+    return serialize(config)
+
+
+@app.post("/api/trading-agents/batches", status_code=202)
+def create_trading_agents_batch(
+    payload: TradingAgentsBatchCreate,
+    _: Administrator = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    check = trading_agents_readiness(settings)
+    if not check["ready"]:
+        raise HTTPException(
+            status_code=503,
+            detail=f"TradingAgents 尚未就绪: {', '.join(check['reasons'])}",
+        )
+    config = _trading_agents_config(db, payload.strategy_config_id)
+    try:
+        batch = create_batch(db, config)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return _batch_payload(db, batch)
+
+
+@app.get("/api/trading-agents/batches")
+def list_trading_agents_batches(
+    limit: int = Query(default=30, ge=1, le=100),
+    _: Administrator = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    batches = db.scalars(
+        select(TradingAgentBatch).order_by(TradingAgentBatch.id.desc()).limit(limit)
+    )
+    return [_batch_payload(db, item) for item in batches]
+
+
+@app.get("/api/trading-agents/batches/{batch_id}")
+def get_trading_agents_batch(
+    batch_id: int,
+    _: Administrator = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    batch = db.get(TradingAgentBatch, batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="TradingAgents 批次不存在")
+    return _batch_payload(db, batch, detail=True)
+
+
+@app.post("/api/trading-agents/batches/{batch_id}/cancel")
+def cancel_trading_agents_batch(
+    batch_id: int,
+    _: Administrator = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    batch = db.get(TradingAgentBatch, batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="TradingAgents 批次不存在")
+    if batch.status not in {"pending", "processing", "ready"}:
+        raise HTTPException(status_code=409, detail="当前批次状态不能取消")
+    batch.status = "cancelled"
+    batch.error_message = "管理员取消批次"
+    batch.lease_until = None
+    batch.completed_at = now()
+    db.commit()
+    return _batch_payload(db, batch)
+
+
+@app.post("/api/trading-agents/batches/{batch_id}/dry-run")
+def dry_run_trading_agents_batch(
+    batch_id: int,
+    _: Administrator = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    batch = db.get(TradingAgentBatch, batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="TradingAgents 批次不存在")
+    if batch.status != "ready":
+        raise HTTPException(status_code=409, detail="批次尚未完成全部分析")
+    config = db.get(StrategyConfig, batch.strategy_config_id)
+    if not bool((config.parameters or {}).get("dry_run", True)):
+        raise HTTPException(status_code=409, detail="策略配置未启用无下单演练")
+    run = rebalance_batch(db, batch, allow_outside_window=True)
+    return serialize(run)
+
+
 @app.post("/api/plugins/scan")
 def plugins_scan(_: Administrator = Depends(require_admin), db: Session = Depends(get_db)):
     return sync_plugin_definitions(db, settings.trusted_plugin_dir)
@@ -329,7 +607,13 @@ def plugins_scan(_: Administrator = Depends(require_admin), db: Session = Depend
 
 @app.get("/api/strategy-configs")
 def strategy_configs(_: Administrator = Depends(require_admin), db: Session = Depends(get_db)):
-    return [serialize(item) for item in db.scalars(select(StrategyConfig).order_by(StrategyConfig.id.desc()))]
+    return [
+        serialize(
+            item,
+            strategy_key=db.get(StrategyDefinition, item.strategy_definition_id).key,
+        )
+        for item in db.scalars(select(StrategyConfig).order_by(StrategyConfig.id.desc()))
+    ]
 
 
 @app.post("/api/strategy-configs", status_code=201)
@@ -337,6 +621,11 @@ def create_strategy_config(payload: StrategyConfigCreate, _: Administrator = Dep
     definition = db.scalar(select(StrategyDefinition).where(StrategyDefinition.key == payload.strategy_key, StrategyDefinition.enabled.is_(True)))
     if not definition:
         raise HTTPException(status_code=422, detail="策略不存在或不可用")
+    if definition.key == "trading_agents_auto":
+        raise HTTPException(
+            status_code=422,
+            detail="TradingAgents 仅支持模拟盘的系统独立配置，请使用专用配置接口",
+        )
     if payload.mode not in {"SIMULATION", "LIVE"}:
         raise HTTPException(status_code=422, detail="交易模式无效")
     if payload.mode == "LIVE":
@@ -350,6 +639,11 @@ def create_strategy_config(payload: StrategyConfigCreate, _: Administrator = Dep
         name=payload.name,
         mode=payload.mode,
         parameters=parameters,
+        simulation_account_id=(
+            db.scalar(select(SimulationAccount.id).order_by(SimulationAccount.id).limit(1))
+            if payload.mode == "SIMULATION"
+            else None
+        ),
     )
     db.add(config)
     db.flush()
@@ -382,7 +676,17 @@ def run_strategy(config_id: int, _: Administrator = Depends(require_admin), db: 
         raise HTTPException(status_code=422, detail="策略配置不可运行")
     if config.mode == "LIVE":
         require_live_runtime_open()
-    run = execute_simulation_strategy(db, config)
+    definition = db.get(StrategyDefinition, config.strategy_definition_id)
+    if definition and definition.key == "trading_agents_auto":
+        check = trading_agents_readiness(settings)
+        if not check["ready"]:
+            raise HTTPException(
+                status_code=503,
+                detail=f"TradingAgents 尚未就绪: {', '.join(check['reasons'])}",
+            )
+        run = execute_strategy_trigger(db, config, "agent_analysis")
+    else:
+        run = execute_simulation_strategy(db, config)
     if run.status == "failed" and config.mode == "LIVE":
         raise HTTPException(status_code=403, detail=run.error_message)
     return serialize(run)
@@ -403,7 +707,12 @@ def strategy_logs(run_id: int, _: Administrator = Depends(require_admin), db: Se
 
 @app.get("/api/strategy-schedules")
 def schedules(_: Administrator = Depends(require_admin), db: Session = Depends(get_db)):
-    return [serialize(item) for item in db.scalars(select(StrategySchedule).order_by(StrategySchedule.id))]
+    result = []
+    for item in db.scalars(select(StrategySchedule).order_by(StrategySchedule.id)):
+        config = db.get(StrategyConfig, item.strategy_config_id)
+        definition = db.get(StrategyDefinition, config.strategy_definition_id)
+        result.append(serialize(item, strategy_key=definition.key))
+    return result
 
 
 @app.post("/api/strategy-schedules", status_code=201)
@@ -433,8 +742,29 @@ def update_schedule(schedule_id: int, payload: ScheduleUpdate, _: Administrator 
     if not item:
         raise HTTPException(status_code=404, detail="调度不存在")
     config = db.get(StrategyConfig, item.strategy_config_id)
+    definition = db.get(StrategyDefinition, config.strategy_definition_id) if config else None
+    if definition and definition.key == "trading_agents_auto":
+        fixed_times = {"agent_analysis": "13:30", "agent_rebalance": "14:45"}
+        requested_trigger = payload.trigger_type or item.trigger_type
+        requested_time = payload.run_time or item.run_time
+        if (
+            requested_trigger != item.trigger_type
+            or requested_time != fixed_times.get(item.trigger_type)
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="TradingAgents 调度触发类型和时间固定，只允许启停",
+            )
     if config and config.mode == "LIVE" and payload.enabled:
         require_live_runtime_open()
+    if config and payload.enabled:
+        if definition and definition.key == "trading_agents_auto":
+            check = _trading_agents_runtime_readiness(db, config)
+            if not check["automation_ready"]:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"自动计划不能启用: {', '.join(check['automation_reasons'])}",
+                )
     for key, value in payload.model_dump(exclude_none=True).items():
         setattr(item, key, value)
     db.commit()
@@ -537,6 +867,96 @@ def simulation_account(_: Administrator = Depends(require_admin), db: Session = 
         seed_database(db, settings)
         account = db.scalar(select(SimulationAccount).limit(1))
     return serialize(account)
+
+
+def _account_payload(db: Session, account: SimulationAccount) -> dict[str, Any]:
+    market_value = db.scalar(
+        select(func.coalesce(func.sum(Position.market_value), 0)).where(
+            Position.account_id == account.id,
+            Position.mode == "SIMULATION",
+            Position.quantity > 0,
+        )
+    ) or 0
+    total_asset = float(account.cash_balance) + float(market_value)
+    bound_configs = list(
+        db.scalars(
+            select(StrategyConfig).where(
+                StrategyConfig.simulation_account_id == account.id,
+            )
+        )
+    )
+    bound_keys = [
+        db.get(StrategyDefinition, config.strategy_definition_id).key
+        for config in bound_configs
+    ]
+    return serialize(
+        account,
+        market_value=float(market_value),
+        total_asset=total_asset,
+        bound_strategy_keys=bound_keys,
+        available_for_trading_agents=(
+            not bound_keys or set(bound_keys) == {"trading_agents_auto"}
+        ),
+    )
+
+
+@app.get("/api/simulation/accounts")
+def simulation_accounts(_: Administrator = Depends(require_admin), db: Session = Depends(get_db)):
+    return [
+        _account_payload(db, item)
+        for item in db.scalars(select(SimulationAccount).order_by(SimulationAccount.id))
+    ]
+
+
+@app.post("/api/simulation/accounts", status_code=201)
+def create_simulation_account(
+    payload: SimulationAccountCreate,
+    _: Administrator = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    account_name = payload.name.strip()
+    if not account_name:
+        raise HTTPException(status_code=422, detail="模拟账户名称不能为空")
+    if db.scalar(select(SimulationAccount.id).where(SimulationAccount.name == account_name)):
+        raise HTTPException(status_code=409, detail="模拟账户名称已存在")
+    account = SimulationAccount(
+        name=account_name,
+        initial_cash=payload.initial_cash,
+        cash_balance=payload.initial_cash,
+        available_cash=payload.initial_cash,
+        total_asset=payload.initial_cash,
+        commission_rate=settings.simulation_commission_rate,
+        min_commission=settings.simulation_min_commission,
+        stamp_tax_rate=settings.simulation_stamp_tax_rate,
+        transfer_fee_rate=settings.simulation_transfer_fee_rate,
+        slippage_bps=settings.simulation_slippage_bps,
+    )
+    db.add(account)
+    db.flush()
+    db.add(
+        SimulationAccountLedger(
+            simulation_account_id=account.id,
+            event_type="initialize",
+            amount=account.initial_cash,
+            balance_after=account.initial_cash,
+            message="管理员创建模拟账户",
+        )
+    )
+    snapshot_account(db, account)
+    db.commit()
+    return _account_payload(db, account)
+
+
+@app.get("/api/simulation/accounts/{account_id}")
+def simulation_account_detail(
+    account_id: int,
+    _: Administrator = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    account = db.get(SimulationAccount, account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="模拟账户不存在")
+    return _account_payload(db, account)
 
 
 @app.post("/api/simulation/account/reset")

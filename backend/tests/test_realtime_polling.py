@@ -17,6 +17,7 @@ from app.models import (
     StockEvent,
     StrategyConfig,
     StrategyDefinition,
+    StrategySchedule,
     WatchlistItem,
 )
 from app.services import execute_simulation_strategy, seed_database
@@ -208,6 +209,56 @@ def test_worker_quote_polling_is_limited_to_execution_windows():
     assert quote_poll_scope(datetime(2026, 7, 14, 10, 0, 1, tzinfo=shanghai)) is None
     assert quote_poll_scope(datetime(2026, 7, 10, 20, 30, tzinfo=shanghai)) is None
     assert quote_poll_scope(datetime(2026, 7, 11, 14, 39, 40, tzinfo=shanghai)) is None
+
+
+def test_worker_agent_snapshot_scope_runs_once_in_pre_analysis_window():
+    from app.worker import agent_snapshot_scope
+
+    shanghai = ZoneInfo("Asia/Shanghai")
+    assert agent_snapshot_scope(datetime(2026, 7, 13, 13, 25, tzinfo=shanghai))
+    assert agent_snapshot_scope(datetime(2026, 7, 13, 13, 29, 59, tzinfo=shanghai))
+    assert not agent_snapshot_scope(datetime(2026, 7, 13, 13, 30, tzinfo=shanghai))
+    assert not agent_snapshot_scope(datetime(2026, 7, 11, 13, 25, tzinfo=shanghai))
+
+
+def test_worker_allows_dry_run_snapshot_before_schedules_are_enabled(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from app.trading_agents.runtime import seed_trading_agents_runtime
+    from app.worker import poll_agent_market_snapshot
+
+    engine = make_db(tmp_path)
+    settings = Settings(database_url=f"sqlite:///{tmp_path / 'poll.db'}")
+    with Session(engine) as db:
+        seed_database(db, settings)
+        config = seed_trading_agents_runtime(db, settings)
+        assert config.parameters["dry_run"] is True
+        schedules = list(
+            db.scalars(
+                select(StrategySchedule).where(
+                    StrategySchedule.strategy_config_id == config.id
+                )
+            )
+        )
+        assert schedules and all(not schedule.enabled for schedule in schedules)
+
+    captured = []
+
+    def fake_sync(db, config, router, *, current):
+        captured.append((config.id, router, current))
+        return {"quote_updated": 5, "daily_rows": 300}
+
+    monkeypatch.setattr("app.worker.sync_agent_market_data", fake_sync)
+    current = datetime(2026, 7, 13, 13, 25, tzinfo=ZoneInfo("Asia/Shanghai"))
+    result = poll_agent_market_snapshot(
+        router=object(),
+        session_factory=lambda: Session(engine),
+        current=current,
+    )
+
+    assert result == {"quote_updated": 5, "daily_rows": 300}
+    assert captured and captured[0][2] == current
 
 
 def test_worker_event_polling_runs_before_quote_preheat_window():

@@ -36,6 +36,7 @@ from app.services import (
     release_simulation_cash,
     scan_plugins,
     seed_database,
+    snapshot_account,
     validate_strategy_parameters,
 )
 
@@ -60,11 +61,40 @@ def make_event_data_fresh(db: Session) -> None:
 
 
 def test_model_count_and_seed(db: Session):
-    assert len(Base.metadata.tables) == 26
+    assert len(Base.metadata.tables) == 30
     account = db.scalar(select(SimulationAccount))
     definition = db.scalar(select(StrategyDefinition).where(StrategyDefinition.key == "overnight_hold"))
     assert account is not None and account.initial_cash == 10000
     assert definition is not None and definition.required_timeframes == ["1m"]
+
+
+def test_snapshot_revalues_total_asset_from_cash_and_all_positions(db: Session):
+    account = db.scalar(select(SimulationAccount).limit(1))
+    stocks = list(db.scalars(select(Stock).order_by(Stock.id).limit(2)))
+    account.cash_balance = 7_000
+    account.available_cash = 7_000
+    account.total_asset = 99_999
+    for stock, quantity in zip(stocks, (100, 200), strict=True):
+        stock.last_price = 10
+        db.add(
+            Position(
+                account_id=account.id,
+                mode="SIMULATION",
+                stock_id=stock.id,
+                quantity=quantity,
+                available_quantity=quantity,
+                average_cost=9,
+                market_value=0,
+                unrealized_pnl=0,
+            )
+        )
+    db.flush()
+
+    snapshot = snapshot_account(db, account)
+
+    assert snapshot.market_value == 3_000
+    assert snapshot.total_asset == 10_000
+    assert account.total_asset == 10_000
 
 
 def test_seed_uses_configurable_risk_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -81,6 +111,35 @@ def test_seed_uses_configurable_risk_defaults(tmp_path: Path, monkeypatch: pytes
         live = session.scalar(select(RiskSettings).where(RiskSettings.mode == "LIVE"))
         assert simulation.max_order_notional_abs == 1234
         assert live.max_daily_orders == 9
+
+
+def test_seed_backfills_legacy_simulation_config_account(tmp_path: Path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'legacy-config.db'}")
+    Base.metadata.create_all(engine)
+    settings = Settings(database_url=str(engine.url))
+    with Session(engine) as session:
+        seed_database(session, settings)
+        definition = session.scalar(
+            select(StrategyDefinition).where(StrategyDefinition.key == "overnight_hold")
+        )
+        account = session.scalar(
+            select(SimulationAccount).order_by(SimulationAccount.id)
+        )
+        account_id = account.id
+        legacy = StrategyConfig(
+            strategy_definition_id=definition.id,
+            name="历史模拟配置",
+            mode="SIMULATION",
+            parameters={},
+            simulation_account_id=None,
+        )
+        session.add(legacy)
+        session.commit()
+
+        seed_database(session, settings)
+        session.refresh(legacy)
+
+    assert legacy.simulation_account_id == account_id
 
 
 def test_password_and_signed_session():
@@ -122,6 +181,49 @@ def test_simulation_run_creates_fill_position_and_t1_lock(db: Session):
     assert db.scalar(select(AccountSnapshot).order_by(AccountSnapshot.id.desc())) is not None
     ledger_events = [item.event_type for item in db.scalars(select(SimulationAccountLedger).order_by(SimulationAccountLedger.id))]
     assert ledger_events == ["initialize", "order_freeze", "fill"]
+
+
+def test_simulation_run_uses_strategy_bound_account(db: Session):
+    make_event_data_fresh(db)
+    definition = db.scalar(
+        select(StrategyDefinition).where(StrategyDefinition.key == "overnight_hold")
+    )
+    default_account = db.scalar(select(SimulationAccount).order_by(SimulationAccount.id))
+    dedicated = SimulationAccount(
+        name="一夜持股专用测试账户",
+        initial_cash=20_000,
+        cash_balance=20_000,
+        available_cash=20_000,
+        total_asset=20_000,
+        commission_rate=0.0003,
+        min_commission=5,
+        stamp_tax_rate=0.0005,
+        transfer_fee_rate=0,
+        slippage_bps=5,
+    )
+    db.add(dedicated)
+    db.flush()
+    stock = db.scalar(select(Stock).where(Stock.symbol == "000001.SZ"))
+    stock.change_pct = 4.9
+    stock.turnover_amount = 900_000_000
+    stock.last_price = 10.01
+    stock.quote_updated_at = now()
+    config = StrategyConfig(
+        strategy_definition_id=definition.id,
+        name="绑定账户测试",
+        mode="SIMULATION",
+        parameters={},
+        simulation_account_id=dedicated.id,
+    )
+    db.add(config)
+    db.commit()
+
+    execute_simulation_strategy(db, config)
+    order = db.scalar(select(Order).order_by(Order.id.desc()))
+
+    assert order.account_id == dedicated.id
+    assert dedicated.cash_balance < 20_000
+    assert default_account.cash_balance == default_account.initial_cash
 
 
 def test_simulation_run_selects_best_universe_candidate_not_first_watchlist(db: Session):

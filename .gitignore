@@ -18,3 +18,4 @@ dist/
 data/market/*.parquet
 data/backtests/*.parquet
 data/plugins/*.pyc
+data/trading-agents/

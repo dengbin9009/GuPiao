@@ -45,3 +45,36 @@ def test_runtime_migration_adds_schedule_retry_column(tmp_path):
             )
         }
     assert "next_run_at" in columns
+
+
+def test_runtime_migration_adds_strategy_simulation_account_binding(tmp_path):
+    from sqlalchemy import text
+
+    from app.database import apply_runtime_migrations, create_database_engine
+
+    database_url = f"sqlite:///{tmp_path / 'legacy-strategy.db'}"
+    engine = create_database_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE strategy_configs ("
+                "id INTEGER PRIMARY KEY, "
+                "strategy_definition_id INTEGER, "
+                "name VARCHAR(128), "
+                "mode VARCHAR(16), "
+                "parameters JSON, "
+                "enabled BOOLEAN"
+                ")"
+            )
+        )
+
+    apply_runtime_migrations(database_engine=engine, database_url=database_url)
+
+    with engine.connect() as connection:
+        columns = {
+            row[1]
+            for row in connection.exec_driver_sql(
+                "PRAGMA table_info(strategy_configs)"
+            )
+        }
+    assert "simulation_account_id" in columns

@@ -1,354 +1,125 @@
-# GuPiao Deployment Manual
+# GuPiao 部署手册
 
-## Overview
+## 支持范围
 
-GuPiao supports two practical deployment modes:
+GuPiao 支持 Mac 本地开发和 Linux Docker Compose 部署。默认且持续保持模拟盘；真实盘只有在券商适配器、账户、权限和风控全部人工验收后才允许进入单独上线流程。
 
-1. Local development or single-machine runtime using the backend and frontend development servers.
-2. Linux Docker Compose deployment using `mysql`, `backend`, `worker`, `scheduler`, and `frontend`.
+应用由五个进程组成：
 
-The core system can run without any real broker gateway. LIVE trading must stay disabled until the selected adapter, account, and permissions are validated.
+- `backend`：FastAPI API
+- `worker`：行情、公告和通知 Worker
+- `scheduler`：交易日计划调度器
+- `tradingagents-worker`：TradingAgents 独立分析 Worker
+- `frontend`：Vue/Nginx 控制台
 
-## Directory Layout
-
-- `backend/`: FastAPI backend and worker logic
-- `frontend/`: Vue web console
-- `data/market/`: minute-bar cache and quote artifacts
-- `data/backtests/`: backtest equity artifacts
-- `data/plugins/`: trusted local strategy plugins
-- `.env`: runtime configuration
-- `docker-compose.yml`: Compose deployment entrypoint
-
-## Prerequisites
-
-### Local development
+## 环境要求
 
 - Python 3.12
 - Node.js 20
-- npm
-- Optional MySQL if you do not use SQLite
+- Docker Engine 与 Docker Compose（Linux 部署）
+- MySQL 8.4（Compose 已包含）
+- 出站访问 PyPI、npm 和 GitHub
 
-### Linux Docker Compose deployment
-
-- Docker Engine
-- Docker Compose
-- Open outbound access for:
-  - `frontend`: TCP `8080`
-  - `backend`: TCP `8000` if you expose it directly
-  - `mysql`: TCP `3306` only if external access is needed
-
-## Environment Configuration
-
-Create `.env` from `.env.example`:
+## 环境配置
 
 ```bash
 cp .env.example .env
 ```
 
-Prebuilt examples are also available:
-
-- `.env.simulation.example`
-- `.env.qmt.example`
-- `.env.ptrade.example`
-- `.env.futu.example`
-
-### Minimal SIMULATION-only `.env`
+模拟盘最小安全边界：
 
 ```dotenv
-GUPIAO_ENV=development
-GUPIAO_SECRET_KEY=replace-with-a-long-random-value
-GUPIAO_ADMIN_USERNAME=admin
-GUPIAO_ADMIN_PASSWORD=change-me
-GUPIAO_ALLOWED_IPS=127.0.0.1/32,::1/128,192.168.0.0/16
-DATABASE_URL=sqlite:///./gupiao.db
-CORS_ORIGINS=http://127.0.0.1:5173,http://localhost:5173,http://localhost:8080
-MARKET_DATA_PROVIDER=akshare
 LIVE_TRADING_ENABLED=false
 BROKER_ADAPTER=simulation
+SIMULATION_MAX_ORDER_NOTIONAL_ABS=20000
 ```
 
-### MySQL deployment `.env`
+TradingAgents 还需要 `OPENAI_API_KEY`。API 只返回是否配置，不返回密钥值。
 
-```dotenv
-DATABASE_URL=mysql+pymysql://gupiao:change-me@mysql:3306/gupiao
-```
+## 本地启动
 
-### Optional market-data configuration
-
-- `TUSHARE_TOKEN`
-- `REALTIME_POLL_INTERVAL_SECONDS`
-- `MARKET_DATA_STALE_AFTER_SECONDS`
-- `CORPORATE_EVENT_SYNC_INTERVAL_SECONDS`
-- `CORPORATE_EVENT_STALE_AFTER_SECONDS`
-
-### SIMULATION risk and cost configuration
-
-- `SIMULATION_INITIAL_CASH`
-- `SIMULATION_COMMISSION_RATE`
-- `SIMULATION_MIN_COMMISSION`
-- `SIMULATION_STAMP_TAX_RATE`
-- `SIMULATION_TRANSFER_FEE_RATE`
-- `SIMULATION_SLIPPAGE_BPS`
-- `SIMULATION_MAX_ORDER_NOTIONAL_ABS`
-- `SIMULATION_MAX_ORDER_NOTIONAL_PCT`
-- `SIMULATION_MAX_POSITION_PCT`
-- `SIMULATION_MAX_TOTAL_EXPOSURE_PCT`
-- `SIMULATION_DAILY_LOSS_LIMIT_PCT`
-- `SIMULATION_MAX_CONSECUTIVE_ERRORS`
-
-### LIVE configuration
-
-Keep this disabled until verified:
-
-```dotenv
-LIVE_TRADING_ENABLED=false
-```
-
-Broker configuration options:
-
-- QMT:
-  - `QMT_GATEWAY_URL`
-  - `QMT_GATEWAY_TOKEN`
-- PTrade:
-  - `PTRADE_GATEWAY_URL`
-  - `PTRADE_GATEWAY_TOKEN`
-- Futu OpenD:
-  - `FUTU_OPEND_HOST`
-  - `FUTU_OPEND_PORT`
-  - `FUTU_TRD_MARKET`
-  - `FUTU_SECURITY_FIRM`
-  - `FUTU_TRD_ENV`
-  - `FUTU_UNLOCK_PASSWORD`
-
-## Local Development Startup
-
-### Backend
+安装后端依赖：
 
 ```bash
 cd backend
-.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+uv pip install -e '.[market,agents,dev]'
 ```
 
-### Frontend
+一键启动五进程：
 
 ```bash
-cd frontend
-npm run dev -- --host 127.0.0.1 --port 5173
+./start_tonight_observe.sh
 ```
 
-Open:
+访问：
 
-- Frontend: `http://127.0.0.1:5173`
-- Backend health: `http://127.0.0.1:8000/api/health`
+- 控制台：http://127.0.0.1:5173
+- 健康检查：http://127.0.0.1:8000/api/health
 
-## Docker Compose Startup
+日志包括：`.uvicorn.log`、`.worker.log`、`.scheduler.log`、`.tradingagents-worker.log` 和 `.vite.log`。
 
-Use a deployment-oriented `.env`:
+Mac LaunchAgent 模板位于 `deploy/launchagents/com.gupiao.tradingagents-worker.plist.example`，使用前必须把占位路径替换为绝对路径，并通过 LaunchAgent 自身的安全环境注入密钥。
 
-```bash
-cp .env.example .env
-```
-
-Then start:
+## Linux Docker Compose
 
 ```bash
 docker compose up --build -d
+docker compose ps
 ```
 
-Main endpoints:
+前端：http://服务器地址:8080
+后端健康：http://服务器地址:8000/api/health
 
-- Frontend: `http://<host>:8080`
-- Backend health: `http://<host>:8000/api/health` if exposed
+Compose 为五个应用进程和 MySQL 都配置了健康检查。`tradingagents-worker` 和 API 镜像安装固定提交的可选依赖。
 
-### Compose services
+## 数据库升级
 
-- `mysql`: persistent database
-- `backend`: FastAPI API
-- `worker`: notification and quote polling worker
-- `scheduler`: trading-day schedule runner
-- `frontend`: Nginx serving the Vue app and proxying `/api/`
-
-## First-Time SIMULATION Setup
-
-1. Log in with the configured administrator account.
-2. Go to `特别关注`, add one or more A-share stocks.
-3. Click `刷新行情`.
-4. Go to `策略中心`.
-5. Optionally click:
-   - `同步股票主数据`
-   - `同步公司事件`
-   - `轮询实时报价`
-6. Create a `SIMULATION` strategy configuration.
-7. Run the strategy.
-8. Check:
-   - `账户与交易`
-   - `历史回测`
-   - `风控与网关`
-
-## Enabling LIVE Trading
-
-### Preconditions
-
-Do not enable LIVE until all of the following are true:
-
-- A broker adapter is configured.
-- The selected gateway is healthy.
-- A LIVE account is synchronized.
-- The account is enabled.
-- The account is not read-only.
-- The account market permissions match the target securities.
-- Quotes are fresh.
-- LIVE risk settings are reviewed.
-
-### QMT / PTrade / Futu workflow
-
-1. Fill the adapter-specific `.env` values.
-2. Restart the backend.
-3. Go to `风控与网关`.
-4. Sync LIVE accounts.
-5. Verify account fields:
-   - market permissions
-   - capabilities
-   - read-only status
-6. Enable the desired account.
-7. Enable LIVE mode.
-8. Only then run a `LIVE` strategy configuration.
-
-### Important fail-closed behaviors
-
-LIVE orders are blocked when:
-
-- no enabled account exists
-- account is read-only
-- account lacks `A_SHARE` market permission
-- gateway is unhealthy
-- quote data is stale
-- event data is stale
-- risk limits are exceeded
-
-## Health Checks
-
-### Backend
+升级前先备份：
 
 ```bash
-curl http://127.0.0.1:8000/api/health
+docker compose exec mysql mysqldump -ugupiao -p gupiao > gupiao-before-upgrade.sql
 ```
 
-### Provider and realtime status
+现有 MySQL 执行：
 
-After login:
+```bash
+docker compose exec -T mysql mysql -ugupiao -p gupiao < backend/migrations/0002_tradingagents_auto.sql
+```
 
-- `GET /api/market-data/sources`
-- `GET /api/market-data/realtime-status`
-- `POST /api/market-data/realtime-poll`
+空数据库由 SQLAlchemy 启动建表；SQLite 旧库由启动时迁移补列。
 
-### Gateway status
+## TradingAgents 启用顺序
 
-After login:
+1. 保持两条 AI 计划停用，`dry_run=true`。
+2. 确认密钥、固定依赖、模拟盘隔离均通过 readiness。
+3. 13:25 后固化行情和公告，创建 Top 10 分析批次。
+4. 批次 `ready` 后执行无下单演练，确认状态为 `dry_run_completed` 且订单数为 0。
+5. 把 `dry_run` 改为 `false`。
+6. 先启用 `agent_analysis`，再启用 `agent_rebalance`。
 
-- `GET /api/gateways`
-- `POST /api/live/accounts/sync`
+任一门禁不满足时，后端拒绝启用自动计划。
 
-## Backup
+## 备份目录
 
-### SQLite
-
-Back up:
-
-- `backend/gupiao.db`
+- 数据库
 - `data/market/`
 - `data/backtests/`
 - `data/plugins/`
+- `data/trading-agents/`
+- `.env`（按密钥文件标准保护）
 
-### MySQL
+## 故障处理
 
-```bash
-docker compose exec mysql mysqldump -ugupiao -p gupiao > gupiao.sql
-```
+- readiness 显示依赖未安装：重建带 `agents` 依赖的后端镜像或重新安装可选依赖。
+- 批次无法创建：检查 13:25 实时行情、60 根已完成日线和公告源时效。
+- 批次失败：查看单股错误、预算、14:42 截止时间和子进程日志。
+- 调仓被拦截：检查 T+1、现金、单笔 2 万、单股 20%、总仓位 60% 和紧急停止。
+- 前端可开但 API 失败：检查 backend 健康、代理目标和登录会话。
 
-Also back up:
+## 回滚
 
-- `data/market/`
-- `data/backtests/`
-- `data/plugins/`
-- `.env`
-
-## Upgrade
-
-1. Stop traffic or announce maintenance.
-2. Back up database and `data/`.
-3. Pull or copy the new code.
-4. Rebuild services:
-
-```bash
-docker compose up --build -d
-```
-
-5. Verify:
-
-```bash
-curl http://127.0.0.1:8000/api/health
-```
-
-6. Log in and check:
-   - strategy page loads
-   - realtime status page loads
-   - backtests page loads
-   - gateway page loads
-
-## Rollback
-
-1. Stop services.
-2. Restore the last working code version.
-3. Restore database backup.
-4. Restore `data/market` and `data/backtests`.
-5. Restart services.
-
-## Troubleshooting
-
-### Frontend opens, but data requests fail
-
-Check:
-
-- `backend` is running
-- browser can reach `/api/`
-- login cookie is valid
-
-### Strategy says quote is stale
-
-Check:
-
-- `特别关注` has at least one stock
-- `轮询实时报价` runs without hard errors
-- `MARKET_DATA_STALE_AFTER_SECONDS` is not too low
-
-### LIVE account sync fails
-
-Check:
-
-- the correct gateway is enabled
-- gateway URL and token are correct
-- adapter endpoint is reachable
-- Futu/OpenD is running if you use Futu
-
-### Futu adapter does not place orders
-
-Current behavior:
-
-- If the `futu` SDK is unavailable, the adapter fails closed.
-- If the SDK is available, account query and order placement use the SDK path.
-
-## Validation Scripts
-
-The repository includes useful smoke and acceptance scripts:
-
-- `backend/scripts/verify_provider_fallbacks.py`
-- `backend/scripts/verify_realtime_chain.py`
-- `backend/scripts/verify_schedule_chain.py`
-- `backend/scripts/verify_backtest_acceptance.py`
-- `backend/scripts/verify_live_guardrails.py`
-- `backend/scripts/verify_live_symbol_permissions.py`
-- `backend/scripts/verify_futu_adapter.py`
-- `backend/scripts/verify_adapter_contracts.py`
-- `backend/scripts/verify_cross_platform_smoke.py`
-- `backend/scripts/verify_e2e_smoke.py`
+1. 停止服务。
+2. 恢复上一版本代码和数据库备份。
+3. 恢复数据目录。
+4. 重新启动并检查五个应用进程。
+5. 确认真实盘仍为关闭状态、真实订单数为 0。

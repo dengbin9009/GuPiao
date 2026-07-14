@@ -10,10 +10,12 @@ RUN_DIR="$ROOT/.run"
 BACKEND_LOG="$BACKEND_DIR/.uvicorn.log"
 WORKER_LOG="$BACKEND_DIR/.worker.log"
 SCHEDULER_LOG="$BACKEND_DIR/.scheduler.log"
+TRADING_AGENTS_LOG="$BACKEND_DIR/.tradingagents-worker.log"
 FRONTEND_LOG="$FRONTEND_DIR/.vite.log"
 BACKEND_PID_FILE="$RUN_DIR/backend.pid"
 WORKER_PID_FILE="$RUN_DIR/worker.pid"
 SCHEDULER_PID_FILE="$RUN_DIR/scheduler.pid"
+TRADING_AGENTS_PID_FILE="$RUN_DIR/tradingagents-worker.pid"
 FRONTEND_PID_FILE="$RUN_DIR/frontend.pid"
 
 PYTHON_BIN="${GUPIAO_PYTHON_BIN:-$BACKEND_DIR/.venv/bin/python}"
@@ -163,6 +165,7 @@ stop_managed_pid() {
 stop_managed_pid "$BACKEND_PID_FILE" "$BACKEND_DIR"
 stop_managed_pid "$WORKER_PID_FILE" "$BACKEND_DIR"
 stop_managed_pid "$SCHEDULER_PID_FILE" "$BACKEND_DIR"
+stop_managed_pid "$TRADING_AGENTS_PID_FILE" "$BACKEND_DIR"
 stop_managed_pid "$FRONTEND_PID_FILE" "$FRONTEND_DIR"
 
 cd "$BACKEND_DIR"
@@ -194,6 +197,8 @@ start_bg "$WORKER_PID_FILE" "$WORKER_LOG" "$PYTHON_BIN" -m app.worker
 WORKER_PID=$LAST_PID
 start_bg "$SCHEDULER_PID_FILE" "$SCHEDULER_LOG" "$PYTHON_BIN" -m app.scheduler_runner
 SCHEDULER_PID=$LAST_PID
+start_bg "$TRADING_AGENTS_PID_FILE" "$TRADING_AGENTS_LOG" "$PYTHON_BIN" -m app.trading_agents.worker
+TRADING_AGENTS_PID=$LAST_PID
 
 cd "$FRONTEND_DIR"
 PATH="$NODE_BIN:$PATH"
@@ -202,7 +207,7 @@ FRONTEND_PID=$LAST_PID
 
 sleep 4
 
-for process in "backend:$BACKEND_PID:$BACKEND_LOG" "worker:$WORKER_PID:$WORKER_LOG" "scheduler:$SCHEDULER_PID:$SCHEDULER_LOG" "frontend:$FRONTEND_PID:$FRONTEND_LOG"; do
+for process in "backend:$BACKEND_PID:$BACKEND_LOG" "worker:$WORKER_PID:$WORKER_LOG" "scheduler:$SCHEDULER_PID:$SCHEDULER_LOG" "tradingagents-worker:$TRADING_AGENTS_PID:$TRADING_AGENTS_LOG" "frontend:$FRONTEND_PID:$FRONTEND_LOG"; do
   IFS=: read -r name pid log_file <<< "$process"
   if ! kill -0 "$pid" 2>/dev/null; then
     echo "$name failed to start; inspect $log_file"
@@ -218,7 +223,7 @@ if [ "${GUPIAO_ATTACHED:-false}" = "true" ]; then
   VERIFIED=false
   ATTACHED_STARTED_AT=$SECONDS
   while true; do
-    for process in "backend:$BACKEND_PID:$BACKEND_LOG" "worker:$WORKER_PID:$WORKER_LOG" "scheduler:$SCHEDULER_PID:$SCHEDULER_LOG" "frontend:$FRONTEND_PID:$FRONTEND_LOG"; do
+    for process in "backend:$BACKEND_PID:$BACKEND_LOG" "worker:$WORKER_PID:$WORKER_LOG" "scheduler:$SCHEDULER_PID:$SCHEDULER_LOG" "tradingagents-worker:$TRADING_AGENTS_PID:$TRADING_AGENTS_LOG" "frontend:$FRONTEND_PID:$FRONTEND_LOG"; do
       IFS=: read -r name pid log_file <<< "$process"
       if ! kill -0 "$pid" 2>/dev/null; then
         echo "$name stopped; inspect $log_file"
@@ -240,6 +245,7 @@ trap - EXIT INT TERM
 echo "Backend PID:   $BACKEND_PID"
 echo "Worker PID:    $WORKER_PID"
 echo "Scheduler PID: $SCHEDULER_PID"
+echo "Agents PID:    $TRADING_AGENTS_PID"
 echo "Frontend PID:  $FRONTEND_PID"
 
 echo
@@ -247,6 +253,7 @@ echo "Logs:"
 echo "  $BACKEND_LOG"
 echo "  $WORKER_LOG"
 echo "  $SCHEDULER_LOG"
+echo "  $TRADING_AGENTS_LOG"
 echo "  $FRONTEND_LOG"
 
 echo

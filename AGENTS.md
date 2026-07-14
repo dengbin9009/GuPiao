@@ -14,7 +14,7 @@
 ```bash
 cd backend
 python3.12 -m venv .venv
-.venv/bin/python -m pip install -e '.[market,dev]'
+.venv/bin/python -m pip install -e '.[market,agents,dev]'
 ```
 
 后端测试：

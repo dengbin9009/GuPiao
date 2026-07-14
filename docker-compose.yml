@@ -18,10 +18,14 @@ services:
       retries: 20
 
   backend:
-    build: ./backend
+    build:
+      context: ./backend
+      args:
+        INSTALL_AGENTS: "true"
     env_file: ${ENV_FILE:-.env}
     environment:
       DATABASE_URL: mysql+pymysql://gupiao:change-me@mysql:3306/gupiao
+      TRADING_AGENTS_DATA_ROOT: /data/trading-agents
     ports:
       - "8000:8000"
     volumes:
@@ -29,30 +33,74 @@ services:
     depends_on:
       mysql:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
 
   worker:
-    build: ./backend
+    build:
+      context: ./backend
+      args:
+        INSTALL_AGENTS: "true"
     command: ["python", "-m", "app.worker"]
     env_file: ${ENV_FILE:-.env}
     environment:
       DATABASE_URL: mysql+pymysql://gupiao:change-me@mysql:3306/gupiao
+      TRADING_AGENTS_DATA_ROOT: /data/trading-agents
     volumes:
       - ./data:/data
     depends_on:
       mysql:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os; os.kill(1, 0)"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
 
   scheduler:
-    build: ./backend
+    build:
+      context: ./backend
+      args:
+        INSTALL_AGENTS: "true"
     command: ["python", "-m", "app.scheduler_runner"]
     env_file: ${ENV_FILE:-.env}
     environment:
       DATABASE_URL: mysql+pymysql://gupiao:change-me@mysql:3306/gupiao
+      TRADING_AGENTS_DATA_ROOT: /data/trading-agents
     volumes:
       - ./data:/data
     depends_on:
       mysql:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os; os.kill(1, 0)"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+
+  tradingagents-worker:
+    build:
+      context: ./backend
+      args:
+        INSTALL_AGENTS: "true"
+    command: ["python", "-m", "app.trading_agents.worker"]
+    env_file: ${ENV_FILE:-.env}
+    environment:
+      DATABASE_URL: mysql+pymysql://gupiao:change-me@mysql:3306/gupiao
+      TRADING_AGENTS_DATA_ROOT: /data/trading-agents
+    volumes:
+      - ./data:/data
+    depends_on:
+      mysql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os; os.kill(1, 0)"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
 
   frontend:
     build: ./frontend
@@ -60,6 +108,11 @@ services:
       - "8080:80"
     depends_on:
       - backend
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
 
 volumes:
   mysql-data:

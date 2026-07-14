@@ -21,12 +21,17 @@ from .models import (
     NotificationDelivery,
     Position,
     Stock,
+    StrategyConfig,
+    StrategyDefinition,
+    StrategySchedule,
     WatchlistItem,
     now,
 )
 from .notifications import deliver_channel
 from .providers import corporate_event_router, market_router
 from .services import seed_database
+from .trading_agents.runtime import seed_trading_agents_runtime
+from .trading_agents.market_snapshot import sync_agent_market_data
 
 LOGGER = logging.getLogger("gupiao.worker")
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -50,6 +55,63 @@ def event_poll_scope(current: datetime | None = None) -> bool:
         return False
     current_time = current.time().replace(tzinfo=None)
     return wall_time(14, 20) <= current_time < wall_time(14, 35)
+
+
+def agent_snapshot_scope(current: datetime | None = None) -> bool:
+    current = (current or datetime.now(SHANGHAI)).astimezone(SHANGHAI)
+    if current.weekday() >= 5:
+        return False
+    current_time = current.time().replace(tzinfo=None)
+    return wall_time(13, 25) <= current_time < wall_time(13, 30)
+
+
+def poll_agent_market_snapshot(
+    *,
+    router=None,
+    session_factory=SessionLocal,
+    current: datetime | None = None,
+) -> dict[str, int]:
+    current = current or datetime.now(SHANGHAI)
+    if router is None:
+        event_result = poll_corporate_events(session_factory=session_factory)
+        if event_result["errors"]:
+            return {"skipped": 0, "errors": 1, "message": "公司公告同步失败"}
+    with session_factory() as db:
+        config = db.scalar(
+            select(StrategyConfig)
+            .join(StrategyDefinition)
+            .where(
+                StrategyDefinition.key == "trading_agents_auto",
+                StrategyConfig.enabled.is_(True),
+                StrategyConfig.mode == "SIMULATION",
+            )
+            .limit(1)
+        )
+        if not config:
+            return {"skipped": 1}
+        parameters = config.parameters or {}
+        analysis_schedule_enabled = bool(
+            db.scalar(
+                select(StrategySchedule.id).where(
+                    StrategySchedule.strategy_config_id == config.id,
+                    StrategySchedule.trigger_type == "agent_analysis",
+                    StrategySchedule.enabled.is_(True),
+                )
+            )
+        )
+        if not parameters.get("dry_run", True) and not analysis_schedule_enabled:
+            return {"skipped": 1}
+        try:
+            return sync_agent_market_data(
+                db,
+                config,
+                router or market_router(),
+                current=current,
+            )
+        except Exception as exc:
+            db.rollback()
+            LOGGER.exception("TradingAgents 行情固化失败")
+            return {"skipped": 0, "errors": 1, "message": str(exc)[:200]}
 
 
 def should_poll_events(
@@ -272,6 +334,7 @@ def main() -> None:
     apply_runtime_migrations()
     with SessionLocal() as db:
         seed_database(db, get_settings())
+        seed_trading_agents_runtime(db, get_settings())
         try:
             routed = market_router().call("stock_master", "stock_master")
             provider = type(
@@ -295,10 +358,19 @@ def main() -> None:
     LOGGER.info("启动公告探测完成 result=%s", event_result)
     last_quote_poll = time.time()
     last_event_attempt = time.time()
+    last_agent_snapshot_date = None
     while True:
         try:
             current = time.time()
             current_dt = datetime.now(SHANGHAI)
+            if (
+                agent_snapshot_scope(current_dt)
+                and last_agent_snapshot_date != current_dt.date()
+            ):
+                result = poll_agent_market_snapshot(current=current_dt)
+                if not result.get("errors"):
+                    last_agent_snapshot_date = current_dt.date()
+                LOGGER.info("TradingAgents 行情固化 result=%s", result)
             if notification_poll_allowed(current_dt):
                 process_pending_notifications()
             scope = quote_poll_scope(current_dt)
