@@ -9,7 +9,7 @@
 ## 本轮结果
 
 - 初始基线：后端 `58 passed / 3 failed`，scheduler 因交易日历提供方全部失败而退出。
-- 当前后端：Python 3.12.12 下全套测试 `176 passed`；Ruff 全部通过；wheel 已从干净构建环境生成。
+- 当前后端：Python 3.12.12 下全套测试 `177 passed`；Ruff 全部通过；wheel 已从干净构建环境生成；全新环境可一次安装 `market + agents + dev` 依赖。
 - 当前前端：Node 20 下生产构建通过，共转换 1560 个模块。
 - TradingAgents：新增独立策略、10 万元独立模拟账户、13:25 快照、Top 100/Top 10 确定性预筛、五级评级、三种仓位映射、批次租约、预算与截止时间、原子模拟调仓、管理员 API 和控制台。上游固定为 `v0.3.1` / `01477f9`，readiness 同时校验版本和 Git 提交。
 - 快照审计：GuPiao 行情、日线、指标和公告为核心依据；Yahoo 基本面与新闻只在 LLM 调用前作为可选数据冻结进 SHA-256 快照，剔除价格派生字段，抓取失败记录不可用哨兵。分析阶段不临场访问任何外部数据工具。
@@ -44,7 +44,7 @@
 - [x] worker 与 scheduler 均至少连续存活 60 秒。
 - [x] 交易日历数据源失败后，模拟盘 scheduler 仍存活；LIVE 配置 fail-closed。
 - [x] 使用 `--preferred-timeframe 60m` 的回测成功并保留结果证据。
-- [x] 后端全套 `176 passed`、Ruff 与 scheduler/TradingAgents 原子占用、崩溃恢复和全批失败测试通过。
+- [x] 后端全套 `177 passed`、Ruff 与 scheduler/TradingAgents 原子占用、崩溃恢复、全批失败及依赖契约测试通过。
 - [x] 前端 Node 20 构建通过。
 - [x] 运行时验证 `LIVE_TRADING_ENABLED=false`。
 - [x] 运行时验证 `BROKER_ADAPTER=simulation`。
@@ -55,7 +55,7 @@
 - [ ] Docker 五进程验收；当前被本机镜像代理证书错误阻塞。
 - [x] 登录后核心 API 全部 HTTP 200；启用 LIVE 请求 HTTP 403。
 - [x] 独立代码审查的 8 项问题均已落实修复或测试覆盖。
-- [x] 所有修改均位于专用 worktree，未 merge、未启用实盘、未发送真实订单。
+- [x] 修改已通过快进方式合并到 `main`；主目录五进程已持续运行超过 60 秒，未启用实盘、未发送真实订单。
 
 ## 观察项
 
