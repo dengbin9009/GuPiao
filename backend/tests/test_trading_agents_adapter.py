@@ -13,6 +13,7 @@ from app.trading_agents.adapter import (
     to_yahoo_symbol,
 )
 from app.trading_agents.agent_subprocess import _news
+from app.trading_agents.agent_subprocess import _openai_chat_kwargs
 
 
 def test_to_yahoo_symbol_supports_a_share_exchanges():
@@ -42,6 +43,7 @@ def test_normalize_rating_rejects_unstructured_output():
 def test_analyzer_runs_isolated_child_with_allowlisted_environment(monkeypatch):
     captured = {}
     monkeypatch.setenv("OPENAI_API_KEY", "test-secret")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://compatible.example/v1")
     monkeypatch.setenv("DATABASE_URL", "mysql://must-not-leak")
 
     def fake_run(command, **kwargs):
@@ -86,11 +88,56 @@ def test_analyzer_runs_isolated_child_with_allowlisted_environment(monkeypatch):
     assert request["symbol"] == "600519.SS"
     assert request["snapshot"]["symbol"] == "600519.SH"
     assert captured["env"]["OPENAI_API_KEY"] == "test-secret"
+    assert captured["env"]["OPENAI_BASE_URL"] == "https://compatible.example/v1"
     assert "DATABASE_URL" not in captured["env"]
     assert Path(captured["cwd"]).name.startswith("gupiao-tradingagents-")
     assert not Path(captured["cwd"]).exists()
     assert result.rating == "Buy"
     assert result.llm_calls == 3
+
+
+def test_openai_chat_kwargs_include_compatible_endpoint(monkeypatch):
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://compatible.example/v1")
+
+    result = _openai_chat_kwargs(model="gpt-5.6-sol", callbacks=["stats"])
+
+    assert result == {
+        "model": "gpt-5.6-sol",
+        "callbacks": ["stats"],
+        "base_url": "https://compatible.example/v1",
+    }
+
+
+def test_analyzer_redacts_key_and_endpoint_from_child_error(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-secret")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://compatible.example/v1")
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr=(
+                "request failed: test-secret at "
+                "https://compatible.example/v1/chat/completions"
+            ),
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        TradingAgentsAnalyzer().analyze(
+            symbol="000001.SZ",
+            trading_date="2026-07-14",
+            snapshot={"symbol": "000001.SZ", "bars": []},
+            profile="a_share_balanced",
+            quick_model="gpt-5.6-terra",
+            deep_model="gpt-5.6-sol",
+            timeout_seconds=1,
+        )
+
+    assert "test-secret" not in str(raised.value)
+    assert "compatible.example" not in str(raised.value)
+    assert str(raised.value).count("[REDACTED]") == 2
 
 
 def test_analyzer_reports_candidate_timeout(monkeypatch):

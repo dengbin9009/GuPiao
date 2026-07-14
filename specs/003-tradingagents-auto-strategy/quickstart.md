@@ -11,7 +11,8 @@ uv pip install -e '.[market,agents,dev]'
 
 ## 2. 配置环境
 
-在项目既有环境配置中增加 `OPENAI_API_KEY`，并确认：
+在项目既有环境配置中增加 `OPENAI_API_KEY`。使用 OpenAI 兼容服务时，同时增加
+`OPENAI_BASE_URL`（通常填写到 `/v1`，不要包含 `/chat/completions`），并确认：
 
 ```text
 LIVE_TRADING_ENABLED=false
@@ -19,7 +20,8 @@ BROKER_ADAPTER=simulation
 SIMULATION_MAX_ORDER_NOTIONAL_ABS=20000
 ```
 
-系统不会通过 API 返回密钥，只会报告是否已配置。
+系统不会通过 API 返回密钥或接口地址，只会报告是否已配置。快速模型和深度模型
+名称在策略中心配置，必须使用兼容服务实际提供的模型标识。
 
 `TRADING_AGENTS_DATA_ROOT` 可指定快照和上游报告目录；Docker Compose 固定为 `/data/trading-agents` 并挂载持久卷。本地默认使用项目 `data/trading-agents`。
 

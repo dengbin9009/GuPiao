@@ -22,6 +22,8 @@ RATINGS = {
 
 CHILD_ENV_KEYS = {
     "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_API_BASE",
     "HTTP_PROXY",
     "HTTPS_PROXY",
     "ALL_PROXY",
@@ -60,9 +62,14 @@ def _child_environment() -> dict[str, str]:
 
 
 def _redact(message: str) -> str:
-    secret = os.getenv("OPENAI_API_KEY", "")
-    if secret:
-        message = message.replace(secret, "[REDACTED]")
+    sensitive_values = (
+        os.getenv("OPENAI_API_KEY", "").strip(),
+        os.getenv("OPENAI_BASE_URL", "").strip(),
+        os.getenv("OPENAI_API_BASE", "").strip(),
+    )
+    for value in sensitive_values:
+        if value:
+            message = message.replace(value, "[REDACTED]")
     return message
 
 

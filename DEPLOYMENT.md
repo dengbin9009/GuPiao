@@ -34,7 +34,10 @@ BROKER_ADAPTER=simulation
 SIMULATION_MAX_ORDER_NOTIONAL_ABS=20000
 ```
 
-TradingAgents 还需要 `OPENAI_API_KEY`。API 只返回是否配置，不返回密钥值。
+TradingAgents 还需要 `OPENAI_API_KEY`。使用 OpenAI 兼容接口时同时配置
+`OPENAI_BASE_URL`，值填写到服务商的 API 根路径（通常以 `/v1` 结尾），不要填写
+`/chat/completions`。系统兼容旧变量名 `OPENAI_API_BASE`，但新配置应优先使用
+`OPENAI_BASE_URL`。API 只返回密钥和兼容接口是否配置，不返回其值。
 
 ## 本地启动
 

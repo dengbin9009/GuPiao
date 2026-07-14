@@ -22,7 +22,7 @@ from app.services import seed_database
 from app.trading_agents import readiness
 from app.trading_agents.runtime import seed_trading_agents_runtime
 from app.trading_agents.runtime import find_matching_dry_run
-from app.trading_agents.config import configuration_fingerprint
+from app.trading_agents.config import configuration_fingerprint, openai_base_url
 
 
 def test_trading_agents_models_and_seed_are_simulation_only(tmp_path):
@@ -60,6 +60,8 @@ def test_trading_agents_models_and_seed_are_simulation_only(tmp_path):
         assert config.mode == "SIMULATION"
         assert config.simulation_account_id == account.id
         assert config.parameters["analysis_profile"] == "a_share_balanced"
+        assert config.parameters["quick_model"] == "gpt-5.6-terra"
+        assert config.parameters["deep_model"] == "gpt-5.6-sol"
         assert {item.trigger_type for item in schedules} == {
             "agent_analysis",
             "agent_rebalance",
@@ -79,6 +81,26 @@ def test_readiness_fails_closed_without_openai_key(monkeypatch):
     assert result["openai_configured"] is False
     assert "OPENAI_API_KEY" in result["reasons"]
     assert "openai_api_key" not in result
+
+
+def test_openai_base_url_prefers_primary_name_and_supports_legacy_alias(monkeypatch):
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://primary.example/v1")
+    monkeypatch.setenv("OPENAI_API_BASE", "https://legacy.example/v1")
+    assert openai_base_url() == "https://primary.example/v1"
+
+    monkeypatch.delenv("OPENAI_BASE_URL")
+    assert openai_base_url() == "https://legacy.example/v1"
+
+
+def test_readiness_reports_endpoint_boolean_without_exposing_url(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-only")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://secret-endpoint.example/v1")
+
+    result = readiness(Settings())
+
+    assert result["custom_endpoint_configured"] is True
+    assert "openai_base_url" not in result
+    assert "https://secret-endpoint.example/v1" not in str(result)
 
 
 def test_dry_run_must_match_current_configuration(tmp_path):

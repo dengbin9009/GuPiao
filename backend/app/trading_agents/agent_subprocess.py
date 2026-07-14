@@ -10,6 +10,16 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .config import openai_base_url
+
+
+def _openai_chat_kwargs(*, model: str, callbacks: list[Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {"model": model, "callbacks": callbacks}
+    base_url = openai_base_url()
+    if base_url:
+        result["base_url"] = base_url
+    return result
+
 
 def _bars(request: dict[str, Any]) -> list[dict[str, Any]]:
     return sorted(
@@ -313,6 +323,7 @@ def _run_candidate(request: dict[str, Any]) -> dict[str, Any]:
         "data_cache_dir": str(root / "cache"),
         "memory_log_path": str(root / "memory.md"),
         "llm_provider": "openai",
+        "backend_url": openai_base_url(),
         "quick_think_llm": request["quick_model"],
         "deep_think_llm": request["deep_model"],
         "output_language": "Simplified Chinese",
@@ -380,7 +391,12 @@ def _run_portfolio(request: dict[str, Any]) -> dict[str, Any]:
         rationale: str
 
     callback = _stats_handler()
-    model = ChatOpenAI(model=request["deep_model"], callbacks=[callback])
+    model = ChatOpenAI(
+        **_openai_chat_kwargs(
+            model=request["deep_model"],
+            callbacks=[callback],
+        )
+    )
     structured = model.with_structured_output(PortfolioComparison)
     payload = json.dumps(request["analyses"], ensure_ascii=False, sort_keys=True)
     result = structured.invoke(

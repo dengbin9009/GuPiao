@@ -43,6 +43,7 @@ GuPiao 新增独立策略 `trading_agents_auto`，使用固定版本的 TradingA
 4. 目标卖出数量超过 T+1 可卖量时，批次为 `blocked`，订单数为 0。
 5. 正式模拟调仓只改变绑定账户，其他模拟账户的现金、持仓和收益不变。
 6. 无 `OPENAI_API_KEY` 时 readiness 返回未就绪，计划启用 API 返回冲突错误。
+7. 配置 `OPENAI_BASE_URL` 时，候选研究和组合决策必须使用该兼容接口；API、日志和报告不得返回地址或密钥。
 
 ## 不在范围
 

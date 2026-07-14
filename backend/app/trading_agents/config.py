@@ -15,6 +15,13 @@ TRADING_AGENTS_VERSION = "0.3.1"
 TRADING_AGENTS_COMMIT = "01477f9afb7a47b849ed4c9259d3a9a4738d9fda"
 
 
+def openai_base_url() -> str | None:
+    value = os.getenv("OPENAI_BASE_URL", "").strip()
+    if not value:
+        value = os.getenv("OPENAI_API_BASE", "").strip()
+    return value or None
+
+
 def data_root() -> Path:
     configured = os.getenv("TRADING_AGENTS_DATA_ROOT", "").strip()
     if configured:
@@ -54,8 +61,8 @@ POSITION_MAPPINGS = {
 TRADING_AGENTS_DEFAULTS: dict[str, Any] = {
     "analysis_profile": "a_share_balanced",
     "position_mapping": "fixed_rating",
-    "quick_model": "gpt-5.4-mini",
-    "deep_model": "gpt-5.2",
+    "quick_model": "gpt-5.6-terra",
+    "deep_model": "gpt-5.6-sol",
     "prefilter_size": 100,
     "top_n": 10,
     "snapshot_quote_max_age_seconds": 600,
@@ -130,6 +137,7 @@ def readiness(settings: Settings) -> dict[str, Any]:
     return {
         "ready": not reasons,
         "openai_configured": openai_configured,
+        "custom_endpoint_configured": openai_base_url() is not None,
         "dependency_installed": dependency_installed,
         "dependency_version": dependency_version,
         "dependency_version_valid": dependency_version == TRADING_AGENTS_VERSION,

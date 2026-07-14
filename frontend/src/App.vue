@@ -480,6 +480,7 @@ onMounted(async () => {
             <div class="section-head"><div><h2>就绪状态</h2><span>自动计划默认关闭</span></div><Activity :size="19" /></div>
             <div class="status-list">
               <div><span>OpenAI 密钥</span><b :class="agentsReadiness?.openai_configured ? 'ok' : 'negative'">{{ agentsReadiness?.openai_configured ? '已配置' : '未配置' }}</b></div>
+              <div><span>兼容接口</span><b :class="agentsReadiness?.custom_endpoint_configured ? 'ok' : ''">{{ agentsReadiness?.custom_endpoint_configured ? '已配置' : '官方默认' }}</b></div>
               <div><span>固定依赖</span><b :class="agentsReadiness?.dependency_version_valid && agentsReadiness?.dependency_commit_valid ? 'ok' : 'negative'">{{ agentsReadiness?.dependency_version_valid && agentsReadiness?.dependency_commit_valid ? `v${agentsReadiness.dependency_version} · ${agentsReadiness.dependency_commit?.slice(0, 7)}` : agentsReadiness?.dependency_installed ? '版本或提交不符' : '未安装' }}</b></div>
               <div><span>模拟盘隔离</span><b :class="agentsReadiness?.simulation_only ? 'ok' : 'negative'">{{ agentsReadiness?.simulation_only ? '通过' : '未通过' }}</b></div>
               <div><span>完整演练</span><b :class="agentsReadiness?.dry_run_validated ? 'ok' : 'muted'">{{ agentsReadiness?.dry_run_validated ? `批次 #${agentsReadiness.last_dry_run_batch_id}` : '尚未完成' }}</b></div>
