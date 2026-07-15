@@ -597,7 +597,8 @@ def execute_simulation_strategy(db: Session, config: StrategyConfig) -> Strategy
             )
 
     max_notional = min(risk.max_order_notional_abs, account.total_asset * risk.max_order_notional_pct)
-    quantity = math.floor(max_notional / stock.last_price / 100) * 100
+    slip_price = stock.last_price * (1 + account.slippage_bps / 10_000)
+    quantity = math.floor(max_notional / slip_price / 100) * 100
     if quantity <= 0:
         run.status = "completed"
         run.summary = {"accepted": 0, "rejected": 1, "reason": "资金不足一手", "selection": selection_summary}
@@ -606,7 +607,6 @@ def execute_simulation_strategy(db: Session, config: StrategyConfig) -> Strategy
         db.commit()
         return run
 
-    slip_price = stock.last_price * (1 + account.slippage_bps / 10_000)
     notional = slip_price * quantity
     commission = max(notional * account.commission_rate, account.min_commission)
     transfer_fee = notional * account.transfer_fee_rate

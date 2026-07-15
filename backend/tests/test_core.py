@@ -183,6 +183,41 @@ def test_simulation_run_creates_fill_position_and_t1_lock(db: Session):
     assert ledger_events == ["initialize", "order_freeze", "fill"]
 
 
+def test_simulation_entry_sizes_from_slippage_adjusted_price_before_risk_gate(db: Session):
+    make_event_data_fresh(db)
+    account = db.scalar(select(SimulationAccount).order_by(SimulationAccount.id))
+    risk = db.scalar(select(RiskSettings).where(RiskSettings.mode == "SIMULATION"))
+    account.initial_cash = 100_000
+    account.cash_balance = 100_000
+    account.available_cash = 100_000
+    account.total_asset = 100_000
+    risk.max_order_notional_abs = 20_000
+
+    definition = db.scalar(select(StrategyDefinition).where(StrategyDefinition.key == "overnight_hold"))
+    stock = db.scalar(select(Stock).where(Stock.symbol == "000001.SZ"))
+    stock.change_pct = 4.9
+    stock.turnover_amount = 900_000_000
+    stock.last_price = 2.94
+    stock.quote_updated_at = now()
+    config = StrategyConfig(
+        strategy_definition_id=definition.id,
+        name="滑点反推数量测试",
+        mode="SIMULATION",
+        parameters={},
+        simulation_account_id=account.id,
+    )
+    db.add(config)
+    db.commit()
+
+    run = execute_simulation_strategy(db, config)
+
+    order = db.scalar(select(Order).order_by(Order.id.desc()))
+    fill = db.scalar(select(Fill).order_by(Fill.id.desc()))
+    assert run.status == "completed"
+    assert order.quantity == 6_700
+    assert fill.price * fill.quantity <= 20_000
+
+
 def test_simulation_run_uses_strategy_bound_account(db: Session):
     make_event_data_fresh(db)
     definition = db.scalar(
