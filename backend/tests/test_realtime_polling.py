@@ -221,6 +221,14 @@ def test_worker_agent_snapshot_scope_runs_once_in_pre_analysis_window():
     assert not agent_snapshot_scope(datetime(2026, 7, 11, 13, 25, tzinfo=shanghai))
 
 
+def test_worker_throttles_failed_agent_snapshot_retries():
+    from app.worker import agent_snapshot_retry_due
+
+    assert agent_snapshot_retry_due(None, current_seconds=100)
+    assert not agent_snapshot_retry_due(100, current_seconds=219)
+    assert agent_snapshot_retry_due(100, current_seconds=220)
+
+
 def test_worker_allows_dry_run_snapshot_before_schedules_are_enabled(
     tmp_path: Path,
     monkeypatch,

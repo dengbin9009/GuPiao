@@ -35,6 +35,7 @@ from .trading_agents.market_snapshot import sync_agent_market_data
 
 LOGGER = logging.getLogger("gupiao.worker")
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+AGENT_SNAPSHOT_RETRY_SECONDS = 120
 
 
 def quote_poll_scope(current: datetime | None = None) -> str | None:
@@ -63,6 +64,17 @@ def agent_snapshot_scope(current: datetime | None = None) -> bool:
         return False
     current_time = current.time().replace(tzinfo=None)
     return wall_time(13, 25) <= current_time < wall_time(13, 30)
+
+
+def agent_snapshot_retry_due(
+    last_attempt_seconds: float | None,
+    *,
+    current_seconds: float,
+) -> bool:
+    return (
+        last_attempt_seconds is None
+        or current_seconds - last_attempt_seconds >= AGENT_SNAPSHOT_RETRY_SECONDS
+    )
 
 
 def poll_agent_market_snapshot(
@@ -359,6 +371,7 @@ def main() -> None:
     last_quote_poll = time.time()
     last_event_attempt = time.time()
     last_agent_snapshot_date = None
+    last_agent_snapshot_attempt = None
     while True:
         try:
             current = time.time()
@@ -366,8 +379,13 @@ def main() -> None:
             if (
                 agent_snapshot_scope(current_dt)
                 and last_agent_snapshot_date != current_dt.date()
+                and agent_snapshot_retry_due(
+                    last_agent_snapshot_attempt,
+                    current_seconds=current,
+                )
             ):
                 result = poll_agent_market_snapshot(current=current_dt)
+                last_agent_snapshot_attempt = time.time()
                 if not result.get("errors"):
                     last_agent_snapshot_date = current_dt.date()
                 LOGGER.info("TradingAgents 行情固化 result=%s", result)

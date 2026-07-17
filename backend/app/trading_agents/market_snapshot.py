@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
+import time
 from typing import Any
 
 from sqlalchemy import select
@@ -10,6 +11,11 @@ from sqlalchemy.orm import Session
 from ..data_sync import refresh_quotes
 from ..models import MarketDailyBar, Position, Stock, StrategyConfig, now
 from .config import TRADING_AGENTS_DEFAULTS
+
+
+DAILY_FETCH_MAX_WORKERS = 2
+DAILY_FETCH_ATTEMPTS = 2
+DAILY_FETCH_RETRY_DELAY_SECONDS = 0.2
 
 
 def _field(row: dict[str, Any], *keys: str, default: Any = None) -> Any:
@@ -123,21 +129,48 @@ def sync_agent_market_data(
     errors = 0
     selected_stocks = sorted(selected_by_id.values(), key=lambda item: item.symbol)
 
-    def fetch_daily(symbol: str):
-        return router.call(
-            "daily",
-            "bars",
-            symbol=symbol,
-            timeframe="1d",
-            start=start,
-            end=latest_completed,
+    def needs_daily_refresh(stock: Stock) -> bool:
+        bars = list(
+            db.scalars(
+                select(MarketDailyBar)
+                .where(
+                    MarketDailyBar.stock_id == stock.id,
+                    MarketDailyBar.trade_date <= latest_completed,
+                )
+                .order_by(MarketDailyBar.trade_date.desc())
+                .limit(60)
+            )
         )
+        return len(bars) < 60 or bars[0].trade_date < latest_completed
+
+    def fetch_daily(symbol: str):
+        last_error = None
+        for attempt in range(DAILY_FETCH_ATTEMPTS):
+            try:
+                return router.call(
+                    "daily",
+                    "bars",
+                    symbol=symbol,
+                    timeframe="1d",
+                    start=start,
+                    end=latest_completed,
+                )
+            except Exception as exc:
+                last_error = exc
+                if attempt + 1 < DAILY_FETCH_ATTEMPTS:
+                    time.sleep(DAILY_FETCH_RETRY_DELAY_SECONDS)
+        raise last_error
 
     fetched: dict[str, Any] = {}
-    with ThreadPoolExecutor(max_workers=min(8, max(1, len(selected_stocks)))) as executor:
+    stocks_needing_refresh = [
+        stock for stock in selected_stocks if needs_daily_refresh(stock)
+    ]
+    with ThreadPoolExecutor(
+        max_workers=min(DAILY_FETCH_MAX_WORKERS, max(1, len(stocks_needing_refresh)))
+    ) as executor:
         futures = {
             executor.submit(fetch_daily, stock.symbol): stock.symbol
-            for stock in selected_stocks
+            for stock in stocks_needing_refresh
         }
         for future in as_completed(futures):
             symbol = futures[future]
@@ -146,7 +179,7 @@ def sync_agent_market_data(
             except Exception:
                 errors += 1
 
-    for stock in selected_stocks:
+    for stock in stocks_needing_refresh:
         daily = fetched.get(stock.symbol)
         if daily is None:
             continue
