@@ -19,6 +19,13 @@ from app.trading_agents.runtime import seed_trading_agents_runtime
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
+def test_latest_completed_daily_date_skips_weekend():
+    from app.trading_agents.market_snapshot import latest_completed_daily_date
+
+    assert latest_completed_daily_date(datetime(2026, 7, 20, 13, 25, tzinfo=SHANGHAI)) == "2026-07-17"
+    assert latest_completed_daily_date(datetime(2026, 7, 21, 13, 25, tzinfo=SHANGHAI)) == "2026-07-20"
+
+
 def test_market_snapshot_refreshes_top_turnover_and_holdings_only(tmp_path: Path):
     engine = create_engine(f"sqlite:///{tmp_path / 'market-snapshot.db'}")
     Base.metadata.create_all(engine)

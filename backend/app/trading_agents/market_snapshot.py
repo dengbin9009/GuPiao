@@ -34,6 +34,13 @@ def _daily_date(row: dict[str, Any]) -> str:
     return text[:10]
 
 
+def latest_completed_daily_date(current: datetime) -> str:
+    candidate = current.date() - timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate -= timedelta(days=1)
+    return candidate.isoformat()
+
+
 def _upsert_daily_rows(
     db: Session,
     *,
@@ -123,7 +130,7 @@ def sync_agent_market_data(
     for stock in db.scalars(select(Stock).where(Stock.id.in_(holding_ids))):
         selected_by_id[stock.id] = stock
 
-    latest_completed = (current.date() - timedelta(days=1)).isoformat()
+    latest_completed = latest_completed_daily_date(current)
     start = (current.date() - timedelta(days=140)).isoformat()
     changed = 0
     errors = 0
