@@ -5,6 +5,7 @@ import {
   Gauge, Heart, LayoutDashboard, LogOut, Play, Plus, RefreshCw, Search,
   Settings2, ShieldAlert, Trash2, TrendingUp, WalletCards, X
 } from 'lucide-vue-next'
+import { createTradingAgentsBatch } from './trading-agents-actions.js'
 
 const api = async (path, options = {}) => {
   const response = await fetch(`/api${path}`, {
@@ -206,21 +207,25 @@ const ensureConfig = async () => {
   return config
 }
 
-const saveAgentsConfig = async () => {
+const saveAgentsConfig = async ({ notifyOnSuccess = true } = {}) => {
   try {
     const { simulation_account_id, ...parameters } = agentsForm
     await api('/trading-agents/config', {
       method: 'PUT', body: JSON.stringify({ parameters, simulation_account_id })
     })
-    await loadAll(); notify('TradingAgents 配置已保存')
+    await loadAll()
+    if (notifyOnSuccess) notify('TradingAgents 配置已保存')
   } catch (err) { error.value = err.message; throw err }
 }
 
 const runAgentsBatch = async () => {
   try {
-    await saveAgentsConfig()
-    await api('/trading-agents/batches', { method: 'POST', body: '{}' })
-    await loadAll(); notify('TradingAgents 分析批次已创建')
+    await createTradingAgentsBatch({
+      saveConfiguration: () => saveAgentsConfig({ notifyOnSuccess: false }),
+      createBatch: () => api('/trading-agents/batches', { method: 'POST', body: '{}' }),
+      reload: loadAll,
+      notify,
+    })
   } catch (err) { error.value = err.message }
 }
 
