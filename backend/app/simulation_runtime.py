@@ -72,7 +72,18 @@ def prepare_simulation_runtime(db: Session, settings: Settings) -> dict[str, Any
         stock.last_price = None
         stock.change_pct = None
         stock.turnover_amount = None
+        stock.turnover_rate = None
+        stock.open_price = None
+        stock.high_price = None
+        stock.low_price = None
+        stock.volume = None
+        stock.vwap = None
+        stock.tail_30m_return = None
+        stock.limit_up_price = None
+        stock.limit_down_price = None
+        stock.quote_source = None
         stock.quote_updated_at = None
+        stock.factor_updated_at = None
 
     account = db.scalar(select(SimulationAccount).limit(1))
     if account is None:

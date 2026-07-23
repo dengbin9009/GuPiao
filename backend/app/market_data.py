@@ -3,6 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import date, datetime
+from threading import local
 from urllib.parse import parse_qs, urlparse
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo
@@ -149,6 +150,54 @@ def _records(frame: Any) -> list[dict[str, Any]]:
     return list(frame)
 
 
+def _normalize_bars(
+    rows: list[dict[str, Any]],
+    *,
+    symbol: str,
+    provider: str,
+    volume_multiplier: float = 1.0,
+    amount_multiplier: float = 1.0,
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        timestamp = (
+            row.get("timestamp")
+            or row.get("trade_time")
+            or row.get("datetime")
+            or row.get("时间")
+            or row.get("trade_date")
+            or row.get("日期")
+        )
+        close = row.get("close", row.get("收盘"))
+        if timestamp in {None, ""} or close in {None, ""} or float(close) <= 0:
+            continue
+        text = (
+            timestamp.isoformat()
+            if isinstance(timestamp, datetime)
+            else str(timestamp).replace(" ", "T")
+        )
+        result.append(
+            {
+                "symbol": symbol,
+                "timestamp": text,
+                "open": float(row.get("open", row.get("开盘", close)) or close),
+                "high": float(row.get("high", row.get("最高", close)) or close),
+                "low": float(row.get("low", row.get("最低", close)) or close),
+                "close": float(close),
+                "volume": float(
+                    row.get("volume", row.get("vol", row.get("成交量", 0))) or 0
+                )
+                * volume_multiplier,
+                "amount": float(row.get("amount", row.get("成交额", 0)) or 0)
+                * amount_multiplier,
+                "provider": provider,
+            }
+        )
+    if not result:
+        raise MarketDataError(f"{provider} K 线返回缺少可用标准字段")
+    return result
+
+
 class AKShareProvider(MarketDataProvider):
     name = "akshare"
     capabilities = frozenset({"stock_master", "daily", "minute", "realtime", "trading_calendar"})
@@ -180,8 +229,30 @@ class AKShareProvider(MarketDataProvider):
         code = symbol.split(".")[0]
         try:
             if timeframe == "1m":
-                return _records(self.client.stock_zh_a_hist_min_em(symbol=code, period="1", adjust="qfq"))
+                return _normalize_bars(
+                    _records(
+                        self.client.stock_zh_a_hist_min_em(
+                            symbol=code,
+                            period="1",
+                            adjust="qfq",
+                        )
+                    ),
+                    symbol=symbol,
+                    provider=self.name,
+                    volume_multiplier=100,
+                )
             if timeframe == "1d":
+                if symbol == "000300.SH":
+                    return _records(
+                        self.client.index_zh_a_hist(
+                            symbol="000300",
+                            period="daily",
+                            start_date=(start or "19900101").replace("-", ""),
+                            end_date=(
+                                end or datetime.now(SHANGHAI).date().isoformat()
+                            ).replace("-", ""),
+                        )
+                    )
                 return _records(
                     self.client.stock_zh_a_hist(
                         symbol=code,
@@ -246,9 +317,16 @@ class TushareProvider(MarketDataProvider):
         params = {"ts_code": symbol, "start_date": (start or "").replace("-", ""), "end_date": (end or "").replace("-", "")}
         try:
             if timeframe == "1d":
+                if symbol == "000300.SH":
+                    return _records(self.client.index_daily(**params))
                 return _records(self.client.daily(**params))
             if timeframe == "1m" and hasattr(self.client, "stk_mins"):
-                return _records(self.client.stk_mins(freq="1min", **params))
+                return _normalize_bars(
+                    _records(self.client.stk_mins(freq="1min", **params)),
+                    symbol=symbol,
+                    provider=self.name,
+                    amount_multiplier=1000,
+                )
         except Exception as exc:
             raise MarketDataError(f"Tushare K 线获取失败: {exc}") from exc
         raise MarketDataError(f"当前 Tushare 权限不支持时间粒度 {timeframe}")
@@ -275,7 +353,7 @@ class TushareProvider(MarketDataProvider):
 
 class MootdxProvider(MarketDataProvider):
     name = "mootdx"
-    capabilities = frozenset({"minute", "hour", "realtime"})
+    capabilities = frozenset({"minute", "hour", "realtime", "finance"})
 
     def __init__(self):
         try:
@@ -283,10 +361,12 @@ class MootdxProvider(MarketDataProvider):
 
             self.Quotes = Quotes
             self.client = None
+            self._thread_clients = local()
             self.import_error = None
         except Exception as exc:
             self.Quotes = None
             self.client = None
+            self._thread_clients = local()
             self.import_error = str(exc)
 
     def health(self) -> tuple[bool, str | None]:
@@ -298,12 +378,16 @@ class MootdxProvider(MarketDataProvider):
     def _quotes(self):
         if not self.Quotes:
             raise MarketDataError("mootdx 未安装")
-        if self.client is None:
+        if self.client is not None:
+            return self.client
+        client = getattr(self._thread_clients, "client", None)
+        if client is None:
             try:
-                self.client = self.Quotes.factory(market="std")
+                client = self.Quotes.factory(market="std")
+                self._thread_clients.client = client
             except Exception as exc:
                 raise MarketDataError(f"mootdx 连接失败: {exc}") from exc
-        return self.client
+        return client
 
     def bars(self, *, symbol: str, timeframe: str, start: str | None = None, end: str | None = None) -> list[dict[str, Any]]:
         if timeframe not in {"1m", "60m"}:
@@ -391,10 +475,36 @@ class MootdxProvider(MarketDataProvider):
                             "最新价": price,
                             "涨跌幅": change_pct,
                             "成交额": float(row.get("amount", 0) or 0),
+                            "open_price": float(row.get("open", 0) or 0),
+                            "high_price": float(row.get("high", 0) or 0),
+                            "low_price": float(row.get("low", 0) or 0),
+                            "volume": float(
+                                row.get("volume", row.get("vol", 0)) or 0
+                            )
+                            * 100,
+                            "previous_close": previous_close,
                             "quote_at": quote_at,
                         }
                     )
         return result
+
+    def finance(self, symbol: str) -> dict[str, Any]:
+        code = symbol.split(".")[0]
+        try:
+            records = _records(self._quotes().finance(symbol=code))
+        except Exception as exc:
+            raise MarketDataError(f"mootdx 财务信息获取失败: {exc}") from exc
+        if not records:
+            raise MarketDataError(f"mootdx 财务信息缺失: {symbol}")
+        row = records[0]
+        ipo_date = str(row.get("ipo_date", "")).split(".")[0]
+        listing_date = None
+        if len(ipo_date) == 8 and ipo_date.isdigit():
+            listing_date = f"{ipo_date[:4]}-{ipo_date[4:6]}-{ipo_date[6:]}"
+        return {
+            "float_shares": float(row.get("liutongguben", 0) or 0),
+            "listing_date": listing_date,
+        }
 
     def trading_days(self, *, start: str, end: str) -> list[str]:
         raise MarketDataError("mootdx 不提供交易日历")

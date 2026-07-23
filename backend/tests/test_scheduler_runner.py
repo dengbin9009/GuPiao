@@ -13,6 +13,7 @@ from app.database import Base
 from app.models import (
     DataSourceState,
     Order,
+    ProbabilityPortfolioRun,
     Stock,
     StrategyConfig,
     StrategyDefinition,
@@ -204,6 +205,99 @@ def test_schedule_window_claim_is_atomic(tmp_path: Path):
     finally:
         first.close()
         second.close()
+
+
+def test_probability_exit_schedule_retries_until_1045():
+    from app.scheduler_runner import schedule_tolerance_seconds
+
+    schedule = SimpleNamespace(trigger_type="portfolio_exit", run_time="10:30")
+    config = SimpleNamespace(parameters={"latest_exit_time": "10:45"})
+
+    assert schedule_tolerance_seconds(schedule, config) == 15 * 60
+
+
+def test_probability_entry_schedule_retries_until_1441():
+    from app.scheduler_runner import schedule_tolerance_seconds
+
+    schedule = SimpleNamespace(trigger_type="portfolio_entry", run_time="14:40")
+    config = SimpleNamespace(parameters={"latest_entry_time": "14:41"})
+
+    assert schedule_tolerance_seconds(schedule, config) == 60
+
+
+def test_probability_entry_recovery_ignores_same_window_observation(tmp_path: Path):
+    from app.probability_portfolio.runtime import seed_probability_portfolio_runtime
+    from app.scheduler_runner import existing_window_run
+
+    database_url = f"sqlite:///{tmp_path / 'probability-recovery.db'}"
+    engine = create_engine(database_url)
+    Base.metadata.create_all(engine)
+    current = datetime(2026, 7, 13, 14, 40, 10, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    with Session(engine) as db:
+        settings = Settings(database_url=database_url)
+        seed_database(db, settings)
+        config = seed_probability_portfolio_runtime(db, settings)
+        schedule = db.scalar(
+            select(StrategySchedule).where(
+                StrategySchedule.strategy_config_id == config.id,
+                StrategySchedule.trigger_type == "portfolio_entry",
+            )
+        )
+        observation = StrategyRun(
+            strategy_config_id=config.id,
+            mode="SIMULATION",
+            status="completed",
+            started_at=current,
+            finished_at=current,
+            summary={},
+        )
+        db.add(observation)
+        db.flush()
+        db.add(
+            ProbabilityPortfolioRun(
+                strategy_run_id=observation.id,
+                strategy_config_id=config.id,
+                simulation_account_id=config.simulation_account_id,
+                trading_date=current.date().isoformat(),
+                trigger_type="portfolio_observation",
+                status="completed",
+                dry_run=True,
+                completed_at=current,
+            )
+        )
+        schedule.last_run_id = observation.id
+        db.commit()
+
+        assert existing_window_run(db, schedule=schedule, current=current) is None
+
+        entry = StrategyRun(
+            strategy_config_id=config.id,
+            mode="SIMULATION",
+            status="completed",
+            started_at=current,
+            finished_at=current,
+            summary={},
+        )
+        db.add(entry)
+        db.flush()
+        db.add(
+            ProbabilityPortfolioRun(
+                strategy_run_id=entry.id,
+                strategy_config_id=config.id,
+                simulation_account_id=config.simulation_account_id,
+                trading_date=current.date().isoformat(),
+                trigger_type="portfolio_entry",
+                status="completed",
+                dry_run=False,
+                completed_at=current,
+            )
+        )
+        db.commit()
+
+        recovered = existing_window_run(db, schedule=schedule, current=current)
+        assert recovered is not None
+        assert recovered.id == entry.id
 
 
 def test_expired_claim_reconciles_completed_run_without_duplicate_order(

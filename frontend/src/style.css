@@ -67,6 +67,7 @@ th { padding: 10px 15px; color: #7c878d; background: #fafbfb; text-align: left; 
 td { padding: 12px 15px; border-top: 1px solid #edf0f2; font-size: 12px; white-space: nowrap; }
 td strong { display: block; font-size: 12px; }
 td small { display: block; color: #8a959b; margin-top: 3px; font-size: 10px; }
+.reason-cell { min-width: 220px; max-width: 360px; white-space: normal; line-height: 1.45; }
 .empty { text-align: center; padding: 34px !important; color: #8b969c; }
 .positive { color: #15805f !important; }
 .negative { color: #c1463e !important; }

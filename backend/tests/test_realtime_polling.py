@@ -206,7 +206,9 @@ def test_worker_quote_polling_is_limited_to_execution_windows():
     assert quote_poll_scope(datetime(2026, 7, 13, 14, 39, 40, tzinfo=shanghai)) == "entry"
     assert quote_poll_scope(datetime(2026, 7, 14, 9, 34, 40, tzinfo=shanghai)) == "exit"
     assert quote_poll_scope(datetime(2026, 7, 14, 9, 59, 40, tzinfo=shanghai)) == "exit"
-    assert quote_poll_scope(datetime(2026, 7, 14, 10, 0, 1, tzinfo=shanghai)) is None
+    assert quote_poll_scope(datetime(2026, 7, 14, 10, 30, 0, tzinfo=shanghai)) == "exit"
+    assert quote_poll_scope(datetime(2026, 7, 14, 10, 45, 0, tzinfo=shanghai)) == "exit"
+    assert quote_poll_scope(datetime(2026, 7, 14, 10, 45, 1, tzinfo=shanghai)) is None
     assert quote_poll_scope(datetime(2026, 7, 10, 20, 30, tzinfo=shanghai)) is None
     assert quote_poll_scope(datetime(2026, 7, 11, 14, 39, 40, tzinfo=shanghai)) is None
 
@@ -219,6 +221,365 @@ def test_worker_agent_snapshot_scope_runs_once_in_pre_analysis_window():
     assert agent_snapshot_scope(datetime(2026, 7, 13, 13, 29, 59, tzinfo=shanghai))
     assert not agent_snapshot_scope(datetime(2026, 7, 13, 13, 30, tzinfo=shanghai))
     assert not agent_snapshot_scope(datetime(2026, 7, 11, 13, 25, tzinfo=shanghai))
+
+
+def test_worker_probability_snapshot_scope_is_limited_to_final_pre_entry_minute():
+    from app.worker import (
+        probability_observation_scope,
+        probability_preheat_scope,
+        probability_snapshot_scope,
+    )
+
+    shanghai = ZoneInfo("Asia/Shanghai")
+    assert not probability_snapshot_scope(
+        datetime(2026, 7, 13, 14, 39, 59, tzinfo=shanghai)
+    )
+    assert probability_snapshot_scope(
+        datetime(2026, 7, 13, 14, 40, 0, tzinfo=shanghai)
+    )
+    assert probability_snapshot_scope(
+        datetime(2026, 7, 13, 14, 40, 29, tzinfo=shanghai)
+    )
+    assert not probability_snapshot_scope(
+        datetime(2026, 7, 13, 14, 38, 59, tzinfo=shanghai)
+    )
+    assert not probability_snapshot_scope(
+        datetime(2026, 7, 13, 14, 40, 30, tzinfo=shanghai)
+    )
+    assert probability_observation_scope(
+        datetime(2026, 7, 13, 14, 40, 0, tzinfo=shanghai)
+    )
+    assert probability_observation_scope(
+        datetime(2026, 7, 13, 14, 40, 59, tzinfo=shanghai)
+    )
+    assert not probability_observation_scope(
+        datetime(2026, 7, 13, 14, 41, 0, tzinfo=shanghai)
+    )
+    assert probability_preheat_scope(
+        datetime(2026, 7, 13, 13, 40, 0, tzinfo=shanghai)
+    )
+    assert probability_preheat_scope(
+        datetime(2026, 7, 13, 14, 9, 59, tzinfo=shanghai)
+    )
+    assert not probability_preheat_scope(
+        datetime(2026, 7, 13, 14, 10, 0, tzinfo=shanghai)
+    )
+    assert not probability_preheat_scope(
+        datetime(2026, 7, 11, 13, 40, 0, tzinfo=shanghai)
+    )
+
+
+def test_worker_probability_label_scope_is_1030_to_1045():
+    from app.worker import probability_label_scope
+
+    shanghai = ZoneInfo("Asia/Shanghai")
+    assert probability_label_scope(
+        datetime(2026, 7, 14, 10, 30, 0, tzinfo=shanghai)
+    )
+    assert probability_label_scope(
+        datetime(2026, 7, 14, 10, 45, 0, tzinfo=shanghai)
+    )
+    assert not probability_label_scope(
+        datetime(2026, 7, 14, 10, 45, 1, tzinfo=shanghai)
+    )
+
+
+def test_worker_probability_observation_delegates_without_orders(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from app.probability_portfolio.candidates import CandidateBuildResult
+    from app.probability_portfolio.runtime import seed_probability_portfolio_runtime
+    from app.worker import poll_probability_observation
+
+    engine = make_db(tmp_path)
+    settings = Settings(database_url=f"sqlite:///{tmp_path / 'poll.db'}")
+    with Session(engine) as db:
+        seed_database(db, settings)
+        seed_probability_portfolio_runtime(db, settings)
+
+    captured = []
+    monkeypatch.setattr(
+        "app.worker.build_scored_candidates",
+        lambda *args, **kwargs: CandidateBuildResult([], [], ("模型未就绪",), None),
+    )
+
+    def fake_record(db, config, **kwargs):
+        captured.append((config.id, kwargs))
+        return type("Run", (), {"summary": {"accepted": 0}})()
+
+    monkeypatch.setattr("app.worker.record_probability_observation", fake_record)
+    current = datetime(2026, 7, 13, 14, 40, 5, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    result = poll_probability_observation(
+        session_factory=lambda: Session(engine),
+        current=current,
+    )
+
+    assert result == {"accepted": 0}
+    assert captured[0][1]["current"] == current
+
+
+def test_probability_fallback_observation_runs_with_fresh_in_window_time(
+    monkeypatch,
+):
+    from app.worker import poll_due_probability_observation
+
+    called = []
+    monkeypatch.setattr(
+        "app.worker.poll_probability_observation",
+        lambda **kwargs: called.append(kwargs) or {"accepted": 0},
+    )
+    current = datetime(2026, 7, 23, 14, 40, 50, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    observed_date, result = poll_due_probability_observation(
+        last_observation_date=None,
+        current=current,
+    )
+
+    assert observed_date == current.date()
+    assert result == {"accepted": 0}
+    assert called == [{"current": current}]
+
+
+def test_probability_fallback_observation_skips_after_1441(monkeypatch):
+    from app.worker import poll_due_probability_observation
+
+    monkeypatch.setattr(
+        "app.worker.poll_probability_observation",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("14:41后不得使用快照开始前的旧时间补记观察")
+        ),
+    )
+    current = datetime(2026, 7, 23, 14, 41, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    observed_date, result = poll_due_probability_observation(
+        last_observation_date=None,
+        current=current,
+    )
+
+    assert observed_date is None
+    assert result is None
+
+
+def test_probability_snapshot_completion_records_observation_after_1440(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from app.probability_portfolio.candidates import CandidateBuildResult
+    from app.probability_portfolio.runtime import seed_probability_portfolio_runtime
+    from app.worker import poll_probability_market_snapshot
+
+    engine = make_db(tmp_path)
+    settings = Settings(database_url=f"sqlite:///{tmp_path / 'poll.db'}")
+    with Session(engine) as db:
+        seed_database(db, settings)
+        seed_probability_portfolio_runtime(db, settings)
+
+    captured = []
+    candidate_times = []
+    monkeypatch.setattr(
+        "app.worker.sync_probability_market_data",
+        lambda *args, **kwargs: {"quote_updated": 5, "errors": 0},
+    )
+    monkeypatch.setattr(
+        "app.worker.build_scored_candidates",
+        lambda *args, **kwargs: (
+            candidate_times.append(kwargs["current"])
+            or CandidateBuildResult([], [], ("概率模型尚未就绪",), None)
+        ),
+    )
+
+    def fake_record(db, config, **kwargs):
+        captured.append(kwargs)
+        return type("Run", (), {"id": 19, "summary": {"accepted": 0}})()
+
+    monkeypatch.setattr("app.worker.record_probability_observation", fake_record)
+    started = datetime(2026, 7, 23, 14, 40, 7, tzinfo=ZoneInfo("Asia/Shanghai"))
+    completed = datetime(2026, 7, 23, 14, 40, 20, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    result = poll_probability_market_snapshot(
+        router=object(),
+        session_factory=lambda: Session(engine),
+        current=started,
+        completed_at=completed,
+    )
+
+    assert result["observation_run_id"] == 19
+    assert captured[0]["current"].hour == 14
+    assert captured[0]["current"].minute == 40
+    assert captured[0]["current"] == completed
+    assert candidate_times == [completed]
+
+
+def test_probability_snapshot_completion_after_1441_does_not_record_observation(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from app.probability_portfolio.runtime import seed_probability_portfolio_runtime
+    from app.worker import poll_probability_market_snapshot
+
+    engine = make_db(tmp_path)
+    settings = Settings(database_url=f"sqlite:///{tmp_path / 'poll.db'}")
+    with Session(engine) as db:
+        seed_database(db, settings)
+        seed_probability_portfolio_runtime(db, settings)
+
+    monkeypatch.setattr(
+        "app.worker.sync_probability_market_data",
+        lambda *args, **kwargs: {"quote_updated": 5, "errors": 0},
+    )
+    monkeypatch.setattr(
+        "app.worker.record_probability_observation",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("14:41后完成的快照不得创建训练观察")
+        ),
+    )
+
+    result = poll_probability_market_snapshot(
+        router=object(),
+        session_factory=lambda: Session(engine),
+        current=datetime(2026, 7, 23, 14, 40, 20, tzinfo=ZoneInfo("Asia/Shanghai")),
+        completed_at=datetime(2026, 7, 23, 14, 41, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert result == {"quote_updated": 5, "errors": 0}
+
+
+def test_probability_preheat_never_records_observation(tmp_path: Path, monkeypatch):
+    from app.probability_portfolio.runtime import seed_probability_portfolio_runtime
+    from app.worker import poll_probability_market_snapshot
+
+    engine = make_db(tmp_path)
+    settings = Settings(database_url=f"sqlite:///{tmp_path / 'poll.db'}")
+    with Session(engine) as db:
+        seed_database(db, settings)
+        seed_probability_portfolio_runtime(db, settings)
+
+    monkeypatch.setattr(
+        "app.worker.sync_probability_market_data",
+        lambda *args, **kwargs: {"quote_updated": 5, "errors": 0},
+    )
+    monkeypatch.setattr(
+        "app.worker.record_probability_observation",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("预热不得创建训练观察")
+        ),
+    )
+
+    result = poll_probability_market_snapshot(
+        router=object(),
+        session_factory=lambda: Session(engine),
+        current=datetime(2026, 7, 23, 13, 40, tzinfo=ZoneInfo("Asia/Shanghai")),
+        completed_at=datetime(2026, 7, 23, 14, 41, tzinfo=ZoneInfo("Asia/Shanghai")),
+        record_observation=False,
+    )
+
+    assert result == {"quote_updated": 5, "errors": 0}
+
+
+def test_worker_probability_labels_refresh_only_pending_observations(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from app.probability_portfolio.runtime import seed_probability_portfolio_runtime
+    from app.worker import poll_probability_training_labels
+
+    engine = make_db(tmp_path)
+    settings = Settings(database_url=f"sqlite:///{tmp_path / 'poll.db'}")
+    with Session(engine) as db:
+        seed_database(db, settings)
+        seed_probability_portfolio_runtime(db, settings)
+
+    requested = []
+    trained = []
+
+    class Provider:
+        name = "mootdx"
+
+        def quotes(self, symbols):
+            requested.extend(symbols)
+            return []
+
+    monkeypatch.setattr(
+        "app.worker.pending_observation_symbols",
+        lambda *args, **kwargs: ["000001.SZ", "600519.SH"],
+    )
+    monkeypatch.setattr(
+        "app.worker.finalize_probability_training_samples",
+        lambda *args, **kwargs: {"created": 2, "skipped": 0, "errors": 0},
+    )
+    monkeypatch.setattr(
+        "app.worker._refresh_symbol_quotes",
+        lambda db, symbols, provider=None: (
+            requested.extend(symbols)
+            or type("Result", (), {"updated": len(symbols), "missing": []})()
+        ),
+    )
+    monkeypatch.setattr(
+        "app.worker.train_and_store_probability_model",
+        lambda db, **kwargs: (
+            trained.append(kwargs)
+            or type(
+                "Artifact",
+                (),
+                {
+                    "id": 17,
+                    "status": "rejected",
+                    "training_sample_count": 2,
+                    "calibration_sample_count": 0,
+                },
+            )()
+        ),
+    )
+
+    result = poll_probability_training_labels(
+        provider=Provider(),
+        session_factory=lambda: Session(engine),
+        current=datetime(2026, 7, 14, 10, 30, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert requested == ["000001.SZ", "600519.SH"]
+    assert result["created"] == 2
+    assert result["quote_updated"] == 2
+    assert result["model_artifact_id"] == 17
+    assert trained[0]["through"].isoformat() == "2026-07-14"
+    with Session(engine) as db:
+        schedules = list(db.scalars(select(StrategySchedule)))
+        assert schedules and all(not item.enabled for item in schedules)
+
+
+def test_worker_probability_labels_reports_calendar_failure_for_retry(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from app.probability_portfolio.runtime import seed_probability_portfolio_runtime
+    from app.worker import poll_probability_training_labels
+
+    engine = make_db(tmp_path)
+    settings = Settings(database_url=f"sqlite:///{tmp_path / 'poll.db'}")
+    with Session(engine) as db:
+        seed_database(db, settings)
+        seed_probability_portfolio_runtime(db, settings)
+
+    monkeypatch.setattr(
+        "app.worker.pending_observation_symbols",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("交易日历暂不可用")
+        ),
+    )
+
+    result = poll_probability_training_labels(
+        session_factory=lambda: Session(engine),
+        current=datetime(2026, 7, 24, 10, 30, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert result == {
+        "created": 0,
+        "skipped": 0,
+        "errors": 1,
+        "quote_updated": 0,
+    }
 
 
 def test_worker_throttles_failed_agent_snapshot_retries():

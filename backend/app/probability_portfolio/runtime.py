@@ -11,8 +11,10 @@ from ..models import (
     StrategyConfig,
     StrategyDefinition,
     StrategySchedule,
+    now,
 )
 from .config import PROBABILITY_PORTFOLIO_DEFAULTS
+from .readiness import automation_readiness
 
 
 STRATEGY_KEY = "overnight_probability_portfolio"
@@ -184,7 +186,8 @@ def seed_probability_portfolio_runtime(
             db.add(schedule)
         else:
             schedule.run_time = run_time
-            if trigger_type == "portfolio_entry":
+            check = automation_readiness(db, config, settings, current=now())
+            if trigger_type == "portfolio_entry" and not check["automation_ready"]:
                 schedule.enabled = False
                 schedule.last_scheduled_for = None
                 schedule.next_run_at = None

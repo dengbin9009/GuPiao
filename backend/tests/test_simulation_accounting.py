@@ -139,3 +139,32 @@ def test_daily_pnl_falls_back_to_initial_cash_without_today_snapshot(tmp_path):
 
         assert daily_pnl_pct(db, account, current=current) == pytest.approx(-0.02)
 
+
+def test_daily_pnl_uses_latest_prior_snapshot_when_today_has_none(tmp_path):
+    engine = setup_account(tmp_path)
+    current = datetime(2026, 7, 23, 14, 40, tzinfo=SHANGHAI)
+    with Session(engine) as db:
+        account = db.scalar(select(SimulationAccount).order_by(SimulationAccount.id))
+        account.initial_cash = 100_000
+        account.total_asset = 108_000
+        db.add(
+            AccountSnapshot(
+                mode="SIMULATION",
+                account_id=account.id,
+                cash_balance=110_000,
+                available_cash=110_000,
+                frozen_cash=0,
+                market_value=0,
+                total_asset=110_000,
+                realized_pnl=10_000,
+                unrealized_pnl=0,
+                exposure=0,
+                source="previous-close",
+                captured_at=current - timedelta(days=1),
+            )
+        )
+        db.commit()
+
+        assert daily_pnl_pct(db, account, current=current) == pytest.approx(
+            -2_000 / 110_000
+        )

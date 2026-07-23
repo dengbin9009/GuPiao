@@ -17,6 +17,7 @@ from app.models import (
     StrategySchedule,
 )
 from app.probability_portfolio.runtime import seed_probability_portfolio_runtime
+from app.runtime_bootstrap import seed_strategy_runtimes
 from app.services import seed_database
 
 
@@ -66,6 +67,7 @@ def test_probability_portfolio_models_and_runtime_are_simulation_only(tmp_path):
         assert ProbabilityModelArtifact.__tablename__ in Base.metadata.tables
         assert ProbabilityTrainingSample.__tablename__ in Base.metadata.tables
         assert ProbabilityPortfolioRun.__tablename__ in Base.metadata.tables
+        assert "config_fingerprint" in ProbabilityPortfolioRun.__table__.columns
         assert ProbabilityCandidateDecision.__tablename__ in Base.metadata.tables
         assert StrategyPositionLot.__tablename__ in Base.metadata.tables
 
@@ -134,3 +136,28 @@ def test_probability_runtime_uses_an_exclusive_account(tmp_path):
         replacement = db.get(SimulationAccount, restarted.simulation_account_id)
         assert replacement.initial_cash == 2_000_000
 
+
+def test_strategy_runtime_bootstrap_seeds_probability_portfolio(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'bootstrap.db'}")
+    Base.metadata.create_all(engine)
+    settings = Settings(database_url=str(engine.url))
+
+    with Session(engine) as db:
+        seed_database(db, settings)
+        seeded = seed_strategy_runtimes(db, settings)
+
+        probability = db.scalar(
+            select(StrategyDefinition).where(
+                StrategyDefinition.key == "overnight_probability_portfolio"
+            )
+        )
+        trading_agents = db.scalar(
+            select(StrategyDefinition).where(
+                StrategyDefinition.key == "trading_agents_auto"
+            )
+        )
+
+        assert probability is not None
+        assert trading_agents is not None
+        assert seeded["probability_portfolio"].strategy_definition_id == probability.id
+        assert seeded["trading_agents"].strategy_definition_id == trading_agents.id

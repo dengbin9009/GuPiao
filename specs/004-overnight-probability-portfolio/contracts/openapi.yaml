@@ -1,0 +1,112 @@
+openapi: 3.1.0
+info:
+  title: GuPiao 一夜持股概率组合 API
+  version: 1.0.0
+  description: >-
+    一夜持股概率组合的管理员接口。策略仅允许模拟盘，所有接口都要求管理员会话，
+    接口不接收真实券商凭据，也不能开启真实交易。
+paths:
+  /api/probability-portfolio/readiness:
+    get:
+      summary: 查询账户、模型、演练和自动调度就绪状态
+      responses:
+        '200':
+          description: 当前就绪状态
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Readiness'
+  /api/probability-portfolio/config:
+    put:
+      summary: 更新概率组合模拟参数
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConfigUpdate'
+      responses:
+        '200': {description: 配置已保存，入场计划自动关闭并等待重新演练}
+        '422': {description: 模式、参数或安全门无效}
+  /api/probability-portfolio/dry-run:
+    post:
+      summary: 创建一次完整无下单演练
+      description: >-
+        保存候选、拒绝原因、概率和目标仓位，但不创建订单。只有在 14:40 决策窗口、
+        使用当前最新合格模型且数据完整的演练，才可以作为自动计划解锁依据。
+      responses:
+        '202': {description: 演练审计已保存，订单数为 0}
+  /api/probability-portfolio/runs:
+    get:
+      summary: 查询概率组合运行列表
+      parameters:
+        - name: limit
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 100, default: 30}
+      responses:
+        '200': {description: 运行列表}
+  /api/probability-portfolio/runs/{id}:
+    get:
+      summary: 查询候选决策、仓位和模拟订单详情
+      parameters:
+        - {name: id, in: path, required: true, schema: {type: integer}}
+      responses:
+        '200': {description: 运行详情}
+        '404': {description: 运行不存在}
+  /api/strategy-schedules/{id}:
+    put:
+      summary: 启停固定的概率组合计划
+      description: >-
+        概率组合入场固定 14:40，退出固定 10:30。启用入场前必须先启用退出计划，
+        且模型、当前配置的人工演练和模拟环境都已就绪；关闭退出会同步关闭入场。
+      parameters:
+        - {name: id, in: path, required: true, schema: {type: integer}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                enabled: {type: boolean}
+      responses:
+        '200': {description: 计划状态已更新}
+        '409': {description: 自动交易安全门未通过}
+        '422': {description: 触发类型或时间不可修改}
+components:
+  schemas:
+    ConfigUpdate:
+      type: object
+      required: [mode, parameters]
+      properties:
+        mode:
+          type: string
+          const: SIMULATION
+        parameters:
+          type: object
+          additionalProperties: true
+          properties:
+            max_positions: {type: integer, minimum: 1, maximum: 10}
+            min_probability: {type: number, minimum: 0.55, maximum: 1}
+            min_position_pct: {type: number, minimum: 0.02, maximum: 0.36}
+            max_position_pct: {type: number, minimum: 0.02, maximum: 0.36}
+            min_total_exposure_pct: {type: number, minimum: 0.30, maximum: 0.60}
+            max_total_exposure_pct: {type: number, minimum: 0.30, maximum: 0.60}
+            daily_loss_limit_pct: {type: number, exclusiveMinimum: 0}
+            dry_run: {type: boolean}
+    Readiness:
+      type: object
+      properties:
+        ready: {type: boolean}
+        reasons: {type: array, items: {type: string}}
+        simulation_only: {type: boolean}
+        account_id: {type: [integer, 'null']}
+        initial_cash: {type: [number, 'null']}
+        model_ready: {type: boolean}
+        model_version: {type: [string, 'null']}
+        brier_score: {type: [number, 'null']}
+        training_sample_count: {type: integer}
+        calibration_sample_count: {type: integer}
+        dry_run_validated: {type: boolean}
+        entry_schedule_enabled: {type: boolean}
+        exit_schedule_enabled: {type: boolean}

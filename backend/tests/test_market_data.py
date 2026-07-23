@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -141,6 +143,66 @@ def test_akshare_quote_refresh_updates_timestamp(tmp_path):
         assert source.last_quote_at.minute == 40
 
 
+def test_akshare_uses_index_history_for_csi300_benchmark():
+    from app.market_data import AKShareProvider
+
+    calls = []
+
+    class Client:
+        @staticmethod
+        def index_zh_a_hist(**kwargs):
+            calls.append(("index", kwargs))
+            return [{"日期": "2026-07-22", "收盘": 4100}]
+
+        @staticmethod
+        def stock_zh_a_hist(**kwargs):
+            calls.append(("stock", kwargs))
+            return []
+
+    provider = AKShareProvider()
+    provider.client = Client()
+
+    rows = provider.bars(
+        symbol="000300.SH",
+        timeframe="1d",
+        start="2026-07-01",
+        end="2026-07-22",
+    )
+
+    assert rows[0]["收盘"] == 4100
+    assert [kind for kind, _ in calls] == ["index"]
+
+
+def test_tushare_uses_index_daily_for_csi300_benchmark():
+    from app.market_data import TushareProvider
+
+    calls = []
+
+    class Client:
+        @staticmethod
+        def index_daily(**kwargs):
+            calls.append(("index", kwargs))
+            return [{"trade_date": "20260722", "close": 4100}]
+
+        @staticmethod
+        def daily(**kwargs):
+            calls.append(("stock", kwargs))
+            return []
+
+    provider = TushareProvider(token="")
+    provider.client = Client()
+
+    rows = provider.bars(
+        symbol="000300.SH",
+        timeframe="1d",
+        start="2026-07-01",
+        end="2026-07-22",
+    )
+
+    assert rows[0]["close"] == 4100
+    assert [kind for kind, _ in calls] == ["index"]
+
+
 def test_stock_master_sync_generates_pinyin_metadata(tmp_path):
     from sqlalchemy import create_engine, select
     from sqlalchemy.orm import Session
@@ -206,6 +268,73 @@ def test_tushare_provider_exposes_trading_days_when_client_available():
     assert days == ["2026-06-23", "2026-06-24"]
 
 
+def test_akshare_minute_bars_are_normalized_for_strategy_consumers():
+    from app.market_data import AKShareProvider
+
+    class Client:
+        @staticmethod
+        def stock_zh_a_hist_min_em(**_):
+            return [
+                {
+                    "时间": "2026-07-23 14:39:00",
+                    "开盘": 10.0,
+                    "最高": 10.1,
+                    "最低": 9.9,
+                    "收盘": 10.05,
+                    "成交量": 12_345,
+                    "成交额": 1_240_000,
+                }
+            ]
+
+    provider = AKShareProvider()
+    provider.client = Client()
+
+    rows = provider.bars(symbol="000001.SZ", timeframe="1m")
+
+    assert rows == [
+        {
+            "symbol": "000001.SZ",
+            "timestamp": "2026-07-23T14:39:00",
+            "open": 10.0,
+            "high": 10.1,
+            "low": 9.9,
+            "close": 10.05,
+            "volume": 1_234_500,
+            "amount": 1_240_000.0,
+            "provider": "akshare",
+        }
+    ]
+
+
+def test_tushare_minute_bars_are_normalized_for_strategy_consumers():
+    from app.market_data import TushareProvider
+
+    class Client:
+        @staticmethod
+        def stk_mins(**_):
+            return [
+                {
+                    "trade_time": "2026-07-23 14:39:00",
+                    "open": 10.0,
+                    "high": 10.1,
+                    "low": 9.9,
+                    "close": 10.05,
+                    "vol": 1_234_500,
+                    "amount": 1_240,
+                }
+            ]
+
+    provider = TushareProvider(token="")
+    provider.client = Client()
+
+    rows = provider.bars(symbol="000001.SZ", timeframe="1m")
+
+    assert rows[0]["timestamp"] == "2026-07-23T14:39:00"
+    assert rows[0]["volume"] == 1_234_500
+    assert rows[0]["amount"] == 1_240_000
+    assert rows[0]["provider"] == "tushare"
+
+
 def test_mootdx_provider_reads_minute_bars_when_client_available():
     from app.market_data import MootdxProvider
 
@@ -243,6 +372,10 @@ def test_mootdx_provider_reads_realtime_quotes_with_server_time():
                     "code": code,
                     "price": 10.45,
                     "last_close": 10.49,
+                    "open": 10.40,
+                    "high": 10.60,
+                    "low": 10.30,
+                    "volume": 123_456,
                     "amount": 999_718_272,
                     "servertime": "15:29:53.736",
                 }
@@ -261,8 +394,72 @@ def test_mootdx_provider_reads_realtime_quotes_with_server_time():
     assert rows[0]["最新价"] == 10.45
     assert rows[0]["涨跌幅"] == pytest.approx(-0.3813, abs=0.0001)
     assert rows[0]["成交额"] == 999_718_272
+    assert rows[0]["open_price"] == 10.40
+    assert rows[0]["high_price"] == 10.60
+    assert rows[0]["low_price"] == 10.30
+    assert rows[0]["volume"] == 12_345_600
+    assert rows[0]["previous_close"] == 10.49
     assert rows[0]["quote_at"].strftime("%H:%M:%S") == "15:29:53"
     assert rows[0]["quote_at"].tzinfo.key == "Asia/Shanghai"
+
+
+def test_mootdx_provider_normalizes_finance_float_shares_and_ipo_date():
+    from app.market_data import MootdxProvider
+
+    provider = MootdxProvider()
+    provider.Quotes = object()
+    provider.client = type(
+        "Client",
+        (),
+        {
+            "finance": lambda self, symbol: [
+                {
+                    "code": symbol,
+                    "liutongguben": 19_405_601_250,
+                    "ipo_date": 19910403,
+                }
+            ]
+        },
+    )()
+
+    result = provider.finance("000001.SZ")
+
+    assert result == {
+        "float_shares": 19_405_601_250,
+        "listing_date": "1991-04-03",
+    }
+
+
+def test_mootdx_provider_uses_one_client_per_worker_thread():
+    from app.market_data import MootdxProvider
+
+    created = []
+    barrier = Barrier(2)
+
+    class Quotes:
+        @staticmethod
+        def factory(*, market):
+            client = object()
+            created.append((market, client))
+            return client
+
+    provider = MootdxProvider()
+    provider.Quotes = Quotes
+    provider.client = None
+    provider.import_error = None
+
+    def resolve_twice():
+        first = provider._quotes()
+        barrier.wait(timeout=2)
+        second = provider._quotes()
+        return first, second
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        pairs = list(executor.map(lambda _: resolve_twice(), range(2)))
+
+    assert len(created) == 2
+    assert all(first is second for first, second in pairs)
+    assert pairs[0][0] is not pairs[1][0]
 
 
 def test_akshare_event_provider_normalizes_real_announcements():

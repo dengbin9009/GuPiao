@@ -49,7 +49,12 @@ class PlannedBuy:
     total_cost: float
 
 
-def _target_total_weight(candidates: list[AllocationCandidate]) -> float:
+def _target_total_weight(
+    candidates: list[AllocationCandidate],
+    *,
+    min_total_exposure_pct: float,
+    max_total_exposure_pct: float,
+) -> float:
     if not candidates:
         return 0.0
     score_sum = sum(
@@ -70,8 +75,11 @@ def _target_total_weight(candidates: list[AllocationCandidate]) -> float:
             )
             for item in candidates
         ) / score_sum
-    scaled = 0.30 + max(0.0, min(average_probability - 0.55, 0.05)) / 0.05 * 0.30
-    return min(max(scaled, 0.30), 0.60)
+    confidence = max(0.0, min(average_probability - 0.55, 0.05)) / 0.05
+    scaled = min_total_exposure_pct + confidence * (
+        max_total_exposure_pct - min_total_exposure_pct
+    )
+    return min(max(scaled, min_total_exposure_pct), max_total_exposure_pct)
 
 
 def _capped_weights(
@@ -111,6 +119,7 @@ def allocate_portfolio(
     min_expected_net_return: float = 0.0,
     min_position_pct: float = 0.02,
     max_position_pct: float = 0.36,
+    min_total_exposure_pct: float = 0.30,
     max_total_exposure_pct: float = 0.60,
     volatility_floor: float = 0.01,
 ) -> AllocationResult:
@@ -146,7 +155,11 @@ def allocate_portfolio(
 
     selected = [item for item, _ in eligible]
     scores = [score for _, score in eligible]
-    target_total = min(_target_total_weight(selected), max_total_exposure_pct)
+    target_total = _target_total_weight(
+        selected,
+        min_total_exposure_pct=min_total_exposure_pct,
+        max_total_exposure_pct=max_total_exposure_pct,
+    )
     active = list(range(len(selected)))
     final_weights: dict[int, float] = {}
     while active:

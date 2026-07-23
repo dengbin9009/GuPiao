@@ -10,10 +10,10 @@ from sqlalchemy.orm import Session
 
 from ..config import get_settings
 from ..database import Base, SessionLocal, apply_runtime_migrations, engine
+from ..runtime_bootstrap import seed_strategy_runtimes
 from ..services import seed_database
 from .adapter import TradingAgentsAnalyzer
 from .batches import claim_pending_batch, process_batch
-from .runtime import seed_trading_agents_runtime
 
 
 LOGGER = logging.getLogger("gupiao.tradingagents-worker")
@@ -48,7 +48,7 @@ def main() -> None:
     apply_runtime_migrations()
     with SessionLocal() as db:
         seed_database(db, get_settings())
-        seed_trading_agents_runtime(db, get_settings())
+        seed_strategy_runtimes(db, get_settings())
     LOGGER.info("TradingAgents 独立 Worker 已启动")
     while True:
         try:

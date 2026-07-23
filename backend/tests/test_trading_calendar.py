@@ -63,6 +63,18 @@ def test_trading_calendar_falls_back_to_weekdays_when_provider_unavailable():
     assert not service.is_trading_day(date(2026, 6, 21))
 
 
+def test_direct_calendar_query_reports_all_providers_unhealthy():
+    import pytest
+
+    from app.market_data import MarketDataError
+    from app.trading_calendar import TradingCalendarService
+
+    service = TradingCalendarService([CalendarProvider(healthy=False)])
+
+    with pytest.raises(MarketDataError, match="不可用"):
+        service.trading_days(start=date(2026, 6, 22), end=date(2026, 6, 23))
+
+
 def test_trading_calendar_falls_back_to_next_provider_when_first_provider_errors():
     from app.trading_calendar import TradingCalendarService
 

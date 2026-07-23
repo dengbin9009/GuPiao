@@ -33,6 +33,8 @@ from .models import (
     NotificationDelivery,
     Order,
     Position,
+    ProbabilityCandidateDecision,
+    ProbabilityPortfolioRun,
     RiskEvent,
     RiskSettings,
     SimulationAccount,
@@ -66,11 +68,7 @@ from .services import (
     validate_strategy_parameters,
     watchlist_payload,
 )
-from .trading_agents.runtime import (
-    find_matching_dry_run,
-    seed_trading_agents_runtime,
-    simulation_account_is_available,
-)
+from .trading_agents.runtime import find_matching_dry_run, simulation_account_is_available
 from .trading_agents.batches import create_batch
 from .trading_agents.config import (
     ANALYSIS_PROFILES,
@@ -80,6 +78,17 @@ from .trading_agents.config import (
 )
 from .trading_agents.rebalance import rebalance_batch
 from .strategy_execution import execute_strategy_trigger
+from .probability_portfolio.candidates import build_scored_candidates
+from .probability_portfolio.config import PROBABILITY_PORTFOLIO_DEFAULTS
+from .probability_portfolio.execution import execute_portfolio_entry
+from .probability_portfolio.readiness import (
+    automation_readiness as probability_automation_readiness,
+)
+from .probability_portfolio.runtime import (
+    STRATEGY_KEY as PROBABILITY_PORTFOLIO_KEY,
+    seed_probability_portfolio_runtime,
+)
+from .runtime_bootstrap import seed_strategy_runtimes
 settings = get_settings()
 
 
@@ -97,7 +106,7 @@ async def lifespan(_: FastAPI):
     apply_runtime_migrations()
     with SessionLocal() as db:
         seed_database(db, settings)
-        seed_trading_agents_runtime(db, settings)
+        seed_strategy_runtimes(db, settings)
     yield
 
 
@@ -222,9 +231,235 @@ class SimulationAccountCreate(BaseModel):
     initial_cash: float = Field(default=100_000, gt=0)
 
 
+class ProbabilityPortfolioConfigUpdate(BaseModel):
+    mode: str = "SIMULATION"
+    parameters: dict[str, Any] = Field(default_factory=dict)
+
+
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "service": "gupiao"}
+
+
+def _probability_portfolio_config(db: Session) -> StrategyConfig:
+    config = db.scalar(
+        select(StrategyConfig)
+        .join(StrategyDefinition)
+        .where(StrategyDefinition.key == PROBABILITY_PORTFOLIO_KEY)
+        .limit(1)
+    )
+    if config is None:
+        config = seed_probability_portfolio_runtime(db, settings)
+    return config
+
+
+def _probability_readiness(db: Session) -> dict[str, Any]:
+    config = _probability_portfolio_config(db)
+    check = probability_automation_readiness(
+        db,
+        config,
+        settings,
+        current=now(),
+    )
+    account = check["account"]
+    artifact = check["artifact"]
+    dry_run = check["dry_run"]
+    schedules = {
+        item.trigger_type: item
+        for item in db.scalars(
+            select(StrategySchedule).where(
+                StrategySchedule.strategy_config_id == config.id
+            )
+        )
+    }
+    return {
+        "ready": check["automation_ready"],
+        "reasons": check["automation_reasons"],
+        "automation_ready": check["automation_ready"],
+        "automation_reasons": check["automation_reasons"],
+        "simulation_only": check["simulation_only"],
+        "account_id": account.id if account else None,
+        "initial_cash": account.initial_cash if account else None,
+        "model_ready": artifact is not None,
+        "model_version": artifact.model_version if artifact else None,
+        "brier_score": artifact.brier_score if artifact else None,
+        "training_sample_count": artifact.training_sample_count if artifact else 0,
+        "calibration_sample_count": (
+            artifact.calibration_sample_count if artifact else 0
+        ),
+        "dry_run_validated": dry_run is not None,
+        "last_dry_run_id": dry_run.id if dry_run else None,
+        "entry_schedule_enabled": bool(
+            schedules.get("portfolio_entry") and schedules["portfolio_entry"].enabled
+        ),
+        "exit_schedule_enabled": bool(
+            schedules.get("portfolio_exit") and schedules["portfolio_exit"].enabled
+        ),
+        "parameters": {**PROBABILITY_PORTFOLIO_DEFAULTS, **(config.parameters or {})},
+    }
+
+
+@app.get("/api/probability-portfolio/readiness")
+def get_probability_portfolio_readiness(
+    _: Administrator = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    return _probability_readiness(db)
+
+
+@app.put("/api/probability-portfolio/config")
+def update_probability_portfolio_config(
+    payload: ProbabilityPortfolioConfigUpdate,
+    _: Administrator = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    if payload.mode != "SIMULATION":
+        raise HTTPException(status_code=422, detail="概率组合策略仅支持模拟盘")
+    config = _probability_portfolio_config(db)
+    allowed = set(PROBABILITY_PORTFOLIO_DEFAULTS) | {"prefilter_size", "quote_max_age_seconds"}
+    unknown = sorted(set(payload.parameters) - allowed)
+    if unknown:
+        raise HTTPException(status_code=422, detail=f"未知概率组合参数: {', '.join(unknown)}")
+    parameters = {**PROBABILITY_PORTFOLIO_DEFAULTS, **(config.parameters or {}), **payload.parameters}
+    if not 1 <= int(parameters["max_positions"]) <= 10:
+        raise HTTPException(status_code=422, detail="最大持股数量必须在1至10之间")
+    if not 0.55 <= float(parameters["min_probability"]) <= 1:
+        raise HTTPException(status_code=422, detail="最低校准盈利概率不得低于55%")
+    if float(parameters["min_expected_net_return"]) < 0:
+        raise HTTPException(status_code=422, detail="最低预期净收益不得低于0")
+    if not 0.02 <= float(parameters["min_position_pct"]) <= float(
+        parameters["max_position_pct"]
+    ) <= 0.36:
+        raise HTTPException(status_code=422, detail="单股仓位必须在2%至36%之间")
+    if not 0.30 <= float(parameters["min_total_exposure_pct"]) <= float(
+        parameters["max_total_exposure_pct"]
+    ) <= 0.60:
+        raise HTTPException(status_code=422, detail="组合总仓位必须在30%至60%之间")
+    if not 1 <= int(parameters.get("prefilter_size", 100)) <= 100:
+        raise HTTPException(status_code=422, detail="预筛数量必须在1至100之间")
+    if str(parameters["entry_time"]) != "14:40" or str(
+        parameters["latest_entry_time"]
+    ) != "14:41":
+        raise HTTPException(status_code=422, detail="入场时间固定为14:40至14:41")
+    if str(parameters["exit_time"]) != "10:30" or str(
+        parameters["latest_exit_time"]
+    ) != "10:45":
+        raise HTTPException(status_code=422, detail="退出时间固定为10:30至10:45")
+    if int(parameters["retry_seconds"]) != 15:
+        raise HTTPException(status_code=422, detail="退出重试间隔固定为15秒")
+    if int(parameters["min_training_samples"]) < 500:
+        raise HTTPException(status_code=422, detail="训练样本不得少于500条")
+    if int(parameters["min_calibration_samples"]) < 100:
+        raise HTTPException(status_code=422, detail="校准样本不得少于100条")
+    if not 0 < float(parameters["max_brier_score"]) <= 0.25:
+        raise HTTPException(status_code=422, detail="最大Brier分数不得超过0.25")
+    if str(parameters["feature_version"]) != str(
+        PROBABILITY_PORTFOLIO_DEFAULTS["feature_version"]
+    ):
+        raise HTTPException(status_code=422, detail="特征版本不可由配置接口修改")
+    if not 0 < float(parameters["daily_loss_limit_pct"]) <= 0.10:
+        raise HTTPException(status_code=422, detail="日亏损熔断必须在0至10%之间")
+    if not 1 <= int(parameters.get("quote_max_age_seconds", 60)) <= 60:
+        raise HTTPException(status_code=422, detail="行情新鲜度必须在1至60秒之间")
+    if not 1 <= int(parameters["event_max_age_seconds"]) <= 1800:
+        raise HTTPException(status_code=422, detail="公告新鲜度必须在1至1800秒之间")
+    config.mode = "SIMULATION"
+    config.parameters = parameters
+    for schedule in db.scalars(
+        select(StrategySchedule).where(
+            StrategySchedule.strategy_config_id == config.id,
+            StrategySchedule.trigger_type == "portfolio_entry",
+        )
+    ):
+        schedule.enabled = False
+        schedule.last_scheduled_for = None
+        schedule.next_run_at = None
+    db.commit()
+    return serialize(config)
+
+
+@app.post("/api/probability-portfolio/dry-run", status_code=202)
+def run_probability_portfolio_dry_run(
+    _: Administrator = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    config = _probability_portfolio_config(db)
+    current = now()
+    candidates = build_scored_candidates(db, config, current=current)
+    run = execute_portfolio_entry(
+        db,
+        config,
+        current=current,
+        scored_candidates=candidates.scored,
+        rejected_candidates=candidates.rejected,
+        candidate_reasons=candidates.reasons,
+        trigger_type=f"portfolio_dry_{current:%H%M%S%f}",
+        dry_run=True,
+    )
+    return serialize(run)
+
+
+@app.get("/api/probability-portfolio/runs")
+def list_probability_portfolio_runs(
+    limit: int = Query(default=30, ge=1, le=100),
+    _: Administrator = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    runs = list(
+        db.scalars(
+            select(ProbabilityPortfolioRun)
+            .order_by(ProbabilityPortfolioRun.id.desc())
+            .limit(limit)
+        )
+    )
+    return [serialize(item) for item in runs]
+
+
+@app.get("/api/probability-portfolio/runs/{run_id}")
+def get_probability_portfolio_run(
+    run_id: int,
+    _: Administrator = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    portfolio_run = db.get(ProbabilityPortfolioRun, run_id)
+    if portfolio_run is None:
+        raise HTTPException(status_code=404, detail="概率组合运行不存在")
+    strategy_run = db.get(StrategyRun, portfolio_run.strategy_run_id)
+    decisions = []
+    for item in db.scalars(
+        select(ProbabilityCandidateDecision)
+        .where(ProbabilityCandidateDecision.portfolio_run_id == portfolio_run.id)
+        .order_by(
+            ProbabilityCandidateDecision.rank.is_(None),
+            ProbabilityCandidateDecision.rank,
+            ProbabilityCandidateDecision.id,
+        )
+    ):
+        stock = db.get(Stock, item.stock_id)
+        decisions.append(
+            serialize(
+                item,
+                symbol=stock.symbol if stock else str(item.stock_id),
+                name=stock.name if stock else "未知股票",
+            )
+        )
+    order_ids = list(portfolio_run.order_ids or [])
+    orders = [
+        serialize(
+            order,
+            symbol=(db.get(Stock, order.stock_id).symbol),
+            name=(db.get(Stock, order.stock_id).name),
+        )
+        for order in db.scalars(
+            select(Order).where(Order.id.in_(order_ids)).order_by(Order.id)
+        )
+    ] if order_ids else []
+    return serialize(
+        portfolio_run,
+        strategy_run=serialize(strategy_run) if strategy_run else None,
+        decisions=decisions,
+        orders=orders,
+    )
 
 
 @app.post("/api/auth/login", status_code=204)
@@ -626,6 +861,11 @@ def create_strategy_config(payload: StrategyConfigCreate, _: Administrator = Dep
             status_code=422,
             detail="TradingAgents 仅支持模拟盘的系统独立配置，请使用专用配置接口",
         )
+    if definition.key == PROBABILITY_PORTFOLIO_KEY:
+        raise HTTPException(
+            status_code=422,
+            detail="概率组合仅支持模拟盘的系统独立配置，请使用专用配置接口",
+        )
     if payload.mode not in {"SIMULATION", "LIVE"}:
         raise HTTPException(status_code=422, detail="交易模式无效")
     if payload.mode == "LIVE":
@@ -685,6 +925,11 @@ def run_strategy(config_id: int, _: Administrator = Depends(require_admin), db: 
                 detail=f"TradingAgents 尚未就绪: {', '.join(check['reasons'])}",
             )
         run = execute_strategy_trigger(db, config, "agent_analysis")
+    elif definition and definition.key == PROBABILITY_PORTFOLIO_KEY:
+        raise HTTPException(
+            status_code=422,
+            detail="概率组合请使用专用无下单演练或自动计划",
+        )
     else:
         run = execute_simulation_strategy(db, config)
     if run.status == "failed" and config.mode == "LIVE":
@@ -755,6 +1000,18 @@ def update_schedule(schedule_id: int, payload: ScheduleUpdate, _: Administrator 
                 status_code=422,
                 detail="TradingAgents 调度触发类型和时间固定，只允许启停",
             )
+    if definition and definition.key == PROBABILITY_PORTFOLIO_KEY:
+        fixed_times = {"portfolio_entry": "14:40", "portfolio_exit": "10:30"}
+        requested_trigger = payload.trigger_type or item.trigger_type
+        requested_time = payload.run_time or item.run_time
+        if (
+            requested_trigger != item.trigger_type
+            or requested_time != fixed_times.get(item.trigger_type)
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="概率组合调度触发类型和时间固定，只允许启停",
+            )
     if config and config.mode == "LIVE" and payload.enabled:
         require_live_runtime_open()
     if config and payload.enabled:
@@ -765,8 +1022,55 @@ def update_schedule(schedule_id: int, payload: ScheduleUpdate, _: Administrator 
                     status_code=409,
                     detail=f"自动计划不能启用: {', '.join(check['automation_reasons'])}",
                 )
+        if (
+            definition
+            and definition.key == PROBABILITY_PORTFOLIO_KEY
+            and item.trigger_type == "portfolio_entry"
+        ):
+            exit_schedule = db.scalar(
+                select(StrategySchedule).where(
+                    StrategySchedule.strategy_config_id == config.id,
+                    StrategySchedule.trigger_type == "portfolio_exit",
+                    StrategySchedule.enabled.is_(True),
+                )
+            )
+            if exit_schedule is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="自动计划不能启用: 请先启用10:30退出计划",
+                )
+            check = probability_automation_readiness(
+                db,
+                config,
+                settings,
+                current=now(),
+            )
+            if not check["automation_ready"]:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "自动计划不能启用: "
+                        f"{', '.join(check['automation_reasons'])}"
+                    ),
+                )
     for key, value in payload.model_dump(exclude_none=True).items():
         setattr(item, key, value)
+    if (
+        definition
+        and definition.key == PROBABILITY_PORTFOLIO_KEY
+        and item.trigger_type == "portfolio_exit"
+        and payload.enabled is False
+    ):
+        entry_schedule = db.scalar(
+            select(StrategySchedule).where(
+                StrategySchedule.strategy_config_id == config.id,
+                StrategySchedule.trigger_type == "portfolio_entry",
+            )
+        )
+        if entry_schedule is not None:
+            entry_schedule.enabled = False
+            entry_schedule.last_scheduled_for = None
+            entry_schedule.next_run_at = None
     db.commit()
     db.refresh(item)
     return serialize(item)

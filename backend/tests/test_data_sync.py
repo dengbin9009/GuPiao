@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import create_engine, select
@@ -72,3 +74,85 @@ def test_event_sync_deduplicates_source_event_id(db: Session):
 
     assert result.created == 1
     assert len(list(db.scalars(select(StockEvent)))) == 1
+
+
+def test_chinese_quote_units_are_normalized_and_price_limits_are_derived(db: Session):
+    from app.data_sync import refresh_quotes
+
+    stock = db.scalar(select(Stock).where(Stock.symbol == "000001.SZ"))
+
+    class Provider:
+        name = "akshare"
+
+        def quotes(self, _symbols):
+            return [
+                {
+                    "代码": "000001",
+                    "最新价": 11.08,
+                    "昨收": 10.98,
+                    "今开": 10.92,
+                    "最高": 11.12,
+                    "最低": 10.90,
+                    "成交量": 1_095_742,
+                    "成交额": 1_210_838_016,
+                    "换手率": 0.56,
+                }
+            ]
+
+    refresh_quotes(db, Provider(), [stock.symbol])
+
+    assert stock.volume == 109_574_200
+    assert stock.turnover_rate == pytest.approx(0.0056)
+    assert stock.vwap == pytest.approx(1_210_838_016 / 109_574_200)
+    assert stock.limit_up_price == 12.08
+    assert stock.limit_down_price == 9.88
+    assert stock.factor_updated_at is None
+
+
+def test_quote_refresh_preserves_same_day_intraday_factors_and_clears_old_day(
+    db: Session,
+):
+    from app.data_sync import refresh_quotes
+
+    stock = db.scalar(select(Stock).where(Stock.symbol == "000001.SZ"))
+    factor_at = datetime(2026, 7, 23, 14, 40, tzinfo=ZoneInfo("Asia/Shanghai"))
+    stock.vwap = 11.01
+    stock.tail_30m_return = 0.008
+    stock.factor_updated_at = factor_at
+    stock.float_shares = 10_000_000_000
+    db.commit()
+
+    class Provider:
+        name = "mootdx"
+
+        def __init__(self, quote_at):
+            self.quote_at = quote_at
+
+        def quotes(self, _symbols):
+            return [
+                {
+                    "代码": "000001",
+                    "最新价": 11.08,
+                    "涨跌幅": 1.0,
+                    "成交额": 1_210_838_016,
+                    "volume": 109_574_200,
+                    "quote_at": self.quote_at,
+                }
+            ]
+
+    refresh_quotes(
+        db,
+        Provider(factor_at + timedelta(seconds=5)),
+        [stock.symbol],
+    )
+    assert stock.tail_30m_return == 0.008
+    assert stock.factor_updated_at == factor_at.replace(tzinfo=None)
+    assert stock.turnover_rate == pytest.approx(109_574_200 / 10_000_000_000)
+
+    refresh_quotes(
+        db,
+        Provider(factor_at + timedelta(days=1)),
+        [stock.symbol],
+    )
+    assert stock.tail_30m_return is None
+    assert stock.factor_updated_at is None

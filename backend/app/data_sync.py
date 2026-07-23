@@ -131,25 +131,56 @@ def refresh_quotes(db: Session, provider: Any, symbols: list[str]) -> SyncResult
         turnover_rate = _value(row, "turnover_rate", "换手率")
         if turnover_rate is not None:
             value = float(turnover_rate)
-            stock.turnover_rate = value / 100 if abs(value) > 1 else value
+            stock.turnover_rate = (
+                value / 100
+                if row.get("换手率") not in {None, ""} or abs(value) > 1
+                else value
+            )
         else:
             stock.turnover_rate = None
         stock.open_price = _optional_float(row, "open_price", "open", "今开")
         stock.high_price = _optional_float(row, "high_price", "high", "最高")
         stock.low_price = _optional_float(row, "low_price", "low", "最低")
-        stock.volume = _optional_float(row, "volume", "vol", "成交量")
+        stock.volume = _optional_float(row, "volume", "vol")
+        if stock.volume is None:
+            chinese_volume = _optional_float(row, "成交量")
+            stock.volume = chinese_volume * 100 if chinese_volume is not None else None
+        if turnover_rate is None and stock.volume and stock.float_shares and stock.float_shares > 0:
+            stock.turnover_rate = float(stock.volume) / float(stock.float_shares)
         stock.vwap = _optional_float(row, "vwap", "日内VWAP")
         if stock.vwap is None and stock.volume and stock.turnover_amount:
             stock.vwap = stock.turnover_amount / stock.volume
-        stock.tail_30m_return = _optional_float(
+        incoming_tail_return = _optional_float(
             row, "tail_30m_return", "尾盘30分钟收益"
         )
         stock.limit_up_price = _optional_float(row, "limit_up_price", "涨停价")
         stock.limit_down_price = _optional_float(row, "limit_down_price", "跌停价")
+        previous_close = _optional_float(row, "previous_close", "last_close", "昨收")
+        if previous_close and previous_close > 0:
+            limit_pct = 0.20 if stock.code.startswith(("300", "688")) else 0.10
+            stock.limit_up_price = stock.limit_up_price or round(
+                previous_close * (1 + limit_pct) + 1e-10,
+                2,
+            )
+            stock.limit_down_price = stock.limit_down_price or round(
+                previous_close * (1 - limit_pct) + 1e-10,
+                2,
+            )
         stock.quote_source = str(provider.name)
         quote_at = _value(row, "quote_at", "trade_time")
         stock.quote_updated_at = quote_at if isinstance(quote_at, datetime) else timestamp
-        stock.factor_updated_at = stock.quote_updated_at
+        factor_at = stock.factor_updated_at
+        if factor_at is not None and factor_at.tzinfo is None:
+            factor_at = factor_at.replace(tzinfo=stock.quote_updated_at.tzinfo)
+        same_factor_day = bool(
+            factor_at and factor_at.date() == stock.quote_updated_at.date()
+        )
+        if incoming_tail_return is not None:
+            stock.tail_30m_return = incoming_tail_return
+            stock.factor_updated_at = stock.quote_updated_at
+        elif not same_factor_day:
+            stock.tail_30m_return = None
+            stock.factor_updated_at = None
         quote_timestamps.append(stock.quote_updated_at)
         updated += 1
     latest_quote_at = max(quote_timestamps) if quote_timestamps else None

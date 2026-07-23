@@ -110,6 +110,33 @@ def apply_runtime_migrations(
                         "ADD COLUMN simulation_account_id INTEGER"
                     )
                 )
+        if "stocks" in tables:
+            stock_columns = {
+                row[1]
+                for row in conn.exec_driver_sql("PRAGMA table_info(stocks)")
+            }
+            probability_factor_columns = {
+                "listing_date": "VARCHAR(10)",
+                "float_shares": "FLOAT",
+                "turnover_rate": "FLOAT",
+                "open_price": "FLOAT",
+                "high_price": "FLOAT",
+                "low_price": "FLOAT",
+                "volume": "FLOAT",
+                "vwap": "FLOAT",
+                "tail_30m_return": "FLOAT",
+                "limit_up_price": "FLOAT",
+                "limit_down_price": "FLOAT",
+                "quote_source": "VARCHAR(32)",
+                "factor_updated_at": "DATETIME",
+            }
+            for column, column_type in probability_factor_columns.items():
+                if column not in stock_columns:
+                    conn.execute(
+                        text(
+                            f"ALTER TABLE stocks ADD COLUMN {column} {column_type}"
+                        )
+                    )
         if "trading_agent_batches" in tables:
             batch_columns = {
                 row[1]
@@ -135,6 +162,20 @@ def apply_runtime_migrations(
                 conn.execute(
                     text(
                         "ALTER TABLE trading_agent_batches "
+                        "ADD COLUMN config_fingerprint VARCHAR(64)"
+                    )
+                )
+        if "probability_portfolio_runs" in tables:
+            probability_run_columns = {
+                row[1]
+                for row in conn.exec_driver_sql(
+                    "PRAGMA table_info(probability_portfolio_runs)"
+                )
+            }
+            if "config_fingerprint" not in probability_run_columns:
+                conn.execute(
+                    text(
+                        "ALTER TABLE probability_portfolio_runs "
                         "ADD COLUMN config_fingerprint VARCHAR(64)"
                     )
                 )

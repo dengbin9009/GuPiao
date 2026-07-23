@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -111,6 +112,37 @@ def test_training_is_time_split_reproducible_and_calibrated_monotonically():
     assert calibrated == sorted(calibrated)
 
 
+def test_training_never_splits_one_decision_timestamp_across_time_slices():
+    rows = []
+    for day in range(23):
+        base = sample(day)
+        rows.extend(
+            replace(
+                base,
+                features={
+                    **base.features,
+                    "momentum_5d": base.features["momentum_5d"] + offset / 10_000,
+                },
+                profitable=bool((day + offset) % 2),
+            )
+            for offset in range(5)
+        )
+
+    artifact = train_probability_model(
+        rows,
+        feature_names=("momentum_5d", "vwap_distance", "volatility_20d"),
+        feature_version="1",
+        min_training_samples=70,
+        min_calibration_samples=20,
+        max_brier_score=1.0,
+    )
+
+    assert artifact.status == "ready"
+    assert artifact.training_sample_count % 5 == 0
+    assert artifact.calibration_sample_count % 5 == 0
+    assert artifact.training_end < artifact.calibration_start
+
+
 def test_prediction_returns_raw_and_calibrated_probabilities():
     artifact = train_probability_model(
         [sample(index) for index in range(120)],
@@ -165,4 +197,3 @@ def test_model_readiness_fails_closed_for_samples_brier_and_feature_version():
     assert check["ready"] is False
     assert "feature_version" in check["reasons"]
     assert "brier_score" in check["reasons"]
-

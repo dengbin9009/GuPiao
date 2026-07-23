@@ -4,7 +4,7 @@ import hashlib
 import json
 import math
 import statistics
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Iterable
 
@@ -237,6 +237,10 @@ def train_probability_model(
 ) -> TrainedProbabilityModel:
     rows = sorted(samples, key=lambda item: item.entry_at)
     split = max(1, int(len(rows) * 0.8)) if rows else 0
+    if 0 < split < len(rows):
+        split_at = rows[split].entry_at
+        while split > 0 and rows[split - 1].entry_at == split_at:
+            split -= 1
     training = rows[:split]
     calibration = rows[split:]
     reasons: list[str] = []

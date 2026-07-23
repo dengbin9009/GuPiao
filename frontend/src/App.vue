@@ -5,7 +5,10 @@ import {
   Gauge, Heart, LayoutDashboard, LogOut, Play, Plus, RefreshCw, Search,
   Settings2, ShieldAlert, Trash2, TrendingUp, WalletCards, X
 } from 'lucide-vue-next'
-import { createTradingAgentsBatch } from './trading-agents-actions.js'
+import {
+  createTradingAgentsBatch,
+  runProbabilityPortfolioDryRun,
+} from './trading-agents-actions.js'
 
 const api = async (path, options = {}) => {
   const response = await fetch(`/api${path}`, {
@@ -64,6 +67,9 @@ const agentsProfiles = ref({ analysis_profiles: {}, position_mappings: {} })
 const agentsBatches = ref([])
 const selectedAgentsBatch = ref(null)
 const expandedAgentReportId = ref(null)
+const probabilityReadiness = ref(null)
+const probabilityRuns = ref([])
+const selectedProbabilityRun = ref(null)
 const agentsForm = reactive({
   analysis_profile: 'a_share_balanced', position_mapping: 'fixed_rating',
   quick_model: 'gpt-5.4-mini', deep_model: 'gpt-5.2', prefilter_size: 100,
@@ -74,6 +80,15 @@ const agentsForm = reactive({
   event_max_age_seconds: 1800, enrichment_enabled: true, enrichment_timeout_seconds: 45,
   analysis_deadline: '14:42', rebalance_time: '14:45', latest_rebalance_time: '14:50',
   dry_run: true, simulation_account_id: null
+})
+const probabilityForm = reactive({
+  max_positions: 10,
+  min_probability: 0.55,
+  min_position_pct: 0.02,
+  max_position_pct: 0.36,
+  max_total_exposure_pct: 0.60,
+  daily_loss_limit_pct: 0.015,
+  dry_run: true,
 })
 const backtestForm = reactive({ start_date: '2025-01-01', end_date: '2025-12-31', initial_cash: 10000 })
 const notificationForm = reactive({ type: 'email', name: '', recipient: '', secret_ref: '', event_types: ['order_failure', 'circuit_breaker'] })
@@ -98,13 +113,14 @@ const loadAll = async () => {
   loading.value = true
   error.value = ''
   try {
-    const [d, w, s, c, sch, r, b, a, o, p, rs, re, g, ds, rt, ch, nd, la, cal, sa, ar, ap, ab] = await Promise.all([
+    const [d, w, s, c, sch, r, b, a, o, p, rs, re, g, ds, rt, ch, nd, la, cal, sa, ar, ap, ab, pr, pru] = await Promise.all([
       api('/dashboard'), api('/watchlist'), api('/strategies'), api('/strategy-configs'),
       api('/strategy-schedules'), api('/strategy-runs'), api('/backtests'), api('/simulation/account'), api('/orders'),
       api('/positions'), api('/risk/settings'), api('/risk/events'), api('/gateways'),
       api('/market-data/sources'), api('/market-data/realtime-status'), api('/notifications/channels'), api('/notifications/deliveries'),
       api('/live/accounts'), api('/market-data/calendar'), api('/simulation/accounts'),
-      api('/trading-agents/readiness'), api('/trading-agents/profiles'), api('/trading-agents/batches')
+      api('/trading-agents/readiness'), api('/trading-agents/profiles'), api('/trading-agents/batches'),
+      api('/probability-portfolio/readiness'), api('/probability-portfolio/runs')
     ])
     dashboard.value = d; watchlist.value = w; strategies.value = s; strategyConfigs.value = c; strategySchedules.value = sch
     runs.value = r; backtests.value = b; account.value = a; orders.value = o; positions.value = p
@@ -114,6 +130,8 @@ const loadAll = async () => {
     liveAccounts.value = la
     marketCalendar.value = cal
     simulationAccounts.value = sa; agentsReadiness.value = ar; agentsProfiles.value = ap; agentsBatches.value = ab
+    probabilityReadiness.value = pr; probabilityRuns.value = pru
+    Object.assign(probabilityForm, pr.parameters || {})
     const agentsConfig = c.find(item => item.strategy_key === 'trading_agents_auto')
     if (agentsConfig) Object.assign(agentsForm, agentsConfig.parameters || {}, { simulation_account_id: agentsConfig.simulation_account_id })
     authenticated.value = true
@@ -246,6 +264,46 @@ const dryRunAgentsBatch = async (id) => {
     await api(`/trading-agents/batches/${id}/dry-run`, { method: 'POST' })
     await loadAll(); selectedAgentsBatch.value = await api(`/trading-agents/batches/${id}`)
     notify('无下单演练已完成')
+  } catch (err) { error.value = err.message }
+}
+
+const saveProbabilityConfig = async () => {
+  try {
+    const current = probabilityReadiness.value?.parameters || {}
+    await api('/probability-portfolio/config', {
+      method: 'PUT',
+      body: JSON.stringify({
+        mode: 'SIMULATION',
+        parameters: {
+          ...current,
+          max_positions: Number(probabilityForm.max_positions),
+          min_probability: Number(probabilityForm.min_probability),
+          min_position_pct: Number(probabilityForm.min_position_pct),
+          max_position_pct: Number(probabilityForm.max_position_pct),
+          max_total_exposure_pct: Number(probabilityForm.max_total_exposure_pct),
+          daily_loss_limit_pct: Number(probabilityForm.daily_loss_limit_pct),
+          dry_run: Boolean(probabilityForm.dry_run),
+        }
+      })
+    })
+    await loadAll()
+    notify('概率组合配置已保存')
+  } catch (err) { error.value = err.message }
+}
+
+const selectProbabilityRun = async (id) => {
+  try { selectedProbabilityRun.value = await api(`/probability-portfolio/runs/${id}`) }
+  catch (err) { error.value = err.message }
+}
+
+const runProbabilityDryRun = async () => {
+  try {
+    await runProbabilityPortfolioDryRun({
+      createDryRun: () => api('/probability-portfolio/dry-run', { method: 'POST', body: '{}' }),
+      reload: loadAll,
+      selectRun: selectProbabilityRun,
+      notify,
+    })
   } catch (err) { error.value = err.message }
 }
 
@@ -456,9 +514,50 @@ onMounted(async () => {
         <section class="strategy-row" v-for="strategy in strategies" :key="strategy.id">
           <div class="strategy-main"><span class="strategy-icon"><TrendingUp :size="21" /></span><div><h2>{{ strategy.name }}</h2><p>{{ strategy.key }} · {{ strategy.version }} · {{ strategy.required_timeframes.join(' / ') }}</p></div></div>
           <div v-if="strategy.key === 'trading_agents_auto'" class="strategy-stats"><span>分析时间<b>13:30</b></span><span>调仓时间<b>14:45</b></span><span>最大持仓<b>5</b></span></div>
-          <div v-else class="strategy-stats"><span>入场窗口<b>14:45-14:55</b></span><span>次日退出<b>09:35-09:45</b></span><span>最大候选<b>3</b></span></div>
+          <div v-else-if="strategy.key === 'overnight_probability_portfolio'" class="strategy-stats"><span>模拟买入<b>14:40</b></span><span>次日退出<b>10:30</b></span><span>最大持仓<b>10</b></span></div>
+          <div v-else class="strategy-stats"><span>入场窗口<b>14:40</b></span><span>次日退出<b>09:35</b></span><span>最大候选<b>3</b></span></div>
           <button v-if="strategy.key === 'trading_agents_auto'" class="primary" :disabled="!agentsReadiness?.ready" @click="runAgentsBatch"><Play :size="17" />创建分析批次</button>
+          <button v-else-if="strategy.key === 'overnight_probability_portfolio'" class="primary" @click="runProbabilityDryRun"><Play :size="17" />无下单演练</button>
           <button v-else class="primary" @click="runStrategy"><Play :size="17" />运行模拟</button>
+        </section>
+        <div class="split-grid agents-grid">
+          <section class="panel">
+            <div class="section-head"><div><h2>一夜持股概率组合</h2><span>独立 200 万模拟账户</span></div><Gauge :size="19" /></div>
+            <div class="config-grid">
+              <label>最大持仓<input v-model.number="probabilityForm.max_positions" type="number" min="1" max="10" /></label>
+              <label>最低校准概率<input v-model.number="probabilityForm.min_probability" type="number" min="0.5" max="0.9" step="0.01" /></label>
+              <label>单股最低仓位<input v-model.number="probabilityForm.min_position_pct" type="number" min="0.02" max="0.36" step="0.01" /></label>
+              <label>单股最高仓位<input v-model.number="probabilityForm.max_position_pct" type="number" min="0.02" max="0.36" step="0.01" /></label>
+              <label>组合最高仓位<input v-model.number="probabilityForm.max_total_exposure_pct" type="number" min="0.02" max="0.60" step="0.01" /></label>
+              <label>日亏损熔断<input v-model.number="probabilityForm.daily_loss_limit_pct" type="number" min="0.001" max="0.10" step="0.001" /></label>
+            </div>
+            <div class="control-row"><label class="check-control"><input v-model="probabilityForm.dry_run" type="checkbox" />无下单演练模式</label><div class="top-actions"><button class="secondary" @click="runProbabilityDryRun"><Play :size="16" />执行演练</button><button class="primary" @click="saveProbabilityConfig"><Settings2 :size="16" />保存配置</button></div></div>
+          </section>
+          <section class="panel">
+            <div class="section-head"><div><h2>概率策略就绪状态</h2><span>真实因子缺失时停止开仓</span></div><Activity :size="19" /></div>
+            <div class="status-list">
+              <div><span>模拟账户</span><b :class="probabilityReadiness?.simulation_only ? 'ok' : 'negative'">{{ formatMoney(probabilityReadiness?.initial_cash) }}</b></div>
+              <div><span>概率模型</span><b :class="probabilityReadiness?.model_ready ? 'ok' : 'negative'">{{ probabilityReadiness?.model_ready ? probabilityReadiness.model_version : '尚未就绪' }}</b></div>
+              <div><span>训练 / 校准样本</span><b>{{ probabilityReadiness?.training_sample_count || 0 }} / {{ probabilityReadiness?.calibration_sample_count || 0 }}</b></div>
+              <div><span>Brier 分数</span><b>{{ probabilityReadiness?.brier_score == null ? '—' : probabilityReadiness.brier_score.toFixed(4) }}</b></div>
+              <div><span>完整演练</span><b :class="probabilityReadiness?.dry_run_validated ? 'ok' : 'muted'">{{ probabilityReadiness?.dry_run_validated ? `运行 #${probabilityReadiness.last_dry_run_id}` : '尚未通过' }}</b></div>
+              <div><span>自动调度</span><b :class="probabilityReadiness?.automation_ready ? 'ok' : 'muted'">{{ probabilityReadiness?.automation_ready ? '可以启用' : '保持关闭' }}</b></div>
+            </div>
+          </section>
+        </div>
+        <section class="panel">
+          <div class="section-head"><div><h2>概率组合运行</h2><span>候选概率、仓位与订单审计</span></div><RefreshCw :size="19" /></div>
+          <div class="table-wrap"><table><thead><tr><th>ID</th><th>交易日</th><th>类型</th><th>状态</th><th>演练</th><th>选择</th><th>订单</th><th>错误</th></tr></thead><tbody>
+            <tr v-for="item in probabilityRuns" :key="item.id" @click="selectProbabilityRun(item.id)"><td>#{{ item.id }}</td><td>{{ item.trading_date }}</td><td>{{ item.trigger_type }}</td><td><span :class="['tag', item.status === 'blocked' ? 'danger-tag' : '']">{{ item.status }}</span></td><td>{{ item.dry_run ? '是' : '否' }}</td><td>{{ item.selected_count }}</td><td>{{ item.order_ids?.length || 0 }}</td><td>{{ item.error_message || '—' }}</td></tr>
+            <tr v-if="!probabilityRuns.length"><td colspan="8" class="empty">暂无概率组合运行</td></tr>
+          </tbody></table></div>
+        </section>
+        <section v-if="selectedProbabilityRun" class="panel">
+          <div class="section-head"><div><h2>概率运行 #{{ selectedProbabilityRun.id }}</h2><span>{{ selectedProbabilityRun.snapshot_sha256 || '无候选快照哈希' }}</span></div><span class="tag">{{ selectedProbabilityRun.strategy_run?.summary?.data_ready ? '数据完整' : '数据未就绪' }}</span></div>
+          <div class="table-wrap"><table><thead><tr><th>排名</th><th>股票</th><th>状态</th><th>校准概率</th><th>预期净收益</th><th>20日波动</th><th>目标仓位</th><th>目标金额</th><th>数量</th><th>原因</th></tr></thead><tbody>
+            <tr v-for="item in selectedProbabilityRun.decisions || []" :key="item.id"><td>{{ item.rank || '—' }}</td><td><strong>{{ item.name }}</strong><small>{{ item.symbol }}</small></td><td><span :class="['tag', item.status === 'rejected' || item.status === 'skipped' ? 'danger-tag' : '']">{{ item.status }}</span></td><td>{{ item.calibrated_probability == null ? '—' : formatPct(item.calibrated_probability) }}</td><td>{{ item.expected_net_return == null ? '—' : formatPct(item.expected_net_return) }}</td><td>{{ item.volatility_20d == null ? '—' : formatPct(item.volatility_20d) }}</td><td>{{ item.target_weight == null ? '—' : formatPct(item.target_weight) }}</td><td>{{ item.target_notional == null ? '—' : formatMoney(item.target_notional) }}</td><td>{{ item.planned_quantity || '—' }}</td><td class="reason-cell">{{ item.rejection_reasons?.join('；') || '—' }}</td></tr>
+            <tr v-if="!(selectedProbabilityRun.decisions || []).length"><td colspan="10" class="empty">本次运行没有候选决策</td></tr>
+          </tbody></table></div>
         </section>
         <div class="split-grid agents-grid">
           <section class="panel">

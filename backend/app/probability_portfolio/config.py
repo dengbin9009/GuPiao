@@ -20,6 +20,8 @@ PROBABILITY_PORTFOLIO_DEFAULTS: dict[str, Any] = {
     "max_total_exposure_pct": 0.60,
     "volatility_floor": 0.01,
     "daily_loss_limit_pct": 0.015,
+    "event_max_age_seconds": 1800,
+    "latest_entry_time": "14:41",
     "min_training_samples": 500,
     "min_calibration_samples": 100,
     "max_brier_score": 0.25,

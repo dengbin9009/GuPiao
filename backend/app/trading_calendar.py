@@ -15,11 +15,16 @@ class TradingCalendarService:
         end_str = end.isoformat()
         failures: list[str] = []
         attempted = False
+        configured = False
         for provider in self.providers:
             if "trading_calendar" not in getattr(provider, "capabilities", set()):
                 continue
+            configured = True
             healthy, error = provider.health()
             if not healthy:
+                failures.append(
+                    f"{getattr(provider, 'name', 'unknown')}: {error or 'unhealthy'}"
+                )
                 continue
             attempted = True
             try:
@@ -29,6 +34,8 @@ class TradingCalendarService:
                 continue
         if attempted and failures:
             raise MarketDataError(f"交易日历获取失败: {'; '.join(failures)}")
+        if configured and failures:
+            raise MarketDataError(f"交易日历不可用: {'; '.join(failures)}")
         return []
 
     def is_trading_day(self, day: date, *, allow_weekday_fallback: bool = True) -> bool:

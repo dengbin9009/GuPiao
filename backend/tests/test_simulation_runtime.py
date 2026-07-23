@@ -74,6 +74,8 @@ def test_prepare_simulation_runtime_is_idempotent(
     assert all(stock.change_pct is None for stock in stocks)
     assert all(stock.turnover_amount is None for stock in stocks)
     assert all(stock.quote_updated_at is None for stock in stocks)
+    assert all(stock.tail_30m_return is None for stock in stocks)
+    assert all(stock.factor_updated_at is None for stock in stocks)
     assert data_sources
     assert "mootdx" in {source.provider for source in data_sources}
     assert all(not source.healthy for source in data_sources)

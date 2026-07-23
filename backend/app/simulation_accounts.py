@@ -93,6 +93,17 @@ def daily_pnl_pct(
         .order_by(AccountSnapshot.captured_at, AccountSnapshot.id)
         .limit(1)
     )
+    if opening_snapshot is None:
+        opening_snapshot = db.scalar(
+            select(AccountSnapshot)
+            .where(
+                AccountSnapshot.mode == "SIMULATION",
+                AccountSnapshot.account_id == account.id,
+                AccountSnapshot.captured_at < day_start,
+            )
+            .order_by(AccountSnapshot.captured_at.desc(), AccountSnapshot.id.desc())
+            .limit(1)
+        )
     opening_asset = (
         float(opening_snapshot.total_asset)
         if opening_snapshot and opening_snapshot.total_asset > 0

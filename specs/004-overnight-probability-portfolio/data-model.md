@@ -51,6 +51,7 @@
 | dry_run | bool | 是否无下单演练 |
 | model_artifact_id | bigint? | 使用的模型产物 |
 | snapshot_sha256 | char(64)? | 候选快照哈希 |
+| config_fingerprint | char(64)? | 除演练开关外的配置与账户指纹 |
 | selected_count | int | 最终选择数 |
 | order_ids | json | 创建的模拟订单 |
 | error_message | text? | 阻断原因 |
@@ -97,8 +98,7 @@
 
 ## 既有实体调整
 
-- `Stock` 增加真实上市日期、换手率、当日开高低、VWAP、涨跌停状态和因子更新时间字段。
+- `Stock` 增加真实上市日期、流通股本、换手率、当日开高低、VWAP、涨跌停状态和因子更新时间字段。流通股本用于按最新累计成交量重算换手率。
 - `MarketDailyBar` 继续保存日线，用于 MA5、MA20、收益率、波动率和平均成交额。
 - `SimulationAccount` 不新增策略专属字段；独立性由账户和策略配置绑定保证。
 - `AccountSnapshot` 继续保存统一估值结果，并作为日亏损基准。
-

@@ -73,6 +73,20 @@ def test_allocation_caps_a_high_confidence_single_stock_at_36_percent():
     assert result.total_weight == pytest.approx(0.36)
 
 
+def test_allocation_uses_configured_total_exposure_band():
+    result = allocate_portfolio(
+        [
+            candidate("000001", probability=0.55),
+            candidate("000002", probability=0.55),
+        ],
+        min_total_exposure_pct=0.40,
+        max_total_exposure_pct=0.50,
+    )
+
+    assert result.target_total_weight == pytest.approx(0.40)
+    assert result.total_weight == pytest.approx(0.40)
+
+
 def test_allocation_rejects_below_threshold_and_negative_expectation():
     result = allocate_portfolio(
         [
@@ -118,4 +132,3 @@ def test_quantity_uses_slippage_fees_cash_and_board_lots():
     assert planned.quantity == 23_900
     assert planned.total_cost <= 240_000
     assert planned.fill_price == pytest.approx(10.005)
-

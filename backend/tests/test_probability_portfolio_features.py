@@ -21,7 +21,9 @@ CURRENT = datetime(2026, 7, 23, 14, 40, tzinfo=SHANGHAI)
 def daily_bars(stock_id: int, *, count: int = 21, end_day: int = 22):
     rows = []
     for index in range(count):
-        day = datetime(2026, 7, end_day, tzinfo=SHANGHAI) - timedelta(days=count - index)
+        day = datetime(2026, 7, end_day, tzinfo=SHANGHAI) - timedelta(
+            days=count - 1 - index
+        )
         close = 10 + index * 0.05
         rows.append(
             MarketDailyBar(
@@ -124,6 +126,37 @@ def test_future_bar_and_missing_core_fields_fail_closed():
     assert "日线包含未完成或未来数据" in result.reasons
 
 
+def test_stale_daily_cache_fails_closed_until_provider_reconfirms_it():
+    stale = daily_bars(1, end_day=21)
+    benchmark = daily_bars(2, count=6)
+
+    result = build_feature_vector(
+        valid_stock(),
+        stale,
+        benchmark,
+        current=CURRENT,
+        source_healthy=True,
+        critical_event=False,
+        market_breadth=0.5,
+    )
+
+    assert result.accepted is False
+    assert "日线未覆盖最近已完成交易日" in result.reasons
+
+    stale[-1].captured_at = CURRENT - timedelta(minutes=5)
+    reconfirmed = build_feature_vector(
+        valid_stock(),
+        stale,
+        benchmark,
+        current=CURRENT,
+        source_healthy=True,
+        critical_event=False,
+        market_breadth=0.5,
+    )
+
+    assert "日线未覆盖最近已完成交易日" not in reconfirmed.reasons
+
+
 def test_listing_limit_event_benchmark_and_stale_checks_reject():
     stock = valid_stock()
     stock.listing_date = "2026-07-01"
@@ -150,6 +183,26 @@ def test_listing_limit_event_benchmark_and_stale_checks_reject():
     assert "行情来源不健康" in result.reasons
     assert "市场基准未通过MA5过滤" in result.reasons
     assert "命中重大事件风险" in result.reasons
+
+
+def test_quote_freshness_keeps_60_second_hard_cap():
+    stock = valid_stock()
+    stock.quote_updated_at = CURRENT - timedelta(seconds=61)
+    stock.factor_updated_at = CURRENT - timedelta(seconds=61)
+
+    result = build_feature_vector(
+        stock,
+        daily_bars(1),
+        daily_bars(2, count=6),
+        current=CURRENT,
+        source_healthy=True,
+        critical_event=False,
+        market_breadth=0.5,
+        max_quote_age_seconds=3600,
+    )
+
+    assert result.accepted is False
+    assert "行情已过期" in result.reasons
 
 
 def test_refresh_quotes_persists_probability_factor_fields(tmp_path):

@@ -9,12 +9,18 @@ from sqlalchemy import and_, or_, select, update
 
 from .config import get_settings
 from .database import Base, SessionLocal, apply_runtime_migrations, engine
-from .models import StrategyConfig, StrategyRun, StrategySchedule, now
+from .models import (
+    ProbabilityPortfolioRun,
+    StrategyConfig,
+    StrategyRun,
+    StrategySchedule,
+    now,
+)
 from .providers import trading_calendar_service
 from .scheduler import evaluate_schedule
 from .services import execute_simulation_exit, execute_simulation_strategy, seed_database
 from .strategy_execution import execute_strategy_trigger
-from .trading_agents.runtime import seed_trading_agents_runtime
+from .runtime_bootstrap import seed_strategy_runtimes
 
 LOGGER = logging.getLogger("gupiao.scheduler")
 RETRY_DELAY = timedelta(seconds=15)
@@ -44,6 +50,20 @@ def schedule_tolerance_seconds(schedule, config: StrategyConfig) -> int:
     if schedule.trigger_type == "agent_rebalance":
         run_time = wall_time.fromisoformat(schedule.run_time)
         latest_text = str((config.parameters or {}).get("latest_rebalance_time", "14:50"))
+        latest = wall_time.fromisoformat(latest_text)
+        run_seconds = run_time.hour * 3600 + run_time.minute * 60 + run_time.second
+        latest_seconds = latest.hour * 3600 + latest.minute * 60 + latest.second
+        return max(59, latest_seconds - run_seconds)
+    if schedule.trigger_type == "portfolio_exit":
+        run_time = wall_time.fromisoformat(schedule.run_time)
+        latest_text = str((config.parameters or {}).get("latest_exit_time", "10:45"))
+        latest = wall_time.fromisoformat(latest_text)
+        run_seconds = run_time.hour * 3600 + run_time.minute * 60 + run_time.second
+        latest_seconds = latest.hour * 3600 + latest.minute * 60 + latest.second
+        return max(59, latest_seconds - run_seconds)
+    if schedule.trigger_type == "portfolio_entry":
+        run_time = wall_time.fromisoformat(schedule.run_time)
+        latest_text = str((config.parameters or {}).get("latest_entry_time", "14:41"))
         latest = wall_time.fromisoformat(latest_text)
         run_seconds = run_time.hour * 3600 + run_time.minute * 60 + run_time.second
         latest_seconds = latest.hour * 3600 + latest.minute * 60 + latest.second
@@ -103,18 +123,32 @@ def existing_window_run(
     window_start = datetime.combine(current.date(), target, tzinfo=current.tzinfo)
     if schedule.last_run_id:
         linked = db.get(StrategyRun, schedule.last_run_id)
+        linked_matches_trigger = True
+        if linked and schedule.trigger_type in {"portfolio_entry", "portfolio_exit"}:
+            linked_matches_trigger = db.scalar(
+                select(ProbabilityPortfolioRun.id).where(
+                    ProbabilityPortfolioRun.strategy_run_id == linked.id,
+                    ProbabilityPortfolioRun.trigger_type == schedule.trigger_type,
+                )
+            ) is not None
         if linked:
             linked_started_at = linked.started_at
             if linked_started_at.tzinfo is None:
                 linked_started_at = linked_started_at.replace(tzinfo=current.tzinfo)
             if (
-                window_start <= linked_started_at <= current
+                linked_matches_trigger
+                and window_start <= linked_started_at <= current
                 and not schedule_run_needs_retry(linked)
             ):
                 return linked
+    query = select(StrategyRun)
+    if schedule.trigger_type in {"portfolio_entry", "portfolio_exit"}:
+        query = query.join(
+            ProbabilityPortfolioRun,
+            ProbabilityPortfolioRun.strategy_run_id == StrategyRun.id,
+        ).where(ProbabilityPortfolioRun.trigger_type == schedule.trigger_type)
     candidate = db.scalar(
-        select(StrategyRun)
-        .where(
+        query.where(
             StrategyRun.strategy_config_id == schedule.strategy_config_id,
             StrategyRun.started_at >= window_start,
             StrategyRun.started_at <= current,
@@ -242,7 +276,7 @@ def main() -> None:
     apply_runtime_migrations()
     with SessionLocal() as db:
         seed_database(db, get_settings())
-        seed_trading_agents_runtime(db, get_settings())
+        seed_strategy_runtimes(db, get_settings())
     LOGGER.info("自动调度已启动")
     while True:
         try:

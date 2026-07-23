@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { createTradingAgentsBatch } from '../src/trading-agents-actions.js'
+import {
+  createTradingAgentsBatch,
+  runProbabilityPortfolioDryRun,
+} from '../src/trading-agents-actions.js'
 
 test('only reports batch creation after configuration, batch creation, and reload succeed', async () => {
   const calls = []
@@ -36,4 +39,25 @@ test('does not report batch creation when the batch API rejects the request', as
   )
 
   assert.deepEqual(calls, ['save', 'create'])
+})
+
+test('probability dry run selects the created audit after reloading state', async () => {
+  const calls = []
+
+  await runProbabilityPortfolioDryRun({
+    createDryRun: async () => {
+      calls.push('create')
+      return { summary: { portfolio_run_id: 17 } }
+    },
+    reload: async () => calls.push('reload'),
+    selectRun: async (id) => calls.push(`select:${id}`),
+    notify: (message) => calls.push(message),
+  })
+
+  assert.deepEqual(calls, [
+    'create',
+    'reload',
+    'select:17',
+    '概率组合无下单演练已完成',
+  ])
 })

@@ -85,6 +85,34 @@ CREATE TABLE notification_channels (
 );
 
 
+CREATE TABLE probability_model_artifacts (
+	id INTEGER NOT NULL AUTO_INCREMENT,
+	model_version VARCHAR(64) NOT NULL,
+	feature_version VARCHAR(32) NOT NULL,
+	status VARCHAR(24) NOT NULL,
+	trained_through VARCHAR(10) NOT NULL,
+	training_sample_count INTEGER NOT NULL,
+	calibration_sample_count INTEGER NOT NULL,
+	calibration_start VARCHAR(10),
+	calibration_end VARCHAR(10),
+	brier_score FLOAT,
+	coefficients JSON NOT NULL,
+	calibration_curve JSON NOT NULL,
+	artifact_sha256 VARCHAR(64),
+	error_message TEXT,
+	created_at DATETIME NOT NULL,
+	PRIMARY KEY (id)
+);
+
+CREATE INDEX ix_probability_model_artifacts_trained_through ON probability_model_artifacts (trained_through);
+
+CREATE INDEX ix_probability_model_artifacts_artifact_sha256 ON probability_model_artifacts (artifact_sha256);
+
+CREATE UNIQUE INDEX ix_probability_model_artifacts_model_version ON probability_model_artifacts (model_version);
+
+CREATE INDEX ix_probability_model_artifacts_feature_version ON probability_model_artifacts (feature_version);
+
+
 CREATE TABLE risk_settings (
 	id INTEGER NOT NULL AUTO_INCREMENT,
 	mode VARCHAR(16) NOT NULL,
@@ -134,22 +162,35 @@ CREATE TABLE stocks (
 	pinyin VARCHAR(128) NOT NULL,
 	pinyin_initials VARCHAR(32) NOT NULL,
 	status VARCHAR(24) NOT NULL,
+	listing_date VARCHAR(10),
+	float_shares FLOAT,
 	last_price FLOAT,
 	change_pct FLOAT,
 	turnover_amount FLOAT,
+	turnover_rate FLOAT,
+	open_price FLOAT,
+	high_price FLOAT,
+	low_price FLOAT,
+	volume FLOAT,
+	vwap FLOAT,
+	tail_30m_return FLOAT,
+	limit_up_price FLOAT,
+	limit_down_price FLOAT,
+	quote_source VARCHAR(32),
 	quote_updated_at DATETIME,
+	factor_updated_at DATETIME,
 	created_at DATETIME NOT NULL,
 	updated_at DATETIME NOT NULL,
 	PRIMARY KEY (id)
 );
 
-CREATE INDEX ix_stocks_code ON stocks (code);
-
 CREATE UNIQUE INDEX ix_stocks_symbol ON stocks (symbol);
 
-CREATE INDEX ix_stocks_name ON stocks (name);
-
 CREATE INDEX ix_stocks_pinyin_initials ON stocks (pinyin_initials);
+
+CREATE INDEX ix_stocks_code ON stocks (code);
+
+CREATE INDEX ix_stocks_name ON stocks (name);
 
 
 CREATE TABLE strategy_definitions (
@@ -246,9 +287,9 @@ CREATE TABLE market_daily_bars (
 	FOREIGN KEY(stock_id) REFERENCES stocks (id)
 );
 
-CREATE INDEX ix_market_daily_bars_stock_id ON market_daily_bars (stock_id);
-
 CREATE INDEX ix_market_daily_bars_trade_date ON market_daily_bars (trade_date);
+
+CREATE INDEX ix_market_daily_bars_stock_id ON market_daily_bars (stock_id);
 
 
 CREATE TABLE notification_deliveries (
@@ -283,6 +324,29 @@ CREATE TABLE positions (
 	UNIQUE (account_id, mode, stock_id),
 	FOREIGN KEY(stock_id) REFERENCES stocks (id)
 );
+
+
+CREATE TABLE probability_training_samples (
+	id INTEGER NOT NULL AUTO_INCREMENT,
+	stock_id INTEGER NOT NULL,
+	entry_at DATETIME NOT NULL,
+	exit_at DATETIME NOT NULL,
+	feature_version VARCHAR(32) NOT NULL,
+	features JSON NOT NULL,
+	net_return FLOAT NOT NULL,
+	profitable BOOL NOT NULL,
+	source_sha256 VARCHAR(64) NOT NULL,
+	created_at DATETIME NOT NULL,
+	PRIMARY KEY (id),
+	UNIQUE (stock_id, entry_at, feature_version),
+	FOREIGN KEY(stock_id) REFERENCES stocks (id)
+);
+
+CREATE INDEX ix_probability_training_samples_entry_at ON probability_training_samples (entry_at);
+
+CREATE INDEX ix_probability_training_samples_stock_id ON probability_training_samples (stock_id);
+
+CREATE INDEX ix_probability_training_samples_feature_version ON probability_training_samples (feature_version);
 
 
 CREATE TABLE stock_events (
@@ -374,6 +438,42 @@ CREATE TABLE strategy_runs (
 );
 
 
+CREATE TABLE probability_portfolio_runs (
+	id INTEGER NOT NULL AUTO_INCREMENT,
+	strategy_run_id INTEGER,
+	strategy_config_id INTEGER NOT NULL,
+	simulation_account_id INTEGER NOT NULL,
+	trading_date VARCHAR(10) NOT NULL,
+	trigger_type VARCHAR(32) NOT NULL,
+	status VARCHAR(24) NOT NULL,
+	dry_run BOOL NOT NULL,
+	model_artifact_id INTEGER,
+	snapshot_sha256 VARCHAR(64),
+	config_fingerprint VARCHAR(64),
+	selected_count INTEGER NOT NULL,
+	order_ids JSON NOT NULL,
+	error_message TEXT,
+	created_at DATETIME NOT NULL,
+	completed_at DATETIME,
+	PRIMARY KEY (id),
+	UNIQUE (strategy_config_id, trading_date, trigger_type),
+	FOREIGN KEY(strategy_run_id) REFERENCES strategy_runs (id),
+	FOREIGN KEY(strategy_config_id) REFERENCES strategy_configs (id),
+	FOREIGN KEY(simulation_account_id) REFERENCES simulation_accounts (id),
+	FOREIGN KEY(model_artifact_id) REFERENCES probability_model_artifacts (id)
+);
+
+CREATE INDEX ix_probability_portfolio_runs_config_fingerprint ON probability_portfolio_runs (config_fingerprint);
+
+CREATE UNIQUE INDEX ix_probability_portfolio_runs_strategy_run_id ON probability_portfolio_runs (strategy_run_id);
+
+CREATE INDEX ix_probability_portfolio_runs_simulation_account_id ON probability_portfolio_runs (simulation_account_id);
+
+CREATE INDEX ix_probability_portfolio_runs_strategy_config_id ON probability_portfolio_runs (strategy_config_id);
+
+CREATE INDEX ix_probability_portfolio_runs_trading_date ON probability_portfolio_runs (trading_date);
+
+
 CREATE TABLE signals (
 	id INTEGER NOT NULL AUTO_INCREMENT,
 	strategy_run_id INTEGER NOT NULL,
@@ -462,13 +562,13 @@ CREATE TABLE trading_agent_batches (
 	FOREIGN KEY(rebalance_run_id) REFERENCES strategy_runs (id)
 );
 
-CREATE INDEX ix_trading_agent_batches_config_fingerprint ON trading_agent_batches (config_fingerprint);
+CREATE INDEX ix_trading_agent_batches_strategy_config_id ON trading_agent_batches (strategy_config_id);
 
 CREATE INDEX ix_trading_agent_batches_simulation_account_id ON trading_agent_batches (simulation_account_id);
 
-CREATE INDEX ix_trading_agent_batches_strategy_config_id ON trading_agent_batches (strategy_config_id);
-
 CREATE INDEX ix_trading_agent_batches_trading_date ON trading_agent_batches (trading_date);
+
+CREATE INDEX ix_trading_agent_batches_config_fingerprint ON trading_agent_batches (config_fingerprint);
 
 
 CREATE TABLE orders (
@@ -561,6 +661,36 @@ CREATE TABLE fills (
 );
 
 
+CREATE TABLE probability_candidate_decisions (
+	id INTEGER NOT NULL AUTO_INCREMENT,
+	portfolio_run_id INTEGER NOT NULL,
+	stock_id INTEGER NOT NULL,
+	status VARCHAR(24) NOT NULL,
+	`rank` INTEGER,
+	features JSON NOT NULL,
+	rejection_reasons JSON NOT NULL,
+	raw_probability FLOAT,
+	calibrated_probability FLOAT,
+	expected_net_return FLOAT,
+	volatility_20d FLOAT,
+	score FLOAT,
+	target_weight FLOAT,
+	target_notional FLOAT,
+	planned_quantity INTEGER,
+	order_id INTEGER,
+	created_at DATETIME NOT NULL,
+	PRIMARY KEY (id),
+	UNIQUE (portfolio_run_id, stock_id),
+	FOREIGN KEY(portfolio_run_id) REFERENCES probability_portfolio_runs (id),
+	FOREIGN KEY(stock_id) REFERENCES stocks (id),
+	FOREIGN KEY(order_id) REFERENCES orders (id)
+);
+
+CREATE INDEX ix_probability_candidate_decisions_portfolio_run_id ON probability_candidate_decisions (portfolio_run_id);
+
+CREATE INDEX ix_probability_candidate_decisions_stock_id ON probability_candidate_decisions (stock_id);
+
+
 CREATE TABLE risk_events (
 	id INTEGER NOT NULL AUTO_INCREMENT,
 	mode VARCHAR(16) NOT NULL,
@@ -591,5 +721,41 @@ CREATE TABLE simulation_account_ledgers (
 	FOREIGN KEY(related_order_id) REFERENCES orders (id),
 	FOREIGN KEY(related_fill_id) REFERENCES fills (id)
 );
+
+
+CREATE TABLE strategy_position_lots (
+	id INTEGER NOT NULL AUTO_INCREMENT,
+	strategy_config_id INTEGER NOT NULL,
+	account_id INTEGER NOT NULL,
+	stock_id INTEGER NOT NULL,
+	buy_order_id INTEGER NOT NULL,
+	buy_fill_id INTEGER NOT NULL,
+	original_quantity INTEGER NOT NULL,
+	remaining_quantity INTEGER NOT NULL,
+	available_on VARCHAR(10) NOT NULL,
+	planned_exit_at DATETIME NOT NULL,
+	status VARCHAR(24) NOT NULL,
+	last_exit_attempt_at DATETIME,
+	close_order_ids JSON NOT NULL,
+	created_at DATETIME NOT NULL,
+	updated_at DATETIME NOT NULL,
+	PRIMARY KEY (id),
+	FOREIGN KEY(strategy_config_id) REFERENCES strategy_configs (id),
+	FOREIGN KEY(stock_id) REFERENCES stocks (id),
+	UNIQUE (buy_order_id),
+	FOREIGN KEY(buy_order_id) REFERENCES orders (id),
+	UNIQUE (buy_fill_id),
+	FOREIGN KEY(buy_fill_id) REFERENCES fills (id)
+);
+
+CREATE INDEX ix_strategy_position_lots_available_on ON strategy_position_lots (available_on);
+
+CREATE INDEX ix_strategy_position_lots_stock_id ON strategy_position_lots (stock_id);
+
+CREATE INDEX ix_strategy_position_lots_planned_exit_at ON strategy_position_lots (planned_exit_at);
+
+CREATE INDEX ix_strategy_position_lots_strategy_config_id ON strategy_position_lots (strategy_config_id);
+
+CREATE INDEX ix_strategy_position_lots_account_id ON strategy_position_lots (account_id);
 
 SET FOREIGN_KEY_CHECKS = 1;

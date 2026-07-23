@@ -110,3 +110,27 @@
   ]
 }
 ```
+
+```json
+{
+  "run_id": "2026-07-23-overnight-probability-portfolio",
+  "pattern": "daily-triage",
+  "mode": "manual-approved-fix",
+  "iteration": 4,
+  "items_found": 20,
+  "actions_taken": 20,
+  "same_error_attempt": 0,
+  "escalations": 0,
+  "worktree": ".worktrees/overnight-probability-portfolio",
+  "safety": "LIVE=false; BROKER=simulation; 概率组合计划默认关闭; 真实订单数为0",
+  "outcome": "done-with-readiness-gates",
+  "evidence": [
+    "Python 3.12.12 后端全套310 passed，Ruff与git diff格式检查通过",
+    "Node 20前端行为测试3 passed，Vite生产构建转换1561个模块并成功退出",
+    "隔离SQLite下五个进程连续存活65秒，后端健康端点与前端入口均可达",
+    "概率组合独立模拟账户为200万元，两条自动计划关闭，真实订单与启用实盘账户均为0",
+    "60m缓存回测退出码为0，未访问券商、未读取.env、未发送真实订单",
+    "功能保留在专用分支，未push、merge、deploy或重启主目录服务；启用仍需模型、管理员演练和人工计划门"
+  ]
+}
+```
