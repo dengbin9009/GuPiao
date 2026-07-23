@@ -61,7 +61,7 @@ def make_event_data_fresh(db: Session) -> None:
 
 
 def test_model_count_and_seed(db: Session):
-    assert len(Base.metadata.tables) == 30
+    assert len(Base.metadata.tables) == 35
     account = db.scalar(select(SimulationAccount))
     definition = db.scalar(select(StrategyDefinition).where(StrategyDefinition.key == "overnight_hold"))
     assert account is not None and account.initial_cash == 10000

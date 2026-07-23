@@ -27,6 +27,7 @@ from ..models import (
     TradingAgentPortfolioDecision,
     now,
 )
+from ..simulation_accounts import daily_pnl_pct, revalue_account
 from .config import TRADING_AGENTS_DEFAULTS
 from .config import configuration_fingerprint
 from .runtime import simulation_account_is_available
@@ -49,28 +50,7 @@ class PlannedOrder:
 
 
 def revalue_simulation_account(db: Session, account: SimulationAccount) -> None:
-    positions = list(
-        db.scalars(
-            select(Position).where(
-                Position.account_id == account.id,
-                Position.mode == "SIMULATION",
-                Position.quantity > 0,
-            )
-        )
-    )
-    market_value = 0.0
-    unrealized = 0.0
-    for position in positions:
-        stock = db.get(Stock, position.stock_id)
-        price = float(stock.last_price or 0)
-        position.market_value = position.quantity * price
-        position.unrealized_pnl = (
-            price - float(position.average_cost)
-        ) * position.quantity
-        market_value += position.market_value
-        unrealized += position.unrealized_pnl
-    account.total_asset = float(account.cash_balance) + market_value
-    account.unrealized_pnl = unrealized
+    revalue_account(db, account)
 
 
 def _latest_rebalance(current: datetime, value: str) -> datetime:
@@ -186,29 +166,8 @@ def _plan_orders(
         raise ValueError("目标总仓位超过上限")
     if risk.emergency_stop_enabled:
         raise ValueError("已触发紧急停止")
-    day_start = datetime.combine(current.date(), datetime.min.time(), tzinfo=current.tzinfo)
-    opening_snapshot = db.scalar(
-        select(AccountSnapshot)
-        .where(
-            AccountSnapshot.mode == "SIMULATION",
-            AccountSnapshot.account_id == account.id,
-            AccountSnapshot.captured_at >= day_start,
-            AccountSnapshot.captured_at <= current,
-        )
-        .order_by(AccountSnapshot.captured_at, AccountSnapshot.id)
-        .limit(1)
-    )
-    opening_asset = (
-        float(opening_snapshot.total_asset)
-        if opening_snapshot and opening_snapshot.total_asset > 0
-        else float(account.initial_cash)
-    )
-    daily_pnl_pct = (
-        (float(account.total_asset) - opening_asset) / opening_asset
-        if opening_asset > 0
-        else 0
-    )
-    if daily_pnl_pct <= -abs(float(risk.daily_loss_limit_pct)):
+    current_daily_pnl_pct = daily_pnl_pct(db, account, current=current)
+    if current_daily_pnl_pct <= -abs(float(risk.daily_loss_limit_pct)):
         raise ValueError("已触发日亏损熔断")
     recent_events = list(
         db.scalars(

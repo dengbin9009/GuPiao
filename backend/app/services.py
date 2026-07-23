@@ -44,6 +44,7 @@ from .models import (
 )
 from .risk import evaluate_order
 from .notifications import queue_notifications
+from .simulation_accounts import daily_pnl_pct, snapshot_account
 from .security import hash_password
 from .trading_agents import TRADING_AGENTS_DEFAULTS
 
@@ -336,44 +337,6 @@ def seed_database(db: Session, settings: Settings) -> None:
     db.commit()
 
 
-def snapshot_account(db: Session, account: SimulationAccount) -> AccountSnapshot:
-    market_value = 0.0
-    unrealized_pnl = 0.0
-    for position, last_price in db.execute(
-        select(Position, Stock.last_price)
-        .join(Stock, Stock.id == Position.stock_id)
-        .where(
-            Position.account_id == account.id,
-            Position.mode == "SIMULATION",
-            Position.quantity > 0,
-        )
-    ):
-        price = float(last_price or 0)
-        position.market_value = position.quantity * price
-        position.unrealized_pnl = (
-            price - float(position.average_cost)
-        ) * position.quantity
-        market_value += position.market_value
-        unrealized_pnl += position.unrealized_pnl
-    account.unrealized_pnl = unrealized_pnl
-    account.total_asset = float(account.cash_balance) + market_value
-    snapshot = AccountSnapshot(
-        mode="SIMULATION",
-        account_id=account.id,
-        cash_balance=account.cash_balance,
-        available_cash=account.available_cash,
-        frozen_cash=account.frozen_cash,
-        market_value=market_value,
-        total_asset=account.total_asset,
-        realized_pnl=account.realized_pnl,
-        unrealized_pnl=unrealized_pnl,
-        exposure=market_value / account.total_asset if account.total_asset else 0,
-        source="simulated_broker",
-    )
-    db.add(snapshot)
-    return snapshot
-
-
 def release_simulation_cash(
     db: Session,
     account: SimulationAccount,
@@ -637,9 +600,7 @@ def execute_simulation_strategy(db: Session, config: StrategyConfig) -> Strategy
         total_asset=account.total_asset,
         position_market_value=position.market_value if position else 0,
         total_market_value=total_market_value,
-        daily_pnl_pct=(account.realized_pnl + account.unrealized_pnl) / account.initial_cash
-        if account.initial_cash
-        else 0,
+        daily_pnl_pct=daily_pnl_pct(db, account, current=current),
         consecutive_errors=0,
     )
     if not decision.allowed:
