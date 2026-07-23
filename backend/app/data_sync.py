@@ -78,6 +78,12 @@ def sync_stock_master(
         stock.code = code
         stock.exchange = exchange
         stock.name = name
+        listing_date = _value(row, "list_date", "listing_date", "上市时间", "上市日期")
+        if listing_date is not None:
+            text = str(listing_date).strip().replace("/", "-")
+            if len(text) == 8 and text.isdigit():
+                text = f"{text[:4]}-{text[4:6]}-{text[6:]}"
+            stock.listing_date = text[:10]
         stock.pinyin = pinyin
         stock.pinyin_initials = initials
         stock.status = "active"
@@ -105,20 +111,62 @@ def refresh_quotes(db: Session, provider: Any, symbols: list[str]) -> SyncResult
             stock.last_price = None
             stock.change_pct = None
             stock.turnover_amount = None
+            stock.turnover_rate = None
+            stock.open_price = None
+            stock.high_price = None
+            stock.low_price = None
+            stock.volume = None
+            stock.vwap = None
+            stock.tail_30m_return = None
+            stock.limit_up_price = None
+            stock.limit_down_price = None
+            stock.quote_source = None
             stock.quote_updated_at = None
+            stock.factor_updated_at = None
             missing.append(symbol)
             continue
         stock.last_price = float(_value(row, "last_price", "price", "最新价", "close", default=0))
         stock.change_pct = float(_value(row, "change_pct", "pct_chg", "涨跌幅", default=0))
         stock.turnover_amount = float(_value(row, "amount", "turnover_amount", "成交额", default=0))
+        turnover_rate = _value(row, "turnover_rate", "换手率")
+        if turnover_rate is not None:
+            value = float(turnover_rate)
+            stock.turnover_rate = value / 100 if abs(value) > 1 else value
+        else:
+            stock.turnover_rate = None
+        stock.open_price = _optional_float(row, "open_price", "open", "今开")
+        stock.high_price = _optional_float(row, "high_price", "high", "最高")
+        stock.low_price = _optional_float(row, "low_price", "low", "最低")
+        stock.volume = _optional_float(row, "volume", "vol", "成交量")
+        stock.vwap = _optional_float(row, "vwap", "日内VWAP")
+        if stock.vwap is None and stock.volume and stock.turnover_amount:
+            stock.vwap = stock.turnover_amount / stock.volume
+        stock.tail_30m_return = _optional_float(
+            row, "tail_30m_return", "尾盘30分钟收益"
+        )
+        stock.limit_up_price = _optional_float(row, "limit_up_price", "涨停价")
+        stock.limit_down_price = _optional_float(row, "limit_down_price", "跌停价")
+        stock.quote_source = str(provider.name)
         quote_at = _value(row, "quote_at", "trade_time")
         stock.quote_updated_at = quote_at if isinstance(quote_at, datetime) else timestamp
+        stock.factor_updated_at = stock.quote_updated_at
         quote_timestamps.append(stock.quote_updated_at)
         updated += 1
     latest_quote_at = max(quote_timestamps) if quote_timestamps else None
     _mark_provider(db, provider.name, healthy=True, quote_at=latest_quote_at)
     db.commit()
     return SyncResult(updated=updated, missing=missing)
+
+
+def _optional_float(row: dict[str, Any], *keys: str) -> float | None:
+    value = _value(row, *keys)
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number else None
 
 
 def sync_corporate_events(db: Session, rows: Iterable[dict[str, Any]]) -> SyncResult:
