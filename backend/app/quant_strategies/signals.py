@@ -228,6 +228,49 @@ def _universe(
     )
     blocked: dict[str, tuple[str, ...]] = {}
     eligible: list[tuple[Stock, float]] = []
+    stock_ids = [stock.id for stock in rows]
+    cutoff = decision_at or datetime.combine(as_of, datetime.max.time())
+    event_stock_ids = set(
+        db.scalars(
+            select(StockEvent.stock_id)
+            .where(
+                StockEvent.stock_id.in_(stock_ids),
+                StockEvent.event_type.in_(BLOCKING_EVENTS),
+                StockEvent.published_at >= cutoff - timedelta(days=7),
+                StockEvent.published_at <= cutoff,
+            )
+            .distinct()
+        )
+    )
+    ranked_amounts = (
+        select(
+            MarketDailyBar.stock_id.label("stock_id"),
+            MarketDailyBar.amount.label("amount"),
+            func.row_number()
+            .over(
+                partition_by=MarketDailyBar.stock_id,
+                order_by=MarketDailyBar.trade_date.desc(),
+            )
+            .label("row_number"),
+        )
+        .where(
+            MarketDailyBar.stock_id.in_(stock_ids),
+            MarketDailyBar.trade_date <= as_of.isoformat(),
+        )
+        .subquery()
+    )
+    turnover_by_stock = {
+        stock_id: (int(count), float(average or 0))
+        for stock_id, count, average in db.execute(
+            select(
+                ranked_amounts.c.stock_id,
+                func.count(ranked_amounts.c.amount),
+                func.avg(ranked_amounts.c.amount),
+            )
+            .where(ranked_amounts.c.row_number <= 20)
+            .group_by(ranked_amounts.c.stock_id)
+        )
+    }
     for stock in rows:
         reasons = []
         if "ST" in stock.name.upper():
@@ -236,31 +279,11 @@ def _universe(
             reasons.append("缺少上市日期")
         elif (as_of - _parse_date(stock.listing_date)).days < 120:
             reasons.append("上市不足120日")
-        cutoff = decision_at or datetime.combine(as_of, datetime.max.time())
-        event = db.scalar(
-            select(StockEvent.id).where(
-                StockEvent.stock_id == stock.id,
-                StockEvent.event_type.in_(BLOCKING_EVENTS),
-                StockEvent.published_at >= cutoff - timedelta(days=7),
-                StockEvent.published_at <= cutoff,
-            )
-        )
-        if event:
+        if stock.id in event_stock_ids:
             reasons.append("命中风险公告")
-        amounts = list(
-            db.scalars(
-                select(MarketDailyBar.amount)
-                .where(
-                    MarketDailyBar.stock_id == stock.id,
-                    MarketDailyBar.trade_date <= as_of.isoformat(),
-                )
-                .order_by(MarketDailyBar.trade_date.desc())
-                .limit(20)
-            )
-        )
-        if len(amounts) < 20:
+        amount_count, average_amount = turnover_by_stock.get(stock.id, (0, 0.0))
+        if amount_count < 20:
             reasons.append("20日成交额历史不足")
-        average_amount = sum(float(value or 0) for value in amounts) / len(amounts) if amounts else 0
         if average_amount < float(parameters.get("min_average_turnover", 100_000_000)):
             reasons.append("20日平均成交额不足1亿元")
         if reasons:

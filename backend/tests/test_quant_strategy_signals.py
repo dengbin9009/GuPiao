@@ -5,7 +5,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import Session
 
 from app.config import Settings
@@ -24,7 +24,7 @@ from app.models import (
 )
 from app.quant_strategies.runtime import seed_quant_strategy_runtimes
 from app.quant_strategies.signals import DataNotReadyError, build_signal_decision
-from app.quant_strategies.signals import _financial_rows
+from app.quant_strategies.signals import _financial_rows, _universe
 from app.services import seed_database
 
 
@@ -246,6 +246,49 @@ def test_signal_blocks_recent_risk_announcement(tmp_path: Path):
         )
 
         assert "命中风险公告" in rejected.rejection_reasons
+
+
+def test_stock_universe_prefilter_uses_constant_query_count(tmp_path: Path):
+    engine, config_id = setup_database(tmp_path)
+    as_of = date(2026, 7, 23)
+    current = datetime(2026, 7, 23, 16, 30, tzinfo=SHANGHAI)
+    with Session(engine) as db:
+        stocks = seed_signal_data(db, as_of)
+        db.add(
+            StockEvent(
+                stock_id=stocks[0].id,
+                event_type="regulatory_investigation",
+                severity="critical",
+                title="立案调查",
+                source="test",
+                source_event_id="bulk-universe-event",
+                published_at=current - timedelta(days=1),
+            )
+        )
+        db.commit()
+        config = db.get(StrategyConfig, config_id)
+        statements = []
+
+        def capture_select(_conn, _cursor, statement, *_args):
+            if statement.lstrip().upper().startswith("SELECT"):
+                statements.append(statement)
+
+        event.listen(engine, "before_cursor_execute", capture_select)
+        try:
+            selected, blocked = _universe(
+                db,
+                config,
+                "multi_factor_core",
+                as_of,
+                decision_at=current,
+            )
+        finally:
+            event.remove(engine, "before_cursor_execute", capture_select)
+
+        assert len(statements) <= 3
+        assert stocks[0].symbol in blocked
+        assert "命中风险公告" in blocked[stocks[0].symbol]
+        assert stocks[1].symbol in {stock.symbol for stock in selected}
 
 
 def test_signal_decision_is_deterministic_and_ignores_future_data(tmp_path: Path):
