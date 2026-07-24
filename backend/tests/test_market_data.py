@@ -615,6 +615,94 @@ def test_mootdx_provider_reads_minute_bars_when_client_available():
     assert rows[0]["provider"] == "mootdx"
 
 
+def test_mootdx_provider_reads_daily_bars_and_builds_adjustment_factors():
+    from app.market_data import MootdxProvider
+
+    class Client:
+        def bars(self, symbol, market, frequency, start=0, offset=800):
+            assert (symbol, market, frequency, start, offset) == (
+                "000001",
+                0,
+                9,
+                0,
+                800,
+            )
+            return [
+                {
+                    "datetime": "2026-07-22 15:00:00",
+                    "open": 10,
+                    "high": 10.2,
+                    "low": 9.8,
+                    "close": 10,
+                    "volume": 100,
+                    "amount": 100_000,
+                },
+                {
+                    "datetime": "2026-07-23 15:00:00",
+                    "open": 9.5,
+                    "high": 9.7,
+                    "low": 9.3,
+                    "close": 9.5,
+                    "volume": 200,
+                    "amount": 190_000,
+                },
+            ]
+
+        def xdxr(self, symbol):
+            assert symbol == "000001"
+            return [
+                {
+                    "year": 2026,
+                    "month": 7,
+                    "day": 23,
+                    "category": 1,
+                    "fenhong": 5,
+                    "peigujia": 0,
+                    "songzhuangu": 0,
+                    "peigu": 0,
+                }
+            ]
+
+    provider = MootdxProvider()
+    provider.Quotes = object()
+    provider.client = Client()
+    provider.import_error = None
+
+    bars = provider.bars(
+        symbol="000001.SZ",
+        timeframe="1d",
+        start="2026-07-22",
+        end="2026-07-23",
+    )
+    factors = provider.adjustment_factors(
+        "000001.SZ",
+        start="2026-07-22",
+        end="2026-07-23",
+    )
+
+    assert "daily" in provider.capabilities
+    assert "adjustment" in provider.capabilities
+    assert bars[0] == {
+        "trade_date": "2026-07-22",
+        "open": 10.0,
+        "high": 10.2,
+        "low": 9.8,
+        "close": 10.0,
+        "volume": 10_000.0,
+        "amount": 100_000.0,
+    }
+    assert factors == [
+        {
+            "trade_date": "2026-07-22",
+            "adjustment_factor": pytest.approx(0.95),
+        },
+        {
+            "trade_date": "2026-07-23",
+            "adjustment_factor": 1.0,
+        },
+    ]
+
+
 def test_mootdx_provider_reads_realtime_quotes_with_server_time():
     from app.market_data import MootdxProvider
 

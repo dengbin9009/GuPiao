@@ -1006,6 +1006,115 @@ def test_worker_quant_sync_fetches_stock_payloads_concurrently(tmp_path: Path):
         assert db.scalar(select(MarketDailyBar).where(MarketDailyBar.adjusted_close.is_(None))) is None
 
 
+def test_quant_sync_uses_mootdx_only_for_stock_daily_and_adjustment(tmp_path: Path):
+    from app.worker import poll_quant_market_data
+
+    database_url = f"sqlite:///{tmp_path / 'split-provider.db'}"
+    engine = create_engine(database_url)
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        db.add(
+            Stock(
+                code="000001",
+                exchange="SZSE",
+                symbol="000001.SZ",
+                name="平安银行",
+                instrument_type="STOCK",
+                status="active",
+                turnover_amount=300_000_000,
+            )
+        )
+        db.commit()
+
+    calls = []
+
+    class PublicSource:
+        name = "akshare"
+        capabilities = frozenset(
+            {"daily", "adjustment", "daily_metric", "financial", "etf_master"}
+        )
+
+        def health(self):
+            return True, None
+
+        def etf_master(self):
+            return []
+
+        def bars(self, **_kwargs):
+            raise AssertionError("股票日线应由 mootdx 提供")
+
+        def adjustment_factors(self, *_args, **_kwargs):
+            raise AssertionError("股票复权应由 mootdx 提供")
+
+        def daily_metrics(self, symbol, *, start, end):
+            calls.append(("metrics", symbol))
+            return [{"trade_date": end, "pe_ttm": 10, "pb": 1}]
+
+        def financial_reports(self, symbol):
+            calls.append(("financial", symbol))
+            return [
+                {
+                    "report_period": "2026-06-30",
+                    "actual_announcement_date": "2026-07-20",
+                    "roe": 0.15,
+                    "gross_margin": 0.3,
+                    "operating_cash_flow": 10,
+                    "total_assets": 100,
+                    "total_liabilities": 30,
+                }
+            ]
+
+    class TdxSource:
+        name = "mootdx"
+        capabilities = frozenset({"daily", "adjustment"})
+
+        def health(self):
+            return True, None
+
+        def bars(self, *, symbol, timeframe, start, end):
+            calls.append(("daily", symbol))
+            assert timeframe == "1d"
+            return [
+                {
+                    "trade_date": end,
+                    "open": 10,
+                    "high": 11,
+                    "low": 9,
+                    "close": 10,
+                    "volume": 100,
+                    "amount": 200_000_000,
+                }
+            ]
+
+        def adjustment_factors(self, symbol, *, start, end):
+            calls.append(("adjustment", symbol))
+            return [{"trade_date": end, "adjustment_factor": 1.2}]
+
+    result = poll_quant_market_data(
+        router=ProviderRouter([PublicSource(), TdxSource()]),
+        trading_days={"2026-07-21", "2026-07-24"},
+        session_factory=lambda: Session(engine),
+        current=datetime(2026, 7, 24, 16, 15, tzinfo=ZoneInfo("Asia/Shanghai")),
+        stock_fetch_workers=1,
+    )
+
+    assert result["stocks"] == 1
+    assert calls == [
+        ("daily", "000001.SZ"),
+        ("adjustment", "000001.SZ"),
+        ("metrics", "000001.SZ"),
+        ("financial", "000001.SZ"),
+    ]
+    with Session(engine) as db:
+        bar = db.scalar(select(MarketDailyBar))
+        metric = db.scalar(select(MarketDailyMetric))
+        report = db.scalar(select(FinancialReportSnapshot))
+        assert bar.source == "mootdx"
+        assert bar.adjustment_factor == 1.2
+        assert metric.source == "akshare"
+        assert report.source == "akshare"
+
+
 def test_quant_sync_stock_universe_uses_liquidity_but_always_keeps_holdings(
     tmp_path: Path,
 ):

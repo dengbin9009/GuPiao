@@ -995,7 +995,9 @@ class TushareProvider(MarketDataProvider):
 
 class MootdxProvider(MarketDataProvider):
     name = "mootdx"
-    capabilities = frozenset({"minute", "hour", "realtime", "finance"})
+    capabilities = frozenset(
+        {"daily", "adjustment", "minute", "hour", "realtime", "finance"}
+    )
 
     def __init__(self):
         try:
@@ -1004,11 +1006,13 @@ class MootdxProvider(MarketDataProvider):
             self.Quotes = Quotes
             self.client = None
             self._thread_clients = local()
+            self._daily_cache: dict[str, list[dict[str, Any]]] = {}
             self.import_error = None
         except Exception as exc:
             self.Quotes = None
             self.client = None
             self._thread_clients = local()
+            self._daily_cache = {}
             self.import_error = str(exc)
 
     def health(self) -> tuple[bool, str | None]:
@@ -1032,18 +1036,59 @@ class MootdxProvider(MarketDataProvider):
         return client
 
     def bars(self, *, symbol: str, timeframe: str, start: str | None = None, end: str | None = None) -> list[dict[str, Any]]:
-        if timeframe not in {"1m", "60m"}:
+        if timeframe not in {"1d", "1m", "60m"}:
             raise MarketDataError(f"mootdx 不支持时间粒度 {timeframe}")
         quotes = self._quotes()
         code, _, suffix = symbol.partition(".")
         market = 1 if suffix.upper() == "SH" else 0
-        frequency = 8 if timeframe == "1m" else 3
+        frequency = {"1d": 9, "1m": 8, "60m": 3}[timeframe]
         try:
-            rows = quotes.bars(symbol=code, market=market, frequency=frequency)
+            if timeframe == "1d":
+                rows = quotes.bars(
+                    symbol=code,
+                    market=market,
+                    frequency=frequency,
+                    start=0,
+                    offset=800,
+                )
+            else:
+                rows = quotes.bars(
+                    symbol=code,
+                    market=market,
+                    frequency=frequency,
+                )
         except Exception as exc:
-            label = "分钟线" if timeframe == "1m" else "小时线"
+            label = {"1d": "日线", "1m": "分钟线", "60m": "小时线"}[timeframe]
             raise MarketDataError(f"mootdx {label}获取失败: {exc}") from exc
         records = _records(rows)
+        if timeframe == "1d":
+            cached = []
+            for row in records:
+                trade_date = _date_text(
+                    row.get("datetime") or row.get("date") or row.get("time")
+                )
+                if not trade_date or (end and trade_date > end):
+                    continue
+                cached.append(
+                    {
+                        "trade_date": trade_date,
+                        "open": float(row.get("open", 0) or 0),
+                        "high": float(row.get("high", 0) or 0),
+                        "low": float(row.get("low", 0) or 0),
+                        "close": float(row.get("close", 0) or 0),
+                        "volume": float(
+                            row.get("volume", row.get("vol", 0)) or 0
+                        )
+                        * 100,
+                        "amount": float(row.get("amount", 0) or 0),
+                    }
+                )
+            self._daily_cache[symbol] = cached
+            return [
+                row
+                for row in cached
+                if not start or row["trade_date"] >= start
+            ]
         result: list[dict[str, Any]] = []
         for row in records:
             timestamp = row.get("datetime") or row.get("date") or row.get("time")
@@ -1072,6 +1117,72 @@ class MootdxProvider(MarketDataProvider):
                     "amount": float(row.get("amount", row.get("money", 0)) or 0),
                     "provider": "mootdx",
                 }
+            )
+        return result
+
+    def adjustment_factors(
+        self,
+        symbol: str,
+        *,
+        start: str,
+        end: str,
+    ) -> list[dict[str, Any]]:
+        cached = self._daily_cache.get(symbol)
+        if cached is None or not cached:
+            self.bars(
+                symbol=symbol,
+                timeframe="1d",
+                start=None,
+                end=end,
+            )
+            cached = self._daily_cache.get(symbol)
+        if not cached:
+            raise MarketDataError(f"mootdx 日线缺失，无法计算复权: {symbol}")
+        code = symbol.split(".")[0]
+        try:
+            events = _records(self._quotes().xdxr(symbol=code))
+        except Exception as exc:
+            raise MarketDataError(f"mootdx 除权除息获取失败: {exc}") from exc
+        events_by_date = {
+            f"{int(row.get('year')):04d}-{int(row.get('month')):02d}-{int(row.get('day')):02d}": row
+            for row in events
+            if int(row.get("category", 0) or 0) == 1
+            and row.get("year")
+            and row.get("month")
+            and row.get("day")
+        }
+        factor = 1.0
+        previous_close = None
+        result = []
+        for bar in sorted(cached, key=lambda item: item["trade_date"]):
+            trade_date = str(bar["trade_date"])
+            event = events_by_date.get(trade_date)
+            if event is not None and previous_close and previous_close > 0:
+                cash = (_optional_number(event.get("fenhong")) or 0) / 10
+                bonus = (_optional_number(event.get("songzhuangu")) or 0) / 10
+                rights = (_optional_number(event.get("peigu")) or 0) / 10
+                rights_price = _optional_number(event.get("peigujia")) or 0
+                ex_right_price = (
+                    previous_close - cash + rights * rights_price
+                ) / (1 + bonus + rights)
+                if ex_right_price > 0:
+                    factor *= previous_close / ex_right_price
+            if start <= trade_date <= end:
+                result.append(
+                    {
+                        "trade_date": trade_date,
+                        "adjustment_factor": factor,
+                    }
+                )
+            previous_close = float(bar["close"])
+        if not result:
+            raise MarketDataError(f"mootdx 复权因子返回为空: {symbol}")
+        latest_factor = float(result[-1]["adjustment_factor"])
+        if latest_factor <= 0:
+            raise MarketDataError(f"mootdx 最新复权因子无效: {symbol}")
+        for row in result:
+            row["adjustment_factor"] = (
+                float(row["adjustment_factor"]) / latest_factor
             )
         return result
 

@@ -254,6 +254,16 @@ def poll_quant_market_data(
                 source,
                 *(item for item in route.providers if item is not source),
             ]
+        stock_daily_source = source
+        if provider is None:
+            for candidate in route.providers:
+                if (
+                    candidate.name == "mootdx"
+                    and {"daily", "adjustment"}.issubset(candidate.capabilities)
+                    and candidate.health()[0]
+                ):
+                    stock_daily_source = candidate
+                    break
 
         dataset_states = {
             provider: db.scalar(
@@ -325,22 +335,23 @@ def poll_quant_market_data(
                 "daily_metric_cross_section",
             )
         ):
-            try:
-                batch_daily = {
-                    str(row.get("symbol") or "").upper(): row
-                    for row in source.daily_cross_section(end)
-                    if row.get("symbol")
-                }
-            except Exception:
-                batch_daily = None
-            try:
-                batch_adjustments = {
-                    str(row.get("symbol") or "").upper(): row
-                    for row in source.adjustment_cross_section(end)
-                    if row.get("symbol")
-                }
-            except Exception:
-                batch_adjustments = None
+            if stock_daily_source is source:
+                try:
+                    batch_daily = {
+                        str(row.get("symbol") or "").upper(): row
+                        for row in source.daily_cross_section(end)
+                        if row.get("symbol")
+                    }
+                except Exception:
+                    batch_daily = None
+                try:
+                    batch_adjustments = {
+                        str(row.get("symbol") or "").upper(): row
+                        for row in source.adjustment_cross_section(end)
+                        if row.get("symbol")
+                    }
+                except Exception:
+                    batch_adjustments = None
             try:
                 batch_metrics = {
                     str(row.get("symbol") or "").upper(): row
@@ -401,6 +412,8 @@ def poll_quant_market_data(
                     current.date() - timedelta(days=30),
                     date.fromisoformat(str(latest_date)) - timedelta(days=5),
                 )
+            if stock_daily_source.name == "mootdx":
+                start_date = current.date() - timedelta(days=1200)
             fetch_plans.append(
                 QuantStockFetchPlan(
                     stock_id=stock.id,
@@ -421,21 +434,32 @@ def poll_quant_market_data(
             financial_error = None
             try:
                 if plan.existing_count >= 520 and batch_daily is not None:
-                    daily_source = source.name
+                    daily_source = stock_daily_source.name
                     bars = (
                         [batch_daily[plan.symbol]]
                         if plan.symbol in batch_daily
                         else []
                     )
                 else:
-                    daily_source, bars = routed_rows(
-                        "daily",
-                        "bars",
-                        symbol=plan.symbol,
-                        timeframe="1d",
-                        start=plan.start,
-                        end=end,
-                    )
+                    if stock_daily_source.name == "mootdx":
+                        daily_source = stock_daily_source.name
+                        bars = list(
+                            stock_daily_source.bars(
+                                symbol=plan.symbol,
+                                timeframe="1d",
+                                start=plan.start,
+                                end=end,
+                            )
+                        )
+                    else:
+                        daily_source, bars = routed_rows(
+                            "daily",
+                            "bars",
+                            symbol=plan.symbol,
+                            timeframe="1d",
+                            start=plan.start,
+                            end=end,
+                        )
                 if plan.existing_count >= 520 and batch_adjustments is not None:
                     adjustments = (
                         [batch_adjustments[plan.symbol]]
@@ -443,8 +467,13 @@ def poll_quant_market_data(
                         else []
                     )
                 else:
+                    adjustment_source = (
+                        stock_daily_source
+                        if stock_daily_source.name == "mootdx"
+                        else source
+                    )
                     adjustments = list(
-                        source.adjustment_factors(
+                        adjustment_source.adjustment_factors(
                             plan.symbol,
                             start=plan.start,
                             end=end,
@@ -521,7 +550,7 @@ def poll_quant_market_data(
                     db,
                     stock,
                     payload.adjustments,
-                    source=source.name,
+                    source=str(payload.daily_source),
                 )
                 daily_ok = db.scalar(
                     select(MarketDailyBar.id).where(
