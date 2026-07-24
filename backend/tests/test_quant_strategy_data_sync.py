@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from threading import Barrier
 from zoneinfo import ZoneInfo
@@ -1098,7 +1098,7 @@ def test_quant_sync_uses_mootdx_only_for_stock_daily_and_adjustment(tmp_path: Pa
         stock_fetch_workers=1,
     )
 
-    assert result["stocks"] == 1
+    assert result["stocks"] == 1, result
     assert calls == [
         ("daily", "000001.SZ"),
         ("adjustment", "000001.SZ"),
@@ -1113,6 +1113,101 @@ def test_quant_sync_uses_mootdx_only_for_stock_daily_and_adjustment(tmp_path: Pa
         assert bar.adjustment_factor == 1.2
         assert metric.source == "akshare"
         assert report.source == "akshare"
+
+
+def test_quant_sync_skips_complete_current_stock_datasets_on_restart(tmp_path: Path):
+    from app.worker import poll_quant_market_data
+
+    database_url = f"sqlite:///{tmp_path / 'resume-complete.db'}"
+    engine = create_engine(database_url)
+    Base.metadata.create_all(engine)
+    current = datetime(2026, 7, 24, 16, 15, tzinfo=ZoneInfo("Asia/Shanghai"))
+    with Session(engine) as db:
+        stock = Stock(
+            code="000001",
+            exchange="SZSE",
+            symbol="000001.SZ",
+            name="平安银行",
+            instrument_type="STOCK",
+            status="active",
+            turnover_amount=300_000_000,
+        )
+        db.add(stock)
+        db.flush()
+        dates = sorted(
+            (date(2026, 7, 24) - timedelta(days=index)).isoformat()
+            for index in range(500)
+        )
+        db.add_all(
+            MarketDailyBar(
+                stock_id=stock.id,
+                trade_date=trade_date,
+                open=10,
+                high=11,
+                low=9,
+                close=10,
+                volume=100,
+                amount=200_000_000,
+                adjusted_close=10,
+                adjustment_factor=1,
+                quality_status="valid",
+                source="mootdx",
+            )
+            for trade_date in dates
+        )
+        db.add_all(
+            MarketDailyMetric(
+                stock_id=stock.id,
+                trade_date=trade_date,
+                pe_ttm=10,
+                pb=1,
+                source="akshare",
+            )
+            for trade_date in dates
+        )
+        db.add(
+            FinancialReportSnapshot(
+                stock_id=stock.id,
+                report_period="2026-06-30",
+                report_type="quarterly",
+                announcement_date="2026-07-20",
+                actual_announcement_date="2026-07-20",
+                available_on="2026-07-21",
+                roe=0.15,
+                source="akshare",
+                fetched_at=current,
+            )
+        )
+        db.commit()
+
+    class Source:
+        name = "akshare"
+
+        def etf_master(self):
+            return []
+
+        def bars(self, **_kwargs):
+            raise AssertionError("完整当日日线不应重复获取")
+
+        def adjustment_factors(self, *_args, **_kwargs):
+            raise AssertionError("完整当日复权不应重复获取")
+
+        def daily_metrics(self, *_args, **_kwargs):
+            raise AssertionError("完整历史估值不应重复获取")
+
+        def financial_reports(self, _symbol):
+            raise AssertionError("当天已刷新财务不应重复获取")
+
+    result = poll_quant_market_data(
+        provider=Source(),
+        trading_days={"2026-07-21", "2026-07-24"},
+        session_factory=lambda: Session(engine),
+        current=current,
+        stock_fetch_workers=1,
+    )
+
+    assert result["stocks"] == 1
+    assert result["errors"] == 0
 
 
 def test_quant_sync_stock_universe_uses_liquidity_but_always_keeps_holdings(

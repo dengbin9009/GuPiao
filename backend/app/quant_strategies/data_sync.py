@@ -14,6 +14,7 @@ from ..models import (
     Stock,
     StrategyConfig,
     StrategyDefinition,
+    now,
 )
 from .catalog import DEFAULT_ETF_UNIVERSE, QUANT_STRATEGY_SPECS
 
@@ -469,6 +470,7 @@ def sync_financial_rows(
             if name in row:
                 setattr(snapshot, name, row.get(name))
         snapshot.source = source
+        snapshot.fetched_at = now()
         changed += 1
     db.commit()
     return changed

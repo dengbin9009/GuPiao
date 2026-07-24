@@ -124,6 +124,9 @@ class QuantStockFetchPlan:
     symbol: str
     existing_count: int
     start: str
+    daily_complete: bool = False
+    metric_complete: bool = False
+    financial_complete: bool = False
 
 
 @dataclass(frozen=True)
@@ -406,6 +409,40 @@ def poll_quant_market_data(
                     func.max(MarketDailyBar.trade_date),
                 ).where(MarketDailyBar.stock_id == stock.id)
             ).one()
+            daily_complete = bool(
+                int(existing_count or 0) >= 500
+                and latest_date == end
+                and db.scalar(
+                    select(MarketDailyBar.id).where(
+                        MarketDailyBar.stock_id == stock.id,
+                        MarketDailyBar.trade_date == end,
+                        MarketDailyBar.quality_status == "valid",
+                        MarketDailyBar.adjusted_close.is_not(None),
+                        MarketDailyBar.adjustment_factor.is_not(None),
+                        MarketDailyBar.adjustment_factor > 0,
+                    )
+                )
+                is not None
+            )
+            metric_count, latest_metric_date = db.execute(
+                select(
+                    func.count(MarketDailyMetric.id),
+                    func.max(MarketDailyMetric.trade_date),
+                ).where(MarketDailyMetric.stock_id == stock.id)
+            ).one()
+            metric_complete = bool(
+                int(metric_count or 0) >= 500 and latest_metric_date == end
+            )
+            latest_financial_fetch = db.scalar(
+                select(func.max(FinancialReportSnapshot.fetched_at)).where(
+                    FinancialReportSnapshot.stock_id == stock.id,
+                    FinancialReportSnapshot.available_on <= end,
+                )
+            )
+            financial_complete = bool(
+                latest_financial_fetch
+                and latest_financial_fetch.date() == current.date()
+            )
             start_date = current.date() - timedelta(days=1200)
             if int(existing_count or 0) >= 520 and latest_date:
                 start_date = max(
@@ -420,6 +457,9 @@ def poll_quant_market_data(
                     symbol=stock.symbol,
                     existing_count=int(existing_count or 0),
                     start=start_date.isoformat(),
+                    daily_complete=daily_complete,
+                    metric_complete=metric_complete,
+                    financial_complete=financial_complete,
                 )
             )
 
@@ -433,7 +473,9 @@ def poll_quant_market_data(
             financial = []
             financial_error = None
             try:
-                if plan.existing_count >= 520 and batch_daily is not None:
+                if plan.daily_complete:
+                    daily_source = stock_daily_source.name
+                elif plan.existing_count >= 520 and batch_daily is not None:
                     daily_source = stock_daily_source.name
                     bars = (
                         [batch_daily[plan.symbol]]
@@ -460,7 +502,9 @@ def poll_quant_market_data(
                             start=plan.start,
                             end=end,
                         )
-                if plan.existing_count >= 520 and batch_adjustments is not None:
+                if plan.daily_complete:
+                    pass
+                elif plan.existing_count >= 520 and batch_adjustments is not None:
                     adjustments = (
                         [batch_adjustments[plan.symbol]]
                         if plan.symbol in batch_adjustments
@@ -482,7 +526,9 @@ def poll_quant_market_data(
             except Exception as exc:
                 daily_error = str(exc)[:1000]
             try:
-                if plan.existing_count >= 520 and batch_metrics is not None:
+                if plan.metric_complete:
+                    pass
+                elif plan.existing_count >= 520 and batch_metrics is not None:
                     metrics = (
                         [batch_metrics[plan.symbol]]
                         if plan.symbol in batch_metrics
@@ -499,7 +545,9 @@ def poll_quant_market_data(
             except Exception as exc:
                 metric_error = str(exc)[:1000]
             try:
-                if batch_financial is not None:
+                if plan.financial_complete:
+                    pass
+                elif batch_financial is not None:
                     if batch_financial_error:
                         raise RuntimeError(batch_financial_error)
                     financial = batch_financial.get(plan.symbol, [])
@@ -530,28 +578,31 @@ def poll_quant_market_data(
             try:
                 if payload.daily_error:
                     raise RuntimeError(payload.daily_error)
-                daily_rows += sync_daily_rows(
-                    db,
-                    stock,
-                    payload.bars,
-                    source=str(payload.daily_source),
-                    amount_multiplier=(
-                        1
-                        if batch_daily is not None and plan.existing_count >= 520
-                        else 1000 if payload.daily_source == "tushare" else 1
-                    ),
-                    volume_multiplier=(
-                        1
-                        if batch_daily is not None and plan.existing_count >= 520
-                        else 100 if payload.daily_source == "tushare" else 1
-                    ),
-                )
-                sync_adjustment_rows(
-                    db,
-                    stock,
-                    payload.adjustments,
-                    source=str(payload.daily_source),
-                )
+                if not plan.daily_complete:
+                    daily_rows += sync_daily_rows(
+                        db,
+                        stock,
+                        payload.bars,
+                        source=str(payload.daily_source),
+                        amount_multiplier=(
+                            1
+                            if batch_daily is not None
+                            and plan.existing_count >= 520
+                            else 1000 if payload.daily_source == "tushare" else 1
+                        ),
+                        volume_multiplier=(
+                            1
+                            if batch_daily is not None
+                            and plan.existing_count >= 520
+                            else 100 if payload.daily_source == "tushare" else 1
+                        ),
+                    )
+                    sync_adjustment_rows(
+                        db,
+                        stock,
+                        payload.adjustments,
+                        source=str(payload.daily_source),
+                    )
                 daily_ok = db.scalar(
                     select(MarketDailyBar.id).where(
                         MarketDailyBar.stock_id == stock.id,
@@ -569,7 +620,8 @@ def poll_quant_market_data(
             try:
                 if payload.metric_error:
                     raise RuntimeError(payload.metric_error)
-                sync_metric_rows(db, stock, payload.metrics, source=source.name)
+                if not plan.metric_complete:
+                    sync_metric_rows(db, stock, payload.metrics, source=source.name)
                 metric_ok = db.scalar(
                     select(MarketDailyMetric.id).where(
                         MarketDailyMetric.stock_id == stock.id,
@@ -584,13 +636,14 @@ def poll_quant_market_data(
             try:
                 if payload.financial_error:
                     raise RuntimeError(payload.financial_error)
-                sync_financial_rows(
-                    db,
-                    stock,
-                    payload.financial,
-                    source=source.name,
-                    trading_days=trading_days,
-                )
+                if not plan.financial_complete:
+                    sync_financial_rows(
+                        db,
+                        stock,
+                        payload.financial,
+                        source=source.name,
+                        trading_days=trading_days,
+                    )
                 financial_ok = db.scalar(
                     select(FinancialReportSnapshot.id).where(
                         FinancialReportSnapshot.stock_id == stock.id,
