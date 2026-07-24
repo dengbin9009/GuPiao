@@ -51,12 +51,14 @@ QUANT_STRATEGY_SPECS: dict[str, QuantStrategySpec] = {
         _defaults(min_position_pct=0.02, value_weight=0.25, quality_weight=0.25,
                   momentum_weight=0.30, low_vol_weight=0.20),
         ("daily", "adjustment", "daily_metric", "financial", "events"),
+        version="1.0.1",
     ),
     "relative_strength_rotation": QuantStrategySpec(
         "relative_strength_rotation", "相对强弱轮动", "16:31", "09:36", "weekly",
         "STOCK", 5, 0.70, 0.20,
         _defaults(momentum_12_1_weight=0.60, momentum_6_1_weight=0.40),
         ("daily", "adjustment", "events"),
+        version="1.0.1",
     ),
     "breakout_trend": QuantStrategySpec(
         "breakout_trend", "突破趋势", "16:32", "09:37", "daily",
@@ -64,6 +66,7 @@ QUANT_STRATEGY_SPECS: dict[str, QuantStrategySpec] = {
         _defaults(breakout_days=55, exit_days=20, atr_multiple=3.0,
                   volume_confirmation=1.5),
         ("daily", "adjustment", "events"),
+        version="1.0.1",
     ),
     "short_term_reversal_t1": QuantStrategySpec(
         "short_term_reversal_t1", "短期反转 T+1", "16:33", "09:38", "daily",
@@ -71,18 +74,21 @@ QUANT_STRATEGY_SPECS: dict[str, QuantStrategySpec] = {
         _defaults(one_day_residual=-0.02, five_day_residual=-0.04,
                   benchmark_symbol="000300.SH", holding_days=1),
         ("daily", "adjustment", "events"),
+        version="1.0.1",
     ),
     "low_vol_quality": QuantStrategySpec(
         "low_vol_quality", "低波质量", "16:34", "09:39", "monthly",
         "STOCK", 10, 0.80, 0.15,
         _defaults(quality_weight=0.60, low_vol_weight=0.40),
         ("daily", "adjustment", "financial", "events"),
+        version="1.0.1",
     ),
     "earnings_drift": QuantStrategySpec(
         "earnings_drift", "业绩公告漂移", "16:35", "09:40", "event",
         "STOCK", 10, 0.70, 0.10,
         _defaults(min_sue=1.0, holding_days=20),
         ("daily", "adjustment", "financial", "events"),
+        version="1.0.1",
     ),
     "regime_allocator": QuantStrategySpec(
         "regime_allocator", "市场状态配置", "16:36", "09:41", "weekly",

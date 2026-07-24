@@ -101,6 +101,11 @@ def seed_quant_strategy_runtimes(
             )
             db.add(definition)
             db.flush()
+        else:
+            definition.name = spec.name
+            definition.version = spec.version
+            definition.market = "A_SHARE"
+            definition.enabled = True
 
         config = db.scalar(
             select(StrategyConfig).where(

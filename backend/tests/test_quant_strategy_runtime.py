@@ -62,6 +62,18 @@ def test_quant_strategy_catalog_defines_eight_simulation_strategies():
         "09:42",
     ]
     assert all(spec.simulation_only for spec in QUANT_STRATEGY_SPECS.values())
+    assert {
+        key: spec.version for key, spec in QUANT_STRATEGY_SPECS.items()
+    } == {
+        "multi_factor_core": "1.0.1",
+        "relative_strength_rotation": "1.0.1",
+        "breakout_trend": "1.0.1",
+        "short_term_reversal_t1": "1.0.1",
+        "low_vol_quality": "1.0.1",
+        "earnings_drift": "1.0.1",
+        "regime_allocator": "1.0.0",
+        "risk_parity_overlay": "1.0.0",
+    }
 
 
 def test_quant_runtime_seeds_independent_accounts_and_disabled_schedules(tmp_path: Path):
@@ -172,6 +184,37 @@ def test_quant_runtime_repairs_only_a_missing_account_binding(tmp_path: Path):
                 for config in repaired.values()
             }
         ) == 8
+
+
+def test_quant_runtime_updates_existing_definition_versions_without_resetting_state(
+    tmp_path: Path,
+):
+    database_url = f"sqlite:///{tmp_path / 'quant-version-refresh.db'}"
+    engine = create_engine(database_url)
+    Base.metadata.create_all(engine)
+    settings = Settings(
+        database_url=database_url,
+        live_enabled=False,
+        broker_adapter="simulation",
+    )
+    with Session(engine) as db:
+        seed_database(db, settings)
+        configs = seed_quant_strategy_runtimes(db, settings)
+        config = configs["breakout_trend"]
+        definition = db.get(StrategyDefinition, config.strategy_definition_id)
+        account = db.get(SimulationAccount, config.simulation_account_id)
+        account.cash_balance -= 456
+        definition.version = "0.9.0"
+        db.commit()
+
+        refreshed = seed_quant_strategy_runtimes(db, settings)["breakout_trend"]
+
+        db.refresh(definition)
+        db.refresh(account)
+        assert definition.version == "1.0.1"
+        assert refreshed.id == config.id
+        assert refreshed.simulation_account_id == account.id
+        assert account.cash_balance == INITIAL_CASH - 456
 
 
 def test_quant_audit_models_are_registered():

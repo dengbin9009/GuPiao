@@ -440,3 +440,72 @@ def test_cached_backtest_portfolio_matches_point_in_time_queries(
         )
 
         assert cached == queried
+
+
+def test_backtest_point_in_time_cache_excludes_beijing_exchange_stocks(
+    tmp_path: Path,
+):
+    engine, _config_id, start = setup_backtest_db(tmp_path)
+    as_of = start + timedelta(days=30)
+    with Session(engine) as db:
+        config = db.scalar(
+            select(StrategyConfig)
+            .join(StrategyDefinition)
+            .where(StrategyDefinition.key == "breakout_trend")
+        )
+        definition = db.get(StrategyDefinition, config.strategy_definition_id)
+        beijing = Stock(
+            code="430001",
+            exchange="BSE",
+            symbol="430001.BJ",
+            name="北交所测试股",
+            status="active",
+            instrument_type="STOCK",
+            listing_date="2010-01-01",
+        )
+        db.add(beijing)
+        db.flush()
+        for offset in range(31):
+            day = start + timedelta(days=offset)
+            db.add(
+                MarketDailyBar(
+                    stock_id=beijing.id,
+                    trade_date=day.isoformat(),
+                    open=10,
+                    high=11,
+                    low=9,
+                    close=10,
+                    adjusted_close=10,
+                    adjustment_factor=1,
+                    volume=20_000_000,
+                    amount=300_000_000,
+                    source="point-in-time-test",
+                )
+            )
+        db.commit()
+        stocks = {
+            stock.symbol: stock
+            for stock in db.scalars(
+                select(Stock).where(
+                    Stock.status == "active",
+                    Stock.instrument_type == "STOCK",
+                )
+            )
+        }
+        cache = _PointInTimeCache.load(
+            db,
+            config,
+            definition,
+            end_date=as_of.isoformat(),
+            candidate_stocks=stocks,
+        )
+
+        selected, rejected = cache.universe(
+            config,
+            definition.key,
+            as_of,
+            decision_at=datetime.combine(as_of, time(16, 30)),
+        )
+
+        assert beijing.symbol not in {stock.symbol for stock in selected}
+        assert beijing.symbol not in rejected

@@ -305,6 +305,8 @@ class _PointInTimeCache:
         blocked: dict[str, tuple[str, ...]] = {}
         eligible: list[tuple[Stock, float]] = []
         for stock in self.candidate_stocks:
+            if stock.exchange not in {"SSE", "SZSE"}:
+                continue
             reasons = []
             if "ST" in stock.name.upper():
                 reasons.append("ST股票")
