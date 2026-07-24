@@ -134,3 +134,28 @@
   ]
 }
 ```
+
+```json
+{
+  "run_id": "2026-07-24-independent-strategy-suite",
+  "pattern": "daily-triage",
+  "mode": "manual-approved-fix",
+  "iteration": 5,
+  "items_found": 28,
+  "actions_taken": 28,
+  "same_error_attempt": 0,
+  "escalations": 0,
+  "worktree": ".worktrees/independent-strategy-suite",
+  "safety": "LIVE=false; BROKER=simulation; 八套自动计划默认关闭; 真实订单数为0",
+  "outcome": "done-with-readiness-gates",
+  "evidence": [
+    "Python 3.12 后端全套468 passed；独立策略及相关调度、数据专项185 passed；Ruff与git diff格式检查通过",
+    "Node 20前端行为测试5 passed，Vite生产构建转换1562个模块并成功退出",
+    "隔离SQLite下六个服务进程持续存活，量化Worker启动八条实时任务通道和两条回测通道，后端与前端均返回HTTP 200",
+    "浏览器验证八个独立200万元模拟账户，桌面与移动端无横向溢出、控件越界或控制台错误",
+    "AKShare与Tushare主数据合并及Tushare批量横截面同步已覆盖测试；财务数据权限不足时相关策略失败关闭",
+    "八套策略仍受真实数据、500交易日回测和无下单演练闸门约束；未读取.env、未连接券商、未发送真实订单",
+    "功能保留在专用分支，未commit、push、merge、deploy或重启主目录服务"
+  ]
+}
+```

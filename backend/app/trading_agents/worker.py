@@ -8,10 +8,8 @@ from typing import Any, Callable
 
 from sqlalchemy.orm import Session
 
-from ..config import get_settings
-from ..database import Base, SessionLocal, apply_runtime_migrations, engine
-from ..runtime_bootstrap import seed_strategy_runtimes
-from ..services import seed_database
+from ..database import SessionLocal
+from ..runtime_bootstrap import wait_for_runtime_database
 from .adapter import TradingAgentsAnalyzer
 from .batches import claim_pending_batch, process_batch
 
@@ -44,11 +42,7 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-    Base.metadata.create_all(bind=engine)
-    apply_runtime_migrations()
-    with SessionLocal() as db:
-        seed_database(db, get_settings())
-        seed_strategy_runtimes(db, get_settings())
+    wait_for_runtime_database()
     LOGGER.info("TradingAgents 独立 Worker 已启动")
     while True:
         try:

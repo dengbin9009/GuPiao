@@ -7,8 +7,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import and_, or_, select, update
 
-from .config import get_settings
-from .database import Base, SessionLocal, apply_runtime_migrations, engine
+from .database import SessionLocal
 from .models import (
     ProbabilityPortfolioRun,
     StrategyConfig,
@@ -18,9 +17,9 @@ from .models import (
 )
 from .providers import trading_calendar_service
 from .scheduler import evaluate_schedule
-from .services import execute_simulation_exit, execute_simulation_strategy, seed_database
+from .services import execute_simulation_exit, execute_simulation_strategy
 from .strategy_execution import execute_strategy_trigger
-from .runtime_bootstrap import seed_strategy_runtimes
+from .runtime_bootstrap import wait_for_runtime_database
 
 LOGGER = logging.getLogger("gupiao.scheduler")
 RETRY_DELAY = timedelta(seconds=15)
@@ -40,6 +39,16 @@ def retry_is_due(next_run_at: datetime | None, *, current: datetime) -> bool:
 
 
 def schedule_tolerance_seconds(schedule, config: StrategyConfig) -> int:
+    if schedule.trigger_type in {"quant_signal", "quant_execute"}:
+        run_time = wall_time.fromisoformat(schedule.run_time)
+        deadline = (
+            wall_time(23, 0)
+            if schedule.trigger_type == "quant_signal"
+            else wall_time(10, 0)
+        )
+        run_seconds = run_time.hour * 3600 + run_time.minute * 60 + run_time.second
+        deadline_seconds = deadline.hour * 3600 + deadline.minute * 60
+        return max(59, deadline_seconds - run_seconds)
     if schedule.trigger_type == "agent_analysis":
         run_time = wall_time.fromisoformat(schedule.run_time)
         deadline_text = str((config.parameters or {}).get("analysis_deadline", "14:42"))
@@ -119,24 +128,40 @@ def existing_window_run(
     schedule: StrategySchedule,
     current: datetime,
 ) -> StrategyRun | None:
+    expected_quant_task = {
+        "quant_signal": "signal",
+        "quant_execute": "execute",
+    }.get(schedule.trigger_type)
+
+    def matches_trigger(run: StrategyRun | None) -> bool:
+        if run is None:
+            return False
+        if schedule.trigger_type in {"portfolio_entry", "portfolio_exit"}:
+            return db.scalar(
+                select(ProbabilityPortfolioRun.id).where(
+                    ProbabilityPortfolioRun.strategy_run_id == run.id,
+                    ProbabilityPortfolioRun.trigger_type == schedule.trigger_type,
+                )
+            ) is not None
+        if expected_quant_task:
+            summary = run.summary or {}
+            return bool(
+                summary.get("queued") is True
+                and summary.get("task_type") == expected_quant_task
+                and summary.get("task_id")
+            )
+        return True
+
     target = wall_time.fromisoformat(schedule.run_time)
     window_start = datetime.combine(current.date(), target, tzinfo=current.tzinfo)
     if schedule.last_run_id:
         linked = db.get(StrategyRun, schedule.last_run_id)
-        linked_matches_trigger = True
-        if linked and schedule.trigger_type in {"portfolio_entry", "portfolio_exit"}:
-            linked_matches_trigger = db.scalar(
-                select(ProbabilityPortfolioRun.id).where(
-                    ProbabilityPortfolioRun.strategy_run_id == linked.id,
-                    ProbabilityPortfolioRun.trigger_type == schedule.trigger_type,
-                )
-            ) is not None
         if linked:
             linked_started_at = linked.started_at
             if linked_started_at.tzinfo is None:
                 linked_started_at = linked_started_at.replace(tzinfo=current.tzinfo)
             if (
-                linked_matches_trigger
+                matches_trigger(linked)
                 and window_start <= linked_started_at <= current
                 and not schedule_run_needs_retry(linked)
             ):
@@ -156,7 +181,11 @@ def existing_window_run(
         .order_by(StrategyRun.id.desc())
         .limit(1)
     )
-    if candidate and not schedule_run_needs_retry(candidate):
+    if (
+        candidate
+        and matches_trigger(candidate)
+        and not schedule_run_needs_retry(candidate)
+    ):
         return candidate
     return None
 
@@ -231,6 +260,10 @@ def run_due_schedules(current: datetime | None = None) -> int:
                     config,
                     schedule.trigger_type,
                     current=current,
+                    trading_day_fn=lambda day: calendar.is_trading_day(
+                        day,
+                        allow_weekday_fallback=config.mode != "LIVE",
+                    ),
                     overnight_entry_executor=execute_simulation_strategy,
                     overnight_exit_executor=execute_simulation_exit,
                 )
@@ -272,11 +305,7 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-    Base.metadata.create_all(bind=engine)
-    apply_runtime_migrations()
-    with SessionLocal() as db:
-        seed_database(db, get_settings())
-        seed_strategy_runtimes(db, get_settings())
+    wait_for_runtime_database()
     LOGGER.info("自动调度已启动")
     while True:
         try:

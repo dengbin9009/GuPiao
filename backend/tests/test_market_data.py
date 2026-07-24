@@ -173,6 +173,30 @@ def test_akshare_uses_index_history_for_csi300_benchmark():
     assert [kind for kind, _ in calls] == ["index"]
 
 
+def test_akshare_stock_daily_returns_raw_prices_for_external_adjustment():
+    from app.market_data import AKShareProvider
+
+    calls = []
+
+    class Client:
+        @staticmethod
+        def stock_zh_a_hist(**kwargs):
+            calls.append(kwargs)
+            return [{"日期": "2026-07-22", "收盘": 10}]
+
+    provider = AKShareProvider()
+    provider.client = Client()
+
+    provider.bars(
+        symbol="000001.SZ",
+        timeframe="1d",
+        start="2026-07-01",
+        end="2026-07-22",
+    )
+
+    assert calls[0]["adjust"] == ""
+
+
 def test_tushare_uses_index_daily_for_csi300_benchmark():
     from app.market_data import TushareProvider
 

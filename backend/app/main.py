@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from .config import Settings, get_settings, live_runtime_is_open
 from .database import Base, SessionLocal, apply_runtime_migrations, engine, get_db
-from .data_sync import sync_stock_master
+from .data_sync import sync_stock_master_sources
 from .brokers import build_broker_adapter
 from .live_trading import sync_live_accounts as sync_broker_accounts
 from .market_data import MarketDataError
@@ -29,12 +29,16 @@ from .models import (
     Fill,
     GatewayEvent,
     LiveTradingAccount,
+    MarketDailyBar,
     NotificationChannel,
     NotificationDelivery,
     Order,
     Position,
     ProbabilityCandidateDecision,
     ProbabilityPortfolioRun,
+    QuantCandidateScore,
+    QuantPortfolioDecision,
+    QuantStrategyTask,
     RiskEvent,
     RiskSettings,
     SimulationAccount,
@@ -46,13 +50,16 @@ from .models import (
     StrategyLog,
     StrategyRun,
     StrategySchedule,
+    StrategyPerformanceDaily,
+    StrategyBacktestQualification,
+    StrategyRiskProfile,
     TradingAgentBatch,
     TradingAgentCandidateAnalysis,
     TradingAgentPortfolioDecision,
     WatchlistItem,
     now,
 )
-from .notifications import deliver_channel
+from .notifications import deliver_channel, queue_notifications
 from .worker import poll_corporate_events, poll_watchlist_quotes
 from .providers import market_router, trading_calendar_service
 from .security import create_session, read_session, verify_password
@@ -89,6 +96,15 @@ from .probability_portfolio.runtime import (
     seed_probability_portfolio_runtime,
 )
 from .runtime_bootstrap import seed_strategy_runtimes
+from .quant_strategies.catalog import QUANT_STRATEGY_SPECS, validate_quant_parameters
+from .quant_strategies.execution import execute_quant_rebalance
+from .quant_strategies.readiness import (
+    configuration_fingerprint,
+    quant_strategy_readiness,
+    record_dry_run_approval,
+)
+from .quant_strategies.signals import DataNotReadyError, build_signal_decision
+from .quant_strategies.tasks import enqueue_task
 settings = get_settings()
 
 
@@ -234,6 +250,469 @@ class SimulationAccountCreate(BaseModel):
 class ProbabilityPortfolioConfigUpdate(BaseModel):
     mode: str = "SIMULATION"
     parameters: dict[str, Any] = Field(default_factory=dict)
+
+
+class QuantStrategyConfigUpdate(BaseModel):
+    mode: str = "SIMULATION"
+    parameters: dict[str, Any] = Field(default_factory=dict)
+
+
+class QuantBacktestCreate(BaseModel):
+    start_date: str
+    end_date: str
+
+
+def _quant_strategy_config(db: Session, key: str) -> StrategyConfig:
+    if key not in QUANT_STRATEGY_SPECS:
+        raise HTTPException(status_code=404, detail="独立量化策略不存在")
+    config = db.scalar(
+        select(StrategyConfig)
+        .join(StrategyDefinition)
+        .where(StrategyDefinition.key == key)
+        .limit(1)
+    )
+    if config is None:
+        seed_strategy_runtimes(db, settings)
+        config = db.scalar(
+            select(StrategyConfig)
+            .join(StrategyDefinition)
+            .where(StrategyDefinition.key == key)
+            .limit(1)
+        )
+    if config is None:
+        raise HTTPException(status_code=404, detail="独立量化策略配置不存在")
+    return config
+
+
+def _quant_strategy_payload(db: Session, config: StrategyConfig) -> dict[str, Any]:
+    definition = db.get(StrategyDefinition, config.strategy_definition_id)
+    account = db.get(SimulationAccount, config.simulation_account_id)
+    readiness = quant_strategy_readiness(db, config.id)
+    latest_performance = db.scalar(
+        select(StrategyPerformanceDaily)
+        .where(StrategyPerformanceDaily.strategy_config_id == config.id)
+        .order_by(StrategyPerformanceDaily.trading_date.desc())
+        .limit(1)
+    )
+    schedules = list(
+        db.scalars(
+            select(StrategySchedule).where(
+                StrategySchedule.strategy_config_id == config.id
+            )
+        )
+    )
+    next_run = min(
+        (item.next_run_at for item in schedules if item.next_run_at is not None),
+        default=None,
+    )
+    risk = db.scalar(
+        select(StrategyRiskProfile).where(
+            StrategyRiskProfile.strategy_config_id == config.id
+        )
+    )
+    position_count = db.scalar(
+        select(func.count())
+        .select_from(Position)
+        .where(
+            Position.account_id == config.simulation_account_id,
+            Position.mode == "SIMULATION",
+            Position.quantity > 0,
+        )
+    ) or 0
+    return {
+        **readiness,
+        "name": definition.name,
+        "version": definition.version,
+        "parameters": config.parameters,
+        "account": serialize(account) if account else None,
+        "initial_cash": account.initial_cash if account else None,
+        "total_asset": account.total_asset if account else None,
+        "cumulative_return": (
+            latest_performance.cumulative_return if latest_performance else 0
+        ),
+        "drawdown": latest_performance.drawdown if latest_performance else 0,
+        "exposure": latest_performance.exposure if latest_performance else 0,
+        "next_run_at": next_run.isoformat() if next_run else None,
+        "schedule_times": {
+            item.trigger_type: item.run_time for item in schedules
+        },
+        "position_count": position_count,
+        "consecutive_errors": risk.consecutive_errors if risk else 0,
+    }
+
+
+@app.get("/api/quant-strategies")
+def list_quant_strategies(
+    _: Administrator = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    rows = list(
+        db.scalars(
+            select(StrategyConfig)
+            .join(StrategyDefinition)
+            .where(StrategyDefinition.key.in_(QUANT_STRATEGY_SPECS))
+            .order_by(StrategyDefinition.id)
+        )
+    )
+    return [_quant_strategy_payload(db, item) for item in rows]
+
+
+@app.get("/api/quant-strategies/compare")
+def compare_quant_strategies(
+    _: Administrator = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    return list_quant_strategies(_, db)
+
+
+@app.get("/api/quant-strategies/{key}")
+def get_quant_strategy(
+    key: str,
+    _: Administrator = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    config = _quant_strategy_config(db, key)
+    payload = _quant_strategy_payload(db, config)
+    payload["schedules"] = [
+        serialize(item)
+        for item in db.scalars(
+            select(StrategySchedule).where(
+                StrategySchedule.strategy_config_id == config.id
+            )
+        )
+    ]
+    payload["tasks"] = [
+        serialize(item)
+        for item in db.scalars(
+            select(QuantStrategyTask)
+            .where(QuantStrategyTask.strategy_config_id == config.id)
+            .order_by(QuantStrategyTask.id.desc())
+            .limit(30)
+        )
+    ]
+    payload["decisions"] = [
+        serialize(item)
+        for item in db.scalars(
+            select(QuantPortfolioDecision)
+            .where(QuantPortfolioDecision.strategy_config_id == config.id)
+            .order_by(QuantPortfolioDecision.id.desc())
+            .limit(30)
+        )
+    ]
+    risk = db.scalar(
+        select(StrategyRiskProfile).where(
+            StrategyRiskProfile.strategy_config_id == config.id
+        )
+    )
+    payload["risk"] = serialize(risk) if risk else None
+    payload["performances"] = [
+        serialize(item)
+        for item in db.scalars(
+            select(StrategyPerformanceDaily)
+            .where(StrategyPerformanceDaily.strategy_config_id == config.id)
+            .order_by(StrategyPerformanceDaily.trading_date.desc())
+            .limit(252)
+        )
+    ]
+    payload["qualifications"] = [
+        serialize(item)
+        for item in db.scalars(
+            select(StrategyBacktestQualification)
+            .where(StrategyBacktestQualification.strategy_config_id == config.id)
+            .order_by(StrategyBacktestQualification.id.desc())
+            .limit(20)
+        )
+    ]
+    latest_decision = db.scalar(
+        select(QuantPortfolioDecision)
+        .where(QuantPortfolioDecision.strategy_config_id == config.id)
+        .order_by(QuantPortfolioDecision.id.desc())
+        .limit(1)
+    )
+    payload["latest_candidates"] = []
+    if latest_decision:
+        payload["latest_candidates"] = [
+            serialize(
+                item,
+                symbol=stock.symbol,
+                name=stock.name,
+            )
+            for item, stock in db.execute(
+                select(QuantCandidateScore, Stock)
+                .join(Stock, Stock.id == QuantCandidateScore.stock_id)
+                .where(QuantCandidateScore.decision_id == latest_decision.id)
+                .order_by(QuantCandidateScore.rank, QuantCandidateScore.id)
+            )
+        ]
+    account_id = config.simulation_account_id
+    payload["positions"] = [
+        serialize(item, symbol=stock.symbol, name=stock.name)
+        for item, stock in db.execute(
+            select(Position, Stock)
+            .join(Stock, Stock.id == Position.stock_id)
+            .where(
+                Position.account_id == account_id,
+                Position.mode == "SIMULATION",
+                Position.quantity > 0,
+            )
+            .order_by(Stock.symbol)
+        )
+    ]
+    payload["orders"] = [
+        serialize(item, symbol=stock.symbol, name=stock.name)
+        for item, stock in db.execute(
+            select(Order, Stock)
+            .join(Stock, Stock.id == Order.stock_id)
+            .where(
+                Order.account_id == account_id,
+                Order.mode == "SIMULATION",
+            )
+            .order_by(Order.id.desc())
+            .limit(100)
+        )
+    ]
+    strategy_run_ids = select(StrategyRun.id).where(
+        StrategyRun.strategy_config_id == config.id
+    )
+    payload["risk_events"] = [
+        serialize(item)
+        for item in db.scalars(
+            select(RiskEvent)
+            .where(
+                RiskEvent.mode == "SIMULATION",
+                or_(
+                    RiskEvent.strategy_run_id.in_(strategy_run_ids),
+                    RiskEvent.context["strategy_config_id"].as_integer()
+                    == config.id,
+                ),
+            )
+            .order_by(RiskEvent.id.desc())
+            .limit(100)
+        )
+    ]
+    return payload
+
+
+@app.get("/api/quant-strategies/{key}/readiness")
+def get_quant_strategy_readiness(
+    key: str,
+    _: Administrator = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    return quant_strategy_readiness(db, _quant_strategy_config(db, key).id)
+
+
+@app.put("/api/quant-strategies/{key}")
+def update_quant_strategy(
+    key: str,
+    payload: QuantStrategyConfigUpdate,
+    _: Administrator = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    if payload.mode != "SIMULATION":
+        raise HTTPException(status_code=422, detail="独立量化策略仅支持模拟盘")
+    config = _quant_strategy_config(db, key)
+    try:
+        parameters = validate_quant_parameters(key, payload.parameters)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    config.mode = "SIMULATION"
+    config.parameters = parameters
+    for schedule in db.scalars(
+        select(StrategySchedule).where(
+            StrategySchedule.strategy_config_id == config.id
+        )
+    ):
+        schedule.enabled = False
+        schedule.last_scheduled_for = None
+        schedule.next_run_at = None
+    db.commit()
+    return _quant_strategy_payload(db, config)
+
+
+@app.post("/api/quant-strategies/{key}/backtests", status_code=202)
+def create_quant_backtest(
+    key: str,
+    payload: QuantBacktestCreate,
+    _: Administrator = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    try:
+        parsed_start = date.fromisoformat(payload.start_date)
+        parsed_end = date.fromisoformat(payload.end_date)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="回测日期格式必须为 YYYY-MM-DD") from exc
+    if parsed_start >= parsed_end:
+        raise HTTPException(status_code=422, detail="回测日期范围无效")
+    config = _quant_strategy_config(db, key)
+    definition = db.get(StrategyDefinition, config.strategy_definition_id)
+    fingerprint = configuration_fingerprint(
+        config.parameters or {},
+        simulation_account_id=config.simulation_account_id,
+        strategy_version=definition.version,
+    )
+    data_version = str((config.parameters or {}).get("data_version", "1"))
+    task = enqueue_task(
+        db,
+        config.id,
+        "backtest",
+        payload.end_date,
+        payload={
+            "start_date": payload.start_date,
+            "end_date": payload.end_date,
+            "data_source": "point_in_time_real",
+            "config_fingerprint": fingerprint,
+            "strategy_version": definition.version,
+            "data_version": data_version,
+        },
+        idempotency_suffix=(
+            f"{payload.start_date}-{payload.end_date}-{fingerprint[:16]}-"
+            f"{definition.version}-{data_version}"
+        ),
+    )
+    return {"task_id": task.id, "status": task.status}
+
+
+@app.post("/api/quant-strategies/{key}/dry-run", status_code=202)
+def run_quant_strategy_dry_run(
+    key: str,
+    _: Administrator = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    config = _quant_strategy_config(db, key)
+    current = now()
+    definition = db.get(StrategyDefinition, config.strategy_definition_id)
+    if definition is None or definition.key not in QUANT_STRATEGY_SPECS:
+        raise HTTPException(status_code=404, detail="独立量化策略不存在")
+    cutoff_date = current.date()
+    if (current.hour, current.minute) < (16, 15):
+        cutoff_date = date.fromordinal(cutoff_date.toordinal() - 1)
+    spec = QUANT_STRATEGY_SPECS[definition.key]
+    latest_trade_date = db.scalar(
+        select(func.max(MarketDailyBar.trade_date))
+        .join(Stock, Stock.id == MarketDailyBar.stock_id)
+        .where(
+            Stock.instrument_type == spec.asset_type,
+            MarketDailyBar.trade_date <= cutoff_date.isoformat(),
+            MarketDailyBar.quality_status == "valid",
+            MarketDailyBar.adjusted_close.is_not(None),
+            MarketDailyBar.adjustment_factor.is_not(None),
+            MarketDailyBar.adjustment_factor > 0,
+            ~func.lower(MarketDailyBar.source).like("%demo%"),
+        )
+    )
+    if latest_trade_date is None:
+        raise HTTPException(status_code=409, detail="没有可用于演练的已完成真实日线")
+    try:
+        decision = build_signal_decision(
+            db,
+            config,
+            current=current,
+            as_of=date.fromisoformat(latest_trade_date),
+            decision_type="dry_run",
+        )
+    except DataNotReadyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    run = execute_quant_rebalance(db, decision, current=current, dry_run=True)
+    if run.summary.get("order_ids"):
+        raise HTTPException(status_code=500, detail="无下单演练产生了异常订单")
+    precheck_passed = run.summary.get(
+        "precheck_passed",
+        bool(run.summary.get("accepted")),
+    )
+    if not precheck_passed or run.summary.get("reason"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"无下单演练未通过: {run.summary.get('reason') or '完整预检未通过'}",
+        )
+    record_dry_run_approval(db, config, decision)
+    return {
+        "decision_id": decision.id,
+        "strategy_run_id": run.id,
+        "order_ids": [],
+        "target_weights": decision.target_weights,
+    }
+
+
+@app.post("/api/quant-strategies/{key}/activate")
+def activate_quant_strategy(
+    key: str,
+    _: Administrator = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    config = _quant_strategy_config(db, key)
+    check = quant_strategy_readiness(db, config.id)
+    if check["status"] in {"PAUSED", "FAILED"} and check["ready"]:
+        risk = db.scalar(
+            select(StrategyRiskProfile).where(
+                StrategyRiskProfile.strategy_config_id == config.id
+            )
+        )
+        if risk is not None:
+            risk.emergency_stop_enabled = False
+            risk.consecutive_errors = 0
+            db.flush()
+            check = quant_strategy_readiness(db, config.id)
+    if not check["automation_ready"]:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=f"独立量化策略上线闸门未通过: {', '.join(check['reasons'])}",
+        )
+    schedules = {
+        item.trigger_type: item
+        for item in db.scalars(
+            select(StrategySchedule).where(
+                StrategySchedule.strategy_config_id == config.id
+            )
+        )
+    }
+    schedules["quant_execute"].enabled = True
+    schedules["quant_signal"].enabled = True
+    db.commit()
+    queue_notifications(
+        db,
+        event_type="quant_strategy_activated",
+        severity="info",
+        subject=f"{config.name}已启用",
+        payload={"strategy_key": key, "strategy_config_id": config.id},
+    )
+    return quant_strategy_readiness(db, config.id)
+
+
+@app.post("/api/quant-strategies/{key}/pause")
+def pause_quant_strategy(
+    key: str,
+    _: Administrator = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    config = _quant_strategy_config(db, key)
+    for schedule in db.scalars(
+        select(StrategySchedule).where(
+            StrategySchedule.strategy_config_id == config.id
+        )
+    ):
+        schedule.enabled = False
+        schedule.last_scheduled_for = None
+        schedule.next_run_at = None
+    risk = db.scalar(
+        select(StrategyRiskProfile).where(
+            StrategyRiskProfile.strategy_config_id == config.id
+        )
+    )
+    if risk:
+        risk.emergency_stop_enabled = True
+    db.commit()
+    queue_notifications(
+        db,
+        event_type="quant_strategy_paused",
+        severity="warning",
+        subject=f"{config.name}已暂停",
+        payload={"strategy_key": key, "strategy_config_id": config.id},
+    )
+    result = quant_strategy_readiness(db, config.id)
+    result["status"] = "PAUSED"
+    return result
 
 
 @app.get("/api/health")
@@ -546,11 +1025,16 @@ def refresh_watchlist(_: Administrator = Depends(require_admin), db: Session = D
 @app.post("/api/market-data/stocks/sync")
 def sync_stocks(_: Administrator = Depends(require_admin), db: Session = Depends(get_db)):
     try:
-        provider = market_router().select("stock_master")
-        result = sync_stock_master(db, provider)
+        result = sync_stock_master_sources(db, market_router().providers)
     except MarketDataError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    return {"provider": provider.name, "created": result.created, "updated": result.updated}
+    return {
+        "provider": result.providers[0],
+        "providers": list(result.providers),
+        "failed_providers": sorted(result.failures),
+        "created": result.created,
+        "updated": result.updated,
+    }
 
 
 @app.post("/api/market-data/events/sync")
@@ -988,6 +1472,11 @@ def update_schedule(schedule_id: int, payload: ScheduleUpdate, _: Administrator 
         raise HTTPException(status_code=404, detail="调度不存在")
     config = db.get(StrategyConfig, item.strategy_config_id)
     definition = db.get(StrategyDefinition, config.strategy_definition_id) if config else None
+    if definition and definition.key in QUANT_STRATEGY_SPECS:
+        raise HTTPException(
+            status_code=422,
+            detail="独立量化策略调度只能通过独立量化策略专用接口管理",
+        )
     if definition and definition.key == "trading_agents_auto":
         fixed_times = {"agent_analysis": "13:30", "agent_rebalance": "14:45"}
         requested_trigger = payload.trigger_type or item.trigger_type
@@ -1081,6 +1570,17 @@ def delete_schedule(schedule_id: int, _: Administrator = Depends(require_admin),
     item = db.get(StrategySchedule, schedule_id)
     if not item:
         raise HTTPException(status_code=404, detail="调度不存在")
+    config = db.get(StrategyConfig, item.strategy_config_id)
+    definition = (
+        db.get(StrategyDefinition, config.strategy_definition_id)
+        if config
+        else None
+    )
+    if definition and definition.key in QUANT_STRATEGY_SPECS:
+        raise HTTPException(
+            status_code=422,
+            detail="独立量化策略调度只能通过独立量化策略专用接口管理",
+        )
     db.delete(item)
     db.commit()
 
@@ -1489,11 +1989,16 @@ def market_calendar(
 @app.post("/api/market-data/stock-master/sync")
 def sync_market_stock_master(_: Administrator = Depends(require_admin), db: Session = Depends(get_db)):
     try:
-        provider = market_router().select("stock_master")
-        result = sync_stock_master(db, provider)
+        result = sync_stock_master_sources(db, market_router().providers)
     except MarketDataError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    return {"created": result.created, "updated": result.updated, "provider": provider.name}
+    return {
+        "created": result.created,
+        "updated": result.updated,
+        "provider": result.providers[0],
+        "providers": list(result.providers),
+        "failed_providers": sorted(result.failures),
+    }
 
 
 @app.get("/api/market-data/bars")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -253,4 +254,76 @@ def test_observe_start_script_is_relocatable_and_uses_runtime_bootstrap():
     )
     assert "trap - EXIT INT TERM" in script
     assert "update data_source_states" not in script.lower()
+
+
+def test_background_processes_do_not_compete_for_runtime_bootstrap():
+    root = Path(__file__).resolve().parents[2]
+    process_sources = (
+        root / "backend/app/worker.py",
+        root / "backend/app/scheduler_runner.py",
+        root / "backend/app/trading_agents/worker.py",
+        root / "backend/app/quant_strategies/worker.py",
+    )
+
+    for source_path in process_sources:
+        source = source_path.read_text(encoding="utf-8")
+        assert "Base.metadata.create_all" not in source
+        assert "apply_runtime_migrations()" not in source
+        assert "seed_strategy_runtimes(db" not in source
+        assert "wait_for_runtime_database()" in source
+
+
+def test_background_runtime_waits_for_api_database_without_writing(tmp_path: Path):
+    from app.runtime_bootstrap import wait_for_runtime_database
+    from app.services import seed_database
+
+    database_url = f"sqlite:///{tmp_path / 'wait-for-api.db'}"
+    engine = create_engine(database_url)
+    settings = Settings(
+        database_url=database_url,
+        live_enabled=False,
+        broker_adapter="simulation",
+    )
+    sleeps = []
+
+    def initialize_after_first_poll(seconds: float) -> None:
+        sleeps.append(seconds)
+        Base.metadata.create_all(engine)
+        with Session(engine) as db:
+            seed_database(db, settings)
+
+    wait_for_runtime_database(
+        session_factory=lambda: Session(engine),
+        sleep=initialize_after_first_poll,
+        poll_seconds=0,
+    )
+
+    assert sleeps == [0]
+    with Session(engine) as db:
+        assert db.scalar(select(StrategyConfig.id)) is None
+
+
+def test_local_and_compose_start_workers_only_after_backend_is_healthy():
+    root = Path(__file__).resolve().parents[2]
+    script = (root / "start_tonight_observe.sh").read_text(encoding="utf-8")
+    compose = (root / "docker-compose.yml").read_text(encoding="utf-8")
+
+    health_wait = 'wait_for_http "backend" "http://127.0.0.1:8000/api/health"'
+    assert script.index(health_wait) < script.index(
+        'start_bg "$WORKER_PID_FILE"'
+    )
+    for service in (
+        "worker",
+        "scheduler",
+        "tradingagents-worker",
+        "quant-strategy-worker",
+    ):
+        match = re.search(
+            rf"(?ms)^  {re.escape(service)}:\n(?P<body>.*?)(?=^  \S|\Z)",
+            compose,
+        )
+        assert match is not None
+        section = match.group("body")
+        assert "backend:" in section
+        assert "condition: service_healthy" in section
     assert 'echo "Administrator password: $GENERATED_PASSWORD"' not in script

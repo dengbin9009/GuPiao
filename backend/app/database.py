@@ -129,6 +129,9 @@ def apply_runtime_migrations(
                 "limit_down_price": "FLOAT",
                 "quote_source": "VARCHAR(32)",
                 "factor_updated_at": "DATETIME",
+                "instrument_type": "VARCHAR(16) DEFAULT 'STOCK'",
+                "lot_size": "INTEGER DEFAULT 100",
+                "settlement_days": "INTEGER DEFAULT 1",
             }
             for column, column_type in probability_factor_columns.items():
                 if column not in stock_columns:
@@ -137,6 +140,68 @@ def apply_runtime_migrations(
                             f"ALTER TABLE stocks ADD COLUMN {column} {column_type}"
                         )
                     )
+        if "market_daily_bars" in tables:
+            daily_columns = {
+                row[1]
+                for row in conn.exec_driver_sql(
+                    "PRAGMA table_info(market_daily_bars)"
+                )
+            }
+            quant_daily_columns = {
+                "adjusted_close": "FLOAT",
+                "adjustment_factor": "FLOAT",
+                "quality_status": "VARCHAR(24) DEFAULT 'valid'",
+            }
+            for column, column_type in quant_daily_columns.items():
+                if column not in daily_columns:
+                    conn.execute(
+                        text(
+                            f"ALTER TABLE market_daily_bars "
+                            f"ADD COLUMN {column} {column_type}"
+                        )
+                    )
+        if "quant_strategy_tasks" in tables:
+            task_columns = {
+                row[1]
+                for row in conn.exec_driver_sql(
+                    "PRAGMA table_info(quant_strategy_tasks)"
+                )
+            }
+            if "next_retry_at" not in task_columns:
+                conn.execute(
+                    text(
+                        "ALTER TABLE quant_strategy_tasks "
+                        "ADD COLUMN next_retry_at DATETIME"
+                    )
+                )
+        if "strategy_position_lots" in tables:
+            lot_columns = {
+                row[1]
+                for row in conn.exec_driver_sql(
+                    "PRAGMA table_info(strategy_position_lots)"
+                )
+            }
+            if "metadata" not in lot_columns:
+                conn.execute(
+                    text(
+                        "ALTER TABLE strategy_position_lots "
+                        "ADD COLUMN metadata JSON DEFAULT '{}'"
+                    )
+                )
+        if "quant_portfolio_decisions" in tables:
+            decision_columns = {
+                row[1]
+                for row in conn.exec_driver_sql(
+                    "PRAGMA table_info(quant_portfolio_decisions)"
+                )
+            }
+            if "snapshot" not in decision_columns:
+                conn.execute(
+                    text(
+                        "ALTER TABLE quant_portfolio_decisions "
+                        "ADD COLUMN snapshot JSON DEFAULT '{}'"
+                    )
+                )
         if "trading_agent_batches" in tables:
             batch_columns = {
                 row[1]

@@ -207,7 +207,15 @@ def seed_database(db: Session, settings: Settings) -> None:
             "provider": "akshare",
             "enabled": True,
             "healthy": False,
-            "capabilities": ["stock_master", "daily", "minute", "realtime"],
+            "capabilities": [
+                "stock_master",
+                "daily",
+                "minute",
+                "realtime",
+                "trading_calendar",
+                "etf_master",
+                "etf_daily",
+            ],
             "stale_after_seconds": settings.market_stale_seconds,
             "last_error": "等待首次行情探测",
         },
@@ -215,7 +223,18 @@ def seed_database(db: Session, settings: Settings) -> None:
             "provider": "tushare",
             "enabled": tushare_enabled,
             "healthy": False,
-            "capabilities": ["stock_master", "daily", "minute", "corporate_events"],
+            "capabilities": [
+                "stock_master",
+                "daily",
+                "minute",
+                "trading_calendar",
+                "corporate_events",
+                "adjustment",
+                "daily_metric",
+                "financial",
+                "etf_master",
+                "etf_daily",
+            ],
             "last_error": None if tushare_enabled else "未配置 Tushare Token",
         },
         {
@@ -244,12 +263,21 @@ def seed_database(db: Session, settings: Settings) -> None:
         },
     ]
     for defaults in source_defaults:
-        if not db.scalar(
-            select(DataSourceState.id).where(
+        state = db.scalar(
+            select(DataSourceState).where(
                 DataSourceState.provider == defaults["provider"]
             )
-        ):
+        )
+        if state is None:
             db.add(DataSourceState(**defaults))
+        else:
+            state.capabilities = list(defaults["capabilities"])
+            if "stale_after_seconds" in defaults:
+                state.stale_after_seconds = defaults["stale_after_seconds"]
+            if defaults["provider"] == "tushare" and tushare_enabled:
+                state.enabled = True
+                if state.last_error == "未配置 Tushare Token":
+                    state.last_error = None
 
     if not db.scalar(select(BrokerGateway.id).limit(1)):
         db.add_all(

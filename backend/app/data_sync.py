@@ -7,7 +7,7 @@ from typing import Any, Callable, Iterable
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .market_data import normalize_events
+from .market_data import MarketDataError, normalize_events
 from .models import DataSourceState, Stock, StockEvent, now
 
 
@@ -16,6 +16,14 @@ class SyncResult:
     created: int = 0
     updated: int = 0
     missing: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class MultiSourceSyncResult:
+    created: int = 0
+    updated: int = 0
+    providers: tuple[str, ...] = ()
+    failures: dict[str, str] = field(default_factory=dict)
 
 
 def pinyin_metadata(name: str) -> tuple[str, str]:
@@ -90,6 +98,55 @@ def sync_stock_master(
     _mark_provider(db, provider.name, healthy=True)
     db.commit()
     return SyncResult(created=created, updated=updated)
+
+
+def sync_stock_master_sources(
+    db: Session,
+    providers: Iterable[Any],
+    *,
+    pinyin_resolver: Callable[[str], tuple[str, str]] = pinyin_metadata,
+) -> MultiSourceSyncResult:
+    """Merge every healthy master source so sparse sources cannot hide key fields."""
+    created = 0
+    updated = 0
+    succeeded: list[str] = []
+    failures: dict[str, str] = {}
+    for provider in providers:
+        if "stock_master" not in getattr(provider, "capabilities", {"stock_master"}):
+            continue
+        name = str(getattr(provider, "name", type(provider).__name__))
+        try:
+            healthy, health_error = provider.health()
+        except AttributeError:
+            healthy, health_error = True, None
+        if not healthy:
+            failures[name] = str(health_error or "数据源不健康")
+            continue
+        try:
+            result = sync_stock_master(
+                db,
+                provider,
+                pinyin_resolver=pinyin_resolver,
+            )
+        except Exception as exc:
+            db.rollback()
+            failures[name] = str(exc)[:1000]
+            mark_provider_failure(db, name, exc)
+            continue
+        created += result.created
+        updated += result.updated
+        succeeded.append(name)
+    if not succeeded:
+        detail = "; ".join(
+            f"{name}: {error}" for name, error in failures.items()
+        ) or "没有提供股票主数据能力的数据源"
+        raise MarketDataError(f"股票主数据源不可用: {detail}")
+    return MultiSourceSyncResult(
+        created=created,
+        updated=updated,
+        providers=tuple(succeeded),
+        failures=failures,
+    )
 
 
 def refresh_quotes(db: Session, provider: Any, symbols: list[str]) -> SyncResult:

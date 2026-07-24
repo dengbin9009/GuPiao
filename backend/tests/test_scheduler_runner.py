@@ -225,6 +225,24 @@ def test_probability_entry_schedule_retries_until_1441():
     assert schedule_tolerance_seconds(schedule, config) == 60
 
 
+def test_quant_signal_schedule_can_recover_until_signal_task_deadline():
+    from app.scheduler_runner import schedule_tolerance_seconds
+
+    schedule = SimpleNamespace(trigger_type="quant_signal", run_time="16:30")
+    config = SimpleNamespace(parameters={})
+
+    assert schedule_tolerance_seconds(schedule, config) == 6 * 60 * 60 + 30 * 60
+
+
+def test_quant_execution_schedule_can_recover_until_1000():
+    from app.scheduler_runner import schedule_tolerance_seconds
+
+    schedule = SimpleNamespace(trigger_type="quant_execute", run_time="09:35")
+    config = SimpleNamespace(parameters={})
+
+    assert schedule_tolerance_seconds(schedule, config) == 25 * 60
+
+
 def test_probability_entry_recovery_ignores_same_window_observation(tmp_path: Path):
     from app.probability_portfolio.runtime import seed_probability_portfolio_runtime
     from app.scheduler_runner import existing_window_run
@@ -298,6 +316,54 @@ def test_probability_entry_recovery_ignores_same_window_observation(tmp_path: Pa
         recovered = existing_window_run(db, schedule=schedule, current=current)
         assert recovered is not None
         assert recovered.id == entry.id
+
+
+def test_quant_schedule_recovery_ignores_unrelated_manual_run(tmp_path: Path):
+    from app.quant_strategies.runtime import seed_quant_strategy_runtimes
+    from app.scheduler_runner import existing_window_run
+
+    database_url = f"sqlite:///{tmp_path / 'quant-recovery.db'}"
+    engine = create_engine(database_url)
+    Base.metadata.create_all(engine)
+    current = datetime(2026, 7, 31, 16, 30, 10, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    with Session(engine) as db:
+        settings = Settings(database_url=database_url)
+        seed_database(db, settings)
+        config = seed_quant_strategy_runtimes(db, settings)["multi_factor_core"]
+        schedule = db.scalar(
+            select(StrategySchedule).where(
+                StrategySchedule.strategy_config_id == config.id,
+                StrategySchedule.trigger_type == "quant_signal",
+            )
+        )
+        manual = StrategyRun(
+            strategy_config_id=config.id,
+            mode="SIMULATION",
+            status="completed",
+            started_at=current,
+            finished_at=current,
+            summary={"dry_run": True},
+        )
+        db.add(manual)
+        db.commit()
+
+        assert existing_window_run(db, schedule=schedule, current=current) is None
+
+        queued = StrategyRun(
+            strategy_config_id=config.id,
+            mode="SIMULATION",
+            status="completed",
+            started_at=current,
+            finished_at=current,
+            summary={"queued": True, "task_type": "signal", "task_id": 7},
+        )
+        db.add(queued)
+        db.commit()
+
+        recovered = existing_window_run(db, schedule=schedule, current=current)
+        assert recovered is not None
+        assert recovered.id == queued.id
 
 
 def test_expired_claim_reconciles_completed_run_without_duplicate_order(

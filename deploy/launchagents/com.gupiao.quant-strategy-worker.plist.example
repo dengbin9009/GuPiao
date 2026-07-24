@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.gupiao.quant-strategy-worker</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/ABSOLUTE/PATH/GuPiao/backend/.venv/bin/python</string>
+    <string>-m</string>
+    <string>app.quant_strategies.worker</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/ABSOLUTE/PATH/GuPiao/backend</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>LIVE_TRADING_ENABLED</key><string>false</string>
+    <key>BROKER_ADAPTER</key><string>simulation</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/ABSOLUTE/PATH/GuPiao/backend/.quant-strategy-worker.log</string>
+  <key>StandardErrorPath</key><string>/ABSOLUTE/PATH/GuPiao/backend/.quant-strategy-worker.log</string>
+</dict>
+</plist>

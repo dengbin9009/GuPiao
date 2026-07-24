@@ -2,13 +2,20 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import {
   Activity, Bell, BookOpenCheck, ChevronRight, CircleDollarSign, Database,
-  Gauge, Heart, LayoutDashboard, LogOut, Play, Plus, RefreshCw, Search,
+  Gauge, Heart, LayoutDashboard, LogOut, Pause, Play, Plus, RefreshCw, Search,
   Settings2, ShieldAlert, Trash2, TrendingUp, WalletCards, X
 } from 'lucide-vue-next'
 import {
   createTradingAgentsBatch,
   runProbabilityPortfolioDryRun,
 } from './trading-agents-actions.js'
+import {
+  activateQuantStrategy,
+  pauseQuantStrategy,
+  queueQuantBacktest,
+  runQuantDryRun,
+  saveQuantStrategy,
+} from './quant-strategy-actions.js'
 
 const api = async (path, options = {}) => {
   const response = await fetch(`/api${path}`, {
@@ -70,6 +77,14 @@ const expandedAgentReportId = ref(null)
 const probabilityReadiness = ref(null)
 const probabilityRuns = ref([])
 const selectedProbabilityRun = ref(null)
+const quantStrategies = ref([])
+const selectedQuantStrategy = ref(null)
+const quantForm = reactive({
+  start_date: '2024-01-01',
+  end_date: new Date().toISOString().slice(0, 10),
+})
+const quantParameterDraft = ref({})
+const quantDetailTab = ref('candidates')
 const agentsForm = reactive({
   analysis_profile: 'a_share_balanced', position_mapping: 'fixed_rating',
   quick_model: 'gpt-5.4-mini', deep_model: 'gpt-5.2', prefilter_size: 100,
@@ -103,6 +118,36 @@ const durationText = (start, end) => {
 }
 const activeTitle = computed(() => nav.find(([key]) => key === active.value)?.[1] || '总览')
 const runResult = (run) => run?.summary?.reason || run?.summary?.symbol || run?.error_message || '—'
+const quantStatusText = (status) => ({
+  DATA_PENDING: '数据待就绪', BACKTEST_PENDING: '待回测', DRY_RUN_PENDING: '待演练',
+  READY: '可启用', ACTIVE: '运行中', PAUSED: '已暂停', FAILED: '失败'
+}[status] || status)
+const quantParameterLabel = (name) => ({
+  timezone: '时区', prefilter_size: '预筛数量', min_listing_days: '最短上市天数',
+  min_average_turnover: '最低20日平均成交额', data_version: '数据版本', dry_run: '演练模式',
+  min_position_pct: '最低单股仓位', value_weight: '价值权重', quality_weight: '质量权重',
+  momentum_weight: '动量权重', low_vol_weight: '低波权重', momentum_12_1_weight: '12-1动量权重',
+  momentum_6_1_weight: '6-1动量权重', breakout_days: '突破观察日', exit_days: '低点退出日',
+  atr_multiple: 'ATR退出倍数', volume_confirmation: '成交量确认倍数', one_day_residual: '1日残差门槛',
+  five_day_residual: '5日残差门槛', benchmark_symbol: '基准证券', holding_days: '持有交易日',
+  min_sue: '最低业绩意外值', etf_universe: 'ETF池', lookback_days: '协方差观察日',
+  target_volatility: '目标波动率', min_weight: '最低ETF权重'
+}[name] || name)
+const quantEquityPoints = computed(() => {
+  const rows = [...(selectedQuantStrategy.value?.performances || [])].reverse()
+  if (!rows.length) return ''
+  const width = 760
+  const height = 180
+  const values = rows.map(item => Number(item.total_asset || 0))
+  const minimum = Math.min(...values)
+  const maximum = Math.max(...values)
+  const spread = maximum - minimum || 1
+  return values.map((value, index) => {
+    const x = rows.length === 1 ? width / 2 : index * width / (rows.length - 1)
+    const y = height - ((value - minimum) / spread) * (height - 20) - 10
+    return `${x.toFixed(1)},${y.toFixed(1)}`
+  }).join(' ')
+})
 
 const notify = (message) => {
   toast.value = message
@@ -113,14 +158,15 @@ const loadAll = async () => {
   loading.value = true
   error.value = ''
   try {
-    const [d, w, s, c, sch, r, b, a, o, p, rs, re, g, ds, rt, ch, nd, la, cal, sa, ar, ap, ab, pr, pru] = await Promise.all([
+    const [d, w, s, c, sch, r, b, a, o, p, rs, re, g, ds, rt, ch, nd, la, cal, sa, ar, ap, ab, pr, pru, qs] = await Promise.all([
       api('/dashboard'), api('/watchlist'), api('/strategies'), api('/strategy-configs'),
       api('/strategy-schedules'), api('/strategy-runs'), api('/backtests'), api('/simulation/account'), api('/orders'),
       api('/positions'), api('/risk/settings'), api('/risk/events'), api('/gateways'),
       api('/market-data/sources'), api('/market-data/realtime-status'), api('/notifications/channels'), api('/notifications/deliveries'),
       api('/live/accounts'), api('/market-data/calendar'), api('/simulation/accounts'),
       api('/trading-agents/readiness'), api('/trading-agents/profiles'), api('/trading-agents/batches'),
-      api('/probability-portfolio/readiness'), api('/probability-portfolio/runs')
+      api('/probability-portfolio/readiness'), api('/probability-portfolio/runs'),
+      api('/quant-strategies')
     ])
     dashboard.value = d; watchlist.value = w; strategies.value = s; strategyConfigs.value = c; strategySchedules.value = sch
     runs.value = r; backtests.value = b; account.value = a; orders.value = o; positions.value = p
@@ -131,6 +177,7 @@ const loadAll = async () => {
     marketCalendar.value = cal
     simulationAccounts.value = sa; agentsReadiness.value = ar; agentsProfiles.value = ap; agentsBatches.value = ab
     probabilityReadiness.value = pr; probabilityRuns.value = pru
+    quantStrategies.value = qs
     Object.assign(probabilityForm, pr.parameters || {})
     const agentsConfig = c.find(item => item.strategy_key === 'trading_agents_auto')
     if (agentsConfig) Object.assign(agentsForm, agentsConfig.parameters || {}, { simulation_account_id: agentsConfig.simulation_account_id })
@@ -302,6 +349,67 @@ const runProbabilityDryRun = async () => {
       createDryRun: () => api('/probability-portfolio/dry-run', { method: 'POST', body: '{}' }),
       reload: loadAll,
       selectRun: selectProbabilityRun,
+      notify,
+    })
+  } catch (err) { error.value = err.message }
+}
+
+const selectQuantStrategy = async (key) => {
+  try {
+    selectedQuantStrategy.value = await api(`/quant-strategies/${key}`)
+    quantDetailTab.value = 'candidates'
+    const parameters = selectedQuantStrategy.value.parameters || {}
+    quantParameterDraft.value = Object.fromEntries(
+      Object.entries(parameters).map(([name, value]) => [name, Array.isArray(value) ? value.join(',') : value])
+    )
+  } catch (err) { error.value = err.message }
+}
+
+const quantOperation = async (action, item) => {
+  try {
+    await action({
+      key: item.strategy_key,
+      request: api,
+      reload: loadAll,
+      select: selectQuantStrategy,
+      notify,
+    })
+  } catch (err) { error.value = err.message }
+}
+
+const runQuantBacktest = async (item) => {
+  try {
+    await queueQuantBacktest({
+      key: item.strategy_key,
+      startDate: quantForm.start_date,
+      endDate: quantForm.end_date,
+      request: api,
+      reload: loadAll,
+      select: selectQuantStrategy,
+      notify,
+    })
+  } catch (err) { error.value = err.message }
+}
+
+const saveSelectedQuantStrategy = async () => {
+  const item = selectedQuantStrategy.value
+  if (!item) return
+  try {
+    const parameters = Object.fromEntries(
+      Object.entries(item.parameters || {}).map(([name, original]) => {
+        const value = quantParameterDraft.value[name]
+        if (Array.isArray(original)) return [name, String(value || '').split(',').map(part => part.trim()).filter(Boolean)]
+        if (typeof original === 'number') return [name, Number(value)]
+        if (typeof original === 'boolean') return [name, Boolean(value)]
+        return [name, String(value)]
+      })
+    )
+    await saveQuantStrategy({
+      key: item.strategy_key,
+      parameters,
+      request: api,
+      reload: loadAll,
+      select: selectQuantStrategy,
       notify,
     })
   } catch (err) { error.value = err.message }
@@ -511,7 +619,7 @@ onMounted(async () => {
           <label>仓位占比<input v-model.number="strategyForm.target_position_pct" type="number" min="0.05" max="1" step="0.05" /></label>
           <button class="primary" @click="createStrategyConfig"><Plus :size="15" />创建策略配置</button>
         </section>
-        <section class="strategy-row" v-for="strategy in strategies" :key="strategy.id">
+        <section class="strategy-row" v-for="strategy in strategies.filter(item => !quantStrategies.some(quant => quant.strategy_key === item.key))" :key="strategy.id">
           <div class="strategy-main"><span class="strategy-icon"><TrendingUp :size="21" /></span><div><h2>{{ strategy.name }}</h2><p>{{ strategy.key }} · {{ strategy.version }} · {{ strategy.required_timeframes.join(' / ') }}</p></div></div>
           <div v-if="strategy.key === 'trading_agents_auto'" class="strategy-stats"><span>分析时间<b>13:30</b></span><span>调仓时间<b>14:45</b></span><span>最大持仓<b>5</b></span></div>
           <div v-else-if="strategy.key === 'overnight_probability_portfolio'" class="strategy-stats"><span>模拟买入<b>14:40</b></span><span>次日退出<b>10:30</b></span><span>最大持仓<b>10</b></span></div>
@@ -519,6 +627,28 @@ onMounted(async () => {
           <button v-if="strategy.key === 'trading_agents_auto'" class="primary" :disabled="!agentsReadiness?.ready" @click="runAgentsBatch"><Play :size="17" />创建分析批次</button>
           <button v-else-if="strategy.key === 'overnight_probability_portfolio'" class="primary" @click="runProbabilityDryRun"><Play :size="17" />无下单演练</button>
           <button v-else class="primary" @click="runStrategy"><Play :size="17" />运行模拟</button>
+        </section>
+        <section class="panel quant-suite">
+          <div class="section-head"><div><h2>八套独立量化策略</h2><span>8 个独立 200 万元模拟账户 · 自动计划默认关闭</span></div><span class="tag">总虚拟本金 {{ formatMoney(quantStrategies.reduce((sum, item) => sum + (item.initial_cash || 0), 0)) }}</span></div>
+          <div class="table-wrap"><table><thead><tr><th>策略</th><th>状态</th><th>总资产</th><th>累计收益</th><th>回撤</th><th>仓位</th><th>下一运行</th><th>持仓</th><th>操作</th></tr></thead><tbody>
+            <tr v-for="item in quantStrategies" :key="item.strategy_key" :class="{ selected: selectedQuantStrategy?.strategy_key === item.strategy_key }" @click="selectQuantStrategy(item.strategy_key)"><td><strong>{{ item.name }}</strong><small>{{ item.strategy_key }} · v{{ item.version }}</small></td><td><span :class="['tag', ['FAILED','PAUSED','DATA_PENDING'].includes(item.status) ? 'danger-tag' : '']">{{ quantStatusText(item.status) }}</span><small v-if="item.reasons?.length">{{ item.reasons[0] }}</small><small v-if="item.consecutive_errors">连续错误 {{ item.consecutive_errors }}</small></td><td>{{ formatMoney(item.total_asset) }}</td><td :class="item.cumulative_return >= 0 ? 'positive' : 'negative'">{{ formatPct(item.cumulative_return) }}</td><td :class="item.drawdown < 0 ? 'negative' : ''">{{ formatPct(item.drawdown) }}</td><td>{{ formatPct(item.exposure) }}</td><td><span v-if="item.next_run_at">{{ shortTime(item.next_run_at) }}</span><span v-else>{{ item.schedule_times?.quant_signal }} / {{ item.schedule_times?.quant_execute }}</span></td><td>{{ item.position_count }}</td><td><div class="table-actions"><button class="icon-action" title="真实点时数据回测" @click.stop="runQuantBacktest(item)"><BookOpenCheck :size="15" /></button><button class="icon-action" title="无下单演练" @click.stop="quantOperation(runQuantDryRun, item)"><Gauge :size="15" /></button><button v-if="item.status !== 'ACTIVE'" class="icon-action" title="启用模拟自动计划" :disabled="!item.automation_ready" @click.stop="quantOperation(activateQuantStrategy, item)"><Play :size="15" /></button><button v-else class="icon-action danger-text" title="暂停策略" @click.stop="quantOperation(pauseQuantStrategy, item)"><Pause :size="15" /></button></div></td></tr>
+            <tr v-if="!quantStrategies.length"><td colspan="9" class="empty">独立量化策略尚未初始化</td></tr>
+          </tbody></table></div>
+        </section>
+        <section v-if="selectedQuantStrategy" class="panel quant-detail">
+          <div class="section-head"><div><h2>{{ selectedQuantStrategy.name }}</h2><span>{{ selectedQuantStrategy.strategy_key }} · 账户 #{{ selectedQuantStrategy.simulation_account_id }}</span></div><div class="top-actions"><button class="secondary" @click="runQuantBacktest(selectedQuantStrategy)"><BookOpenCheck :size="15" />回测</button><button class="secondary" @click="quantOperation(runQuantDryRun, selectedQuantStrategy)"><Gauge :size="15" />演练</button><button v-if="selectedQuantStrategy.status !== 'ACTIVE'" class="primary" :disabled="!selectedQuantStrategy.automation_ready" @click="quantOperation(activateQuantStrategy, selectedQuantStrategy)"><Play :size="15" />启用</button><button v-else class="danger-button" @click="quantOperation(pauseQuantStrategy, selectedQuantStrategy)"><Pause :size="15" />暂停</button></div></div>
+          <div class="quant-summary"><span><small>状态</small><b>{{ quantStatusText(selectedQuantStrategy.status) }}</b></span><span><small>总资产</small><b>{{ formatMoney(selectedQuantStrategy.total_asset) }}</b></span><span><small>回测</small><b>{{ selectedQuantStrategy.backtest_qualified ? '已通过' : '未通过' }}</b></span><span><small>演练</small><b>{{ selectedQuantStrategy.dry_run_validated ? '已通过' : '未通过' }}</b></span><span><small>日亏损熔断</small><b>{{ formatPct(selectedQuantStrategy.risk?.daily_loss_limit_pct) }}</b></span><span><small>最大回撤</small><b>{{ formatPct(selectedQuantStrategy.risk?.max_drawdown_pct) }}</b></span></div>
+          <div v-if="selectedQuantStrategy.reasons?.length" class="decision-band"><span><strong>尚未就绪</strong><small>{{ selectedQuantStrategy.reasons.join('；') }}</small></span></div>
+          <div class="quant-config-band"><div class="quant-date-range"><label>回测开始<input v-model="quantForm.start_date" type="date" /></label><label>回测结束<input v-model="quantForm.end_date" type="date" /></label></div><div class="config-grid quant-parameters"><label v-for="(value, name) in selectedQuantStrategy.parameters" :key="name">{{ quantParameterLabel(name) }}<input v-if="typeof value === 'number'" v-model.number="quantParameterDraft[name]" type="number" step="any" /><input v-else-if="Array.isArray(value)" v-model="quantParameterDraft[name]" /><select v-else-if="typeof value === 'boolean'" v-model="quantParameterDraft[name]"><option :value="true">启用</option><option :value="false">关闭</option></select><input v-else v-model="quantParameterDraft[name]" /></label></div><div class="control-row"><span class="muted">保存参数后自动关闭计划，旧回测与演练不再解锁该配置。</span><button class="primary" @click="saveSelectedQuantStrategy"><Settings2 :size="15" />保存参数</button></div></div>
+          <div class="tab-bar"><button :class="{ active: quantDetailTab === 'candidates' }" @click="quantDetailTab='candidates'">候选</button><button :class="{ active: quantDetailTab === 'decisions' }" @click="quantDetailTab='decisions'">决策与风控</button><button :class="{ active: quantDetailTab === 'positions' }" @click="quantDetailTab='positions'">持仓与订单</button><button :class="{ active: quantDetailTab === 'tasks' }" @click="quantDetailTab='tasks'">运行任务</button><button :class="{ active: quantDetailTab === 'backtests' }" @click="quantDetailTab='backtests'">回测资格</button><button :class="{ active: quantDetailTab === 'equity' }" @click="quantDetailTab='equity'">净值</button></div>
+          <div class="quant-tab-content">
+            <section v-if="quantDetailTab === 'candidates'"><div class="table-wrap"><table><thead><tr><th>排名</th><th>证券</th><th>状态</th><th>分数</th><th>目标仓位</th><th>原因</th></tr></thead><tbody><tr v-for="item in selectedQuantStrategy.latest_candidates" :key="item.id"><td>{{ item.rank || '—' }}</td><td><strong>{{ item.name }}</strong><small>{{ item.symbol }}</small></td><td>{{ item.status }}</td><td>{{ item.score == null ? '—' : item.score.toFixed(4) }}</td><td>{{ item.target_weight == null ? '—' : formatPct(item.target_weight) }}</td><td class="reason-cell">{{ item.rejection_reasons?.join('；') || '—' }}</td></tr><tr v-if="!selectedQuantStrategy.latest_candidates?.length"><td colspan="6" class="empty">暂无候选审计</td></tr></tbody></table></div></section>
+            <section v-else-if="quantDetailTab === 'decisions'"><div class="table-wrap"><table><thead><tr><th>交易日</th><th>类型</th><th>状态</th><th>数据截止</th><th>快照哈希</th><th>目标组合</th><th>错误</th></tr></thead><tbody><tr v-for="item in selectedQuantStrategy.decisions" :key="item.id"><td>{{ item.trading_date }}</td><td>{{ item.decision_type }}</td><td>{{ item.status }}</td><td>{{ shortTime(item.data_as_of) }}</td><td class="mono-cell">{{ item.snapshot_sha256?.slice(0, 12) || '—' }}</td><td class="reason-cell">{{ Object.entries(item.target_weights || {}).map(([symbol, weight]) => `${symbol} ${formatPct(weight)}`).join('；') || '空仓' }}</td><td class="reason-cell">{{ item.error_message || '—' }}</td></tr><tr v-if="!selectedQuantStrategy.decisions?.length"><td colspan="7" class="empty">暂无组合决策</td></tr></tbody></table></div><div class="table-wrap"><table><thead><tr><th>时间</th><th>事件</th><th>消息</th><th>关联运行</th></tr></thead><tbody><tr v-for="item in selectedQuantStrategy.risk_events" :key="item.id"><td>{{ shortTime(item.created_at) }}</td><td>{{ item.event_type }}</td><td class="reason-cell">{{ item.message }}</td><td>{{ item.strategy_run_id ? `#${item.strategy_run_id}` : '—' }}</td></tr><tr v-if="!selectedQuantStrategy.risk_events?.length"><td colspan="4" class="empty">暂无风控事件</td></tr></tbody></table></div></section>
+            <section v-else-if="quantDetailTab === 'positions'"><div class="table-wrap"><table><thead><tr><th>证券</th><th>数量</th><th>可卖</th><th>成本</th><th>市值</th><th>浮盈亏</th></tr></thead><tbody><tr v-for="item in selectedQuantStrategy.positions" :key="item.id"><td><strong>{{ item.name }}</strong><small>{{ item.symbol }}</small></td><td>{{ item.quantity }}</td><td>{{ item.available_quantity }}</td><td>{{ item.average_cost?.toFixed(3) }}</td><td>{{ formatMoney(item.market_value) }}</td><td :class="item.unrealized_pnl >= 0 ? 'positive' : 'negative'">{{ formatMoney(item.unrealized_pnl) }}</td></tr><tr v-if="!selectedQuantStrategy.positions?.length"><td colspan="6" class="empty">当前无持仓</td></tr></tbody></table></div><div class="table-wrap"><table><thead><tr><th>订单</th><th>证券</th><th>方向</th><th>数量</th><th>状态</th><th>时间</th></tr></thead><tbody><tr v-for="item in selectedQuantStrategy.orders" :key="item.id"><td>#{{ item.id }}</td><td>{{ item.symbol }}</td><td>{{ item.side }}</td><td>{{ item.quantity }}</td><td>{{ item.status }}</td><td>{{ shortTime(item.created_at) }}</td></tr><tr v-if="!selectedQuantStrategy.orders?.length"><td colspan="6" class="empty">暂无订单</td></tr></tbody></table></div></section>
+            <section v-else-if="quantDetailTab === 'tasks'"><div class="table-wrap"><table><thead><tr><th>类型</th><th>交易日</th><th>状态</th><th>尝试</th><th>错误</th></tr></thead><tbody><tr v-for="item in selectedQuantStrategy.tasks" :key="item.id"><td>{{ item.task_type }}</td><td>{{ item.trading_date }}</td><td><span :class="['tag', item.status === 'failed' ? 'danger-tag' : '']">{{ item.status }}</span></td><td>{{ item.attempts }}</td><td class="reason-cell">{{ item.error_message || '—' }}</td></tr><tr v-if="!selectedQuantStrategy.tasks?.length"><td colspan="5" class="empty">暂无任务</td></tr></tbody></table></div></section>
+            <section v-else-if="quantDetailTab === 'backtests'"><div class="table-wrap"><table><thead><tr><th>交易日</th><th>完整率</th><th>样本外年化</th><th>Sharpe</th><th>最大回撤</th><th>交易数</th><th>结果</th></tr></thead><tbody><tr v-for="item in selectedQuantStrategy.qualifications" :key="item.id"><td>{{ item.trading_days }}</td><td>{{ formatPct(item.data_completeness) }}</td><td>{{ formatPct(item.out_of_sample_annualized_return) }}</td><td>{{ item.sharpe_ratio?.toFixed(3) }}</td><td>{{ formatPct(item.max_drawdown) }}</td><td>{{ item.trade_count }}</td><td><span :class="['tag', item.qualified ? '' : 'danger-tag']">{{ item.qualified ? '通过' : '未通过' }}</span></td></tr><tr v-if="!selectedQuantStrategy.qualifications?.length"><td colspan="7" class="empty">暂无回测资格记录</td></tr></tbody></table></div></section>
+            <section v-else class="equity-panel"><svg v-if="quantEquityPoints" viewBox="0 0 760 180" role="img" aria-label="策略净值曲线"><polyline :points="quantEquityPoints" fill="none" stroke="#1c6d56" stroke-width="3" vector-effect="non-scaling-stroke" /></svg><p v-else class="empty">尚无每日绩效净值</p><div v-if="selectedQuantStrategy.performances?.length" class="equity-axis"><span>{{ selectedQuantStrategy.performances.at(-1)?.trading_date }}</span><strong>{{ formatMoney(selectedQuantStrategy.performances[0]?.total_asset) }}</strong><span>{{ selectedQuantStrategy.performances[0]?.trading_date }}</span></div></section>
+          </div>
         </section>
         <div class="split-grid agents-grid">
           <section class="panel">

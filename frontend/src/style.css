@@ -122,6 +122,28 @@ button.danger-button { background: #bd3d36; border: 1px solid #bd3d36; color: #f
 .decision-band > span:first-child { flex: 1; min-width: 240px; }
 .decision-band small { display: block; margin-top: 4px; color: #7e8a90; font-size: 11px; white-space: normal; }
 .agent-report { margin: 0; max-height: 420px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: #344149; font: 12px/1.65 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.table-actions { display: flex; align-items: center; gap: 6px; min-width: 154px; }
+.table-actions .icon-action { width: 32px; height: 32px; }
+.table-actions .icon-action:disabled { opacity: .42; cursor: default; }
+.quant-suite tbody tr { cursor: pointer; }
+.quant-suite tbody tr.selected { background: #edf5f1; }
+.quant-summary { display: grid; grid-template-columns: repeat(6, minmax(110px, 1fr)); border-bottom: 1px solid #e5eaed; }
+.quant-summary > span { min-height: 68px; padding: 13px 16px; border-right: 1px solid #edf0f2; }
+.quant-summary > span:last-child { border-right: 0; }
+.quant-summary small { display: block; color: #849096; font-size: 10px; }
+.quant-summary b { display: block; margin-top: 7px; font-size: 12px; }
+.quant-config-band { border-bottom: 1px solid #e5eaed; }
+.quant-date-range { display: flex; gap: 12px; padding: 14px 16px 0; }
+.quant-date-range label { width: min(220px, 50%); }
+.quant-parameters { grid-template-columns: repeat(4, minmax(150px, 1fr)); }
+.tab-bar { min-height: 45px; display: flex; align-items: end; gap: 2px; padding: 0 14px; border-bottom: 1px solid #dfe5e8; background: #f8faf9; overflow-x: auto; }
+.tab-bar button { min-height: 44px; padding: 0 14px; border: 0; border-bottom: 2px solid transparent; background: transparent; color: #718087; font-size: 11px; font-weight: 700; white-space: nowrap; }
+.tab-bar button.active { color: #165c48; border-bottom-color: #1c6d56; }
+.quant-tab-content { min-height: 220px; }
+.equity-panel { padding: 18px; }
+.equity-panel svg { display: block; width: 100%; height: 220px; border: 1px solid #e3e8ea; background: #fbfcfc; }
+.equity-axis { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 9px; color: #839097; font-size: 10px; }
+.equity-axis strong { color: #263238; font-size: 12px; }
 .notification-form label:nth-child(3), .notification-form label:nth-child(4) { flex: 1; }
 .risk-banner { min-height: 72px; padding: 0 17px; border-radius: 7px; background: #fff6e5; border: 1px solid #ecd69f; display: flex; align-items: center; justify-content: space-between; }
 .risk-banner > div { display: flex; align-items: center; gap: 12px; color: #725815; }
@@ -139,6 +161,8 @@ button.danger-button { background: #bd3d36; border: 1px solid #bd3d36; color: #f
   .strategy-stats { grid-column: 1 / -1; }
   .form-band { flex-wrap: wrap; }
   .agents-grid { grid-template-columns: 1fr; }
+  .quant-summary { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .quant-parameters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 @media (max-width: 720px) {
@@ -159,6 +183,10 @@ button.danger-button { background: #bd3d36; border: 1px solid #bd3d36; color: #f
   .toolbar-band { align-items: stretch; flex-direction: column; }
   .form-band label { min-width: 0; width: 100%; }
   .config-grid { grid-template-columns: 1fr; }
+  .quant-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .quant-parameters { grid-template-columns: 1fr; }
+  .quant-date-range { flex-direction: column; }
+  .quant-date-range label { width: 100%; }
 }
 
 @media (max-width: 460px) {

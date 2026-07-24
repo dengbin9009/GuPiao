@@ -1,0 +1,67 @@
+openapi: 3.1.0
+info:
+  title: GuPiao 独立量化策略 API
+  version: 1.0.0
+  description: 八套仅模拟盘策略的管理员接口，全部需要管理员会话。
+paths:
+  /api/quant-strategies:
+    get:
+      summary: 查询八套策略的账户、状态、绩效和下一任务
+      responses:
+        '200': {description: 策略运营列表}
+  /api/quant-strategies/compare:
+    get:
+      summary: 横向比较策略净值、收益、回撤和暴露
+      responses:
+        '200': {description: 策略绩效列表}
+  /api/quant-strategies/{key}:
+    get:
+      summary: 查询单套策略配置和运行详情
+      parameters:
+        - {name: key, in: path, required: true, schema: {type: string}}
+      responses:
+        '200': {description: 策略详情}
+        '404': {description: 策略不存在}
+    put:
+      summary: 更新参数；更新后关闭信号计划并使旧演练失效
+      parameters:
+        - {name: key, in: path, required: true, schema: {type: string}}
+      responses:
+        '200': {description: 已保存}
+        '422': {description: 参数或模拟账户无效}
+  /api/quant-strategies/{key}/readiness:
+    get:
+      summary: 查询数据、回测、演练和自动计划就绪状态
+      parameters:
+        - {name: key, in: path, required: true, schema: {type: string}}
+      responses:
+        '200': {description: 就绪状态}
+  /api/quant-strategies/{key}/backtests:
+    post:
+      summary: 创建真实点时数据回测
+      parameters:
+        - {name: key, in: path, required: true, schema: {type: string}}
+      responses:
+        '202': {description: 回测任务已创建}
+  /api/quant-strategies/{key}/dry-run:
+    post:
+      summary: 创建当前配置的无下单演练
+      parameters:
+        - {name: key, in: path, required: true, schema: {type: string}}
+      responses:
+        '202': {description: 演练决策已保存且订单数为零}
+  /api/quant-strategies/{key}/activate:
+    post:
+      summary: 管理员启用模拟计划
+      parameters:
+        - {name: key, in: path, required: true, schema: {type: string}}
+      responses:
+        '200': {description: 策略已启用}
+        '409': {description: 上线闸门未通过}
+  /api/quant-strategies/{key}/pause:
+    post:
+      summary: 暂停对应策略计划
+      parameters:
+        - {name: key, in: path, required: true, schema: {type: string}}
+      responses:
+        '200': {description: 策略已暂停}

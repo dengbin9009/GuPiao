@@ -150,6 +150,17 @@ def _records(frame: Any) -> list[dict[str, Any]]:
     return list(frame)
 
 
+def _date_text(value: Any) -> str:
+    text = str(value or "").strip().replace("/", "-")
+    if len(text) == 8 and text.isdigit():
+        return f"{text[:4]}-{text[4:6]}-{text[6:]}"
+    return text[:10]
+
+
+def _optional_number(value: Any) -> float | None:
+    return float(value) if value not in {None, ""} else None
+
+
 def _normalize_bars(
     rows: list[dict[str, Any]],
     *,
@@ -200,7 +211,15 @@ def _normalize_bars(
 
 class AKShareProvider(MarketDataProvider):
     name = "akshare"
-    capabilities = frozenset({"stock_master", "daily", "minute", "realtime", "trading_calendar"})
+    capabilities = frozenset({
+        "stock_master",
+        "daily",
+        "minute",
+        "realtime",
+        "trading_calendar",
+        "etf_master",
+        "etf_daily",
+    })
 
     def __init__(self):
         try:
@@ -259,7 +278,7 @@ class AKShareProvider(MarketDataProvider):
                         period="daily",
                         start_date=(start or "19900101").replace("-", ""),
                         end_date=(end or datetime.now(SHANGHAI).date().isoformat()).replace("-", ""),
-                        adjust="qfq",
+                        adjust="",
                     )
                 )
         except Exception as exc:
@@ -284,10 +303,80 @@ class AKShareProvider(MarketDataProvider):
             raise MarketDataError(f"AKShare 交易日历获取失败: {exc}") from exc
         return [str(row.get("trade_date")) for row in rows if start <= str(row.get("trade_date")) <= end]
 
+    def etf_master(self) -> list[dict[str, Any]]:
+        if not self.client:
+            raise MarketDataError("AKShare 未安装")
+        try:
+            rows = _records(self.client.fund_etf_spot_em())
+        except Exception as exc:
+            raise MarketDataError(f"AKShare ETF 主数据获取失败: {exc}") from exc
+        result = []
+        for row in rows:
+            code = str(row.get("代码") or row.get("code") or "")
+            name = str(row.get("名称") or row.get("name") or "")
+            if not code or not name:
+                continue
+            suffix = "SH" if code.startswith(("5", "6")) else "SZ"
+            result.append(
+                {
+                    "ts_code": f"{code}.{suffix}",
+                    "name": name,
+                    "instrument_type": "ETF",
+                    "lot_size": 100,
+                    "settlement_days": 1,
+                }
+            )
+        return result
+
+    def etf_bars(
+        self,
+        symbol: str,
+        *,
+        start: str,
+        end: str,
+    ) -> list[dict[str, Any]]:
+        if not self.client:
+            raise MarketDataError("AKShare 未安装")
+        try:
+            rows = _records(
+                self.client.fund_etf_hist_em(
+                    symbol=symbol.split(".")[0],
+                    period="daily",
+                    start_date=start.replace("-", ""),
+                    end_date=end.replace("-", ""),
+                    adjust="",
+                )
+            )
+        except Exception as exc:
+            raise MarketDataError(f"AKShare ETF 日线获取失败: {exc}") from exc
+        return [
+            {
+                "trade_date": _date_text(row.get("日期") or row.get("trade_date")),
+                "open": float(row.get("开盘") or row.get("open") or 0),
+                "high": float(row.get("最高") or row.get("high") or 0),
+                "low": float(row.get("最低") or row.get("low") or 0),
+                "close": float(row.get("收盘") or row.get("close") or 0),
+                "volume": float(row.get("成交量") or row.get("volume") or 0),
+                "amount": float(row.get("成交额") or row.get("amount") or 0),
+            }
+            for row in rows
+        ]
+
 
 class TushareProvider(MarketDataProvider):
     name = "tushare"
-    capabilities = frozenset({"stock_master", "daily", "minute", "trading_calendar", "corporate_events"})
+    capabilities = frozenset({
+        "stock_master",
+        "daily",
+        "minute",
+        "trading_calendar",
+        "corporate_events",
+        "adjustment",
+        "daily_metric",
+        "financial",
+        "etf_master",
+        "etf_daily",
+    })
 
     def __init__(self, token: str):
         self.token = token
@@ -349,6 +438,270 @@ class TushareProvider(MarketDataProvider):
         except Exception as exc:
             raise MarketDataError(f"Tushare 交易日历获取失败: {exc}") from exc
         return [str(row.get("cal_date")) for row in rows]
+
+    def adjustment_factors(
+        self,
+        symbol: str,
+        *,
+        start: str,
+        end: str,
+    ) -> list[dict[str, Any]]:
+        rows = _records(
+            self.client.adj_factor(
+                ts_code=symbol,
+                start_date=start.replace("-", ""),
+                end_date=end.replace("-", ""),
+            )
+        )
+        return [
+            {
+                "trade_date": _date_text(row.get("trade_date")),
+                "adjustment_factor": float(row.get("adj_factor") or 0),
+            }
+            for row in rows
+            if row.get("adj_factor") not in {None, ""}
+        ]
+
+    def daily_cross_section(self, trade_date: str) -> list[dict[str, Any]]:
+        rows = _records(
+            self.client.daily(trade_date=trade_date.replace("-", ""))
+        )
+        return [
+            {
+                "symbol": str(row.get("ts_code") or "").upper(),
+                "trade_date": _date_text(row.get("trade_date")),
+                "open": float(row.get("open") or 0),
+                "high": float(row.get("high") or 0),
+                "low": float(row.get("low") or 0),
+                "close": float(row.get("close") or 0),
+                "volume": float(row.get("vol") or 0) * 100,
+                "amount": float(row.get("amount") or 0) * 1000,
+            }
+            for row in rows
+            if row.get("ts_code") and row.get("close") not in {None, ""}
+        ]
+
+    def adjustment_cross_section(
+        self,
+        trade_date: str,
+    ) -> list[dict[str, Any]]:
+        rows = _records(
+            self.client.adj_factor(trade_date=trade_date.replace("-", ""))
+        )
+        return [
+            {
+                "symbol": str(row.get("ts_code") or "").upper(),
+                "trade_date": _date_text(row.get("trade_date")),
+                "adjustment_factor": float(row.get("adj_factor") or 0),
+            }
+            for row in rows
+            if row.get("ts_code") and row.get("adj_factor") not in {None, ""}
+        ]
+
+    def daily_metrics(
+        self,
+        symbol: str,
+        *,
+        start: str,
+        end: str,
+    ) -> list[dict[str, Any]]:
+        rows = _records(
+            self.client.daily_basic(
+                ts_code=symbol,
+                start_date=start.replace("-", ""),
+                end_date=end.replace("-", ""),
+            )
+        )
+        return [
+            {
+                "trade_date": _date_text(row.get("trade_date")),
+                "pe_ttm": _optional_number(row.get("pe_ttm")),
+                "pb": _optional_number(row.get("pb")),
+                "dividend_yield": (
+                    float(row["dv_ttm"]) / 100
+                    if row.get("dv_ttm") not in {None, ""}
+                    else None
+                ),
+                "total_market_value": (
+                    float(row["total_mv"]) * 10_000
+                    if row.get("total_mv") not in {None, ""}
+                    else None
+                ),
+                "float_market_value": (
+                    float(row["circ_mv"]) * 10_000
+                    if row.get("circ_mv") not in {None, ""}
+                    else None
+                ),
+            }
+            for row in rows
+        ]
+
+    def daily_metric_cross_section(
+        self,
+        trade_date: str,
+    ) -> list[dict[str, Any]]:
+        rows = _records(
+            self.client.daily_basic(
+                ts_code="",
+                trade_date=trade_date.replace("-", ""),
+            )
+        )
+        return [
+            {
+                "symbol": str(row.get("ts_code") or "").upper(),
+                "trade_date": _date_text(row.get("trade_date")),
+                "pe_ttm": _optional_number(row.get("pe_ttm")),
+                "pb": _optional_number(row.get("pb")),
+                "dividend_yield": (
+                    float(row["dv_ttm"]) / 100
+                    if row.get("dv_ttm") not in {None, ""}
+                    else None
+                ),
+                "total_market_value": (
+                    float(row["total_mv"]) * 10_000
+                    if row.get("total_mv") not in {None, ""}
+                    else None
+                ),
+                "float_market_value": (
+                    float(row["circ_mv"]) * 10_000
+                    if row.get("circ_mv") not in {None, ""}
+                    else None
+                ),
+            }
+            for row in rows
+            if row.get("ts_code")
+        ]
+
+    def financial_reports(self, symbol: str) -> list[dict[str, Any]]:
+        indicator = _records(self.client.fina_indicator(ts_code=symbol))
+        cashflow = _records(self.client.cashflow(ts_code=symbol))
+        income = _records(self.client.income(ts_code=symbol))
+        balance = _records(self.client.balancesheet(ts_code=symbol))
+        grouped: dict[tuple[str, str], dict[str, Any]] = {}
+        for rows in (indicator, cashflow, income, balance):
+            for row in rows:
+                period = _date_text(row.get("end_date"))
+                if not period:
+                    continue
+                announcement = _date_text(row.get("f_ann_date") or row.get("ann_date"))
+                if not announcement:
+                    continue
+                value = grouped.setdefault(
+                    (period, announcement),
+                    {
+                        "report_period": period,
+                        "announcement_date": announcement,
+                        "actual_announcement_date": announcement,
+                    },
+                )
+                if announcement:
+                    value["announcement_date"] = announcement
+                    value["actual_announcement_date"] = announcement
+                mappings = {
+                    "eps": ("eps", 1),
+                    "roe": ("roe", 0.01),
+                    "gross_margin": ("grossprofit_margin", 0.01),
+                    "operating_cash_flow": ("n_cashflow_act", 1),
+                    "net_profit": ("n_income", 1),
+                    "revenue": ("revenue", 1),
+                    "total_assets": ("total_assets", 1),
+                    "total_liabilities": ("total_liab", 1),
+                }
+                for target, (source, multiplier) in mappings.items():
+                    if row.get(source) not in {None, ""}:
+                        value[target] = float(row[source]) * multiplier
+        return [
+            value
+            for _, value in sorted(grouped.items())
+            if value.get("actual_announcement_date")
+        ]
+
+    def financial_report_cross_sections(
+        self,
+        periods: Iterable[str],
+    ) -> list[dict[str, Any]]:
+        grouped: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for period in periods:
+            compact_period = str(period).replace("-", "")
+            datasets = (
+                _records(self.client.fina_indicator_vip(period=compact_period)),
+                _records(self.client.cashflow_vip(period=compact_period)),
+                _records(self.client.income_vip(period=compact_period)),
+                _records(self.client.balancesheet_vip(period=compact_period)),
+            )
+            for rows in datasets:
+                for row in rows:
+                    symbol = str(row.get("ts_code") or "").upper()
+                    report_period = _date_text(row.get("end_date"))
+                    announcement = _date_text(
+                        row.get("f_ann_date") or row.get("ann_date")
+                    )
+                    if not symbol or not report_period or not announcement:
+                        continue
+                    value = grouped.setdefault(
+                        (symbol, report_period, announcement),
+                        {
+                            "symbol": symbol,
+                            "report_period": report_period,
+                            "announcement_date": announcement,
+                            "actual_announcement_date": announcement,
+                        },
+                    )
+                    mappings = {
+                        "eps": ("eps", 1),
+                        "roe": ("roe", 0.01),
+                        "gross_margin": ("grossprofit_margin", 0.01),
+                        "operating_cash_flow": ("n_cashflow_act", 1),
+                        "net_profit": ("n_income", 1),
+                        "revenue": ("revenue", 1),
+                        "total_assets": ("total_assets", 1),
+                        "total_liabilities": ("total_liab", 1),
+                    }
+                    for target, (field, multiplier) in mappings.items():
+                        if row.get(field) not in {None, ""}:
+                            value[target] = float(row[field]) * multiplier
+        return [grouped[key] for key in sorted(grouped)]
+
+    def etf_master(self) -> list[dict[str, Any]]:
+        rows = _records(self.client.fund_basic(market="E", status="L"))
+        return [
+            {
+                "ts_code": row.get("ts_code"),
+                "name": row.get("name"),
+                "list_date": row.get("list_date"),
+                "instrument_type": "ETF",
+                "lot_size": 100,
+                "settlement_days": 1,
+            }
+            for row in rows
+        ]
+
+    def etf_bars(
+        self,
+        symbol: str,
+        *,
+        start: str,
+        end: str,
+    ) -> list[dict[str, Any]]:
+        rows = _records(
+            self.client.fund_daily(
+                ts_code=symbol,
+                start_date=start.replace("-", ""),
+                end_date=end.replace("-", ""),
+            )
+        )
+        return [
+            {
+                "trade_date": _date_text(row.get("trade_date")),
+                "open": float(row.get("open") or 0),
+                "high": float(row.get("high") or 0),
+                "low": float(row.get("low") or 0),
+                "close": float(row.get("close") or 0),
+                "volume": float(row.get("vol") or 0) * 100,
+                "amount": float(row.get("amount") or 0) * 1000,
+            }
+            for row in rows
+        ]
 
 
 class MootdxProvider(MarketDataProvider):

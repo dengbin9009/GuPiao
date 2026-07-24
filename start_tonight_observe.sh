@@ -11,11 +11,13 @@ BACKEND_LOG="$BACKEND_DIR/.uvicorn.log"
 WORKER_LOG="$BACKEND_DIR/.worker.log"
 SCHEDULER_LOG="$BACKEND_DIR/.scheduler.log"
 TRADING_AGENTS_LOG="$BACKEND_DIR/.tradingagents-worker.log"
+QUANT_STRATEGY_LOG="$BACKEND_DIR/.quant-strategy-worker.log"
 FRONTEND_LOG="$FRONTEND_DIR/.vite.log"
 BACKEND_PID_FILE="$RUN_DIR/backend.pid"
 WORKER_PID_FILE="$RUN_DIR/worker.pid"
 SCHEDULER_PID_FILE="$RUN_DIR/scheduler.pid"
 TRADING_AGENTS_PID_FILE="$RUN_DIR/tradingagents-worker.pid"
+QUANT_STRATEGY_PID_FILE="$RUN_DIR/quant-strategy-worker.pid"
 FRONTEND_PID_FILE="$RUN_DIR/frontend.pid"
 
 PYTHON_BIN="${GUPIAO_PYTHON_BIN:-$BACKEND_DIR/.venv/bin/python}"
@@ -166,6 +168,7 @@ stop_managed_pid "$BACKEND_PID_FILE" "$BACKEND_DIR"
 stop_managed_pid "$WORKER_PID_FILE" "$BACKEND_DIR"
 stop_managed_pid "$SCHEDULER_PID_FILE" "$BACKEND_DIR"
 stop_managed_pid "$TRADING_AGENTS_PID_FILE" "$BACKEND_DIR"
+stop_managed_pid "$QUANT_STRATEGY_PID_FILE" "$BACKEND_DIR"
 stop_managed_pid "$FRONTEND_PID_FILE" "$FRONTEND_DIR"
 
 cd "$BACKEND_DIR"
@@ -182,6 +185,8 @@ start_bg() {
 }
 
 STARTED_PIDS=()
+STARTED_NAMES=()
+STARTED_LOGS=()
 cleanup_started() {
   local pid
   for pid in "${STARTED_PIDS[@]}"; do
@@ -190,20 +195,15 @@ cleanup_started() {
 }
 trap cleanup_started EXIT INT TERM
 
-cd "$BACKEND_DIR"
-start_bg "$BACKEND_PID_FILE" "$BACKEND_LOG" "$PYTHON_BIN" -m uvicorn app.main:app --host 127.0.0.1 --port 8000
-BACKEND_PID=$LAST_PID
-start_bg "$WORKER_PID_FILE" "$WORKER_LOG" "$PYTHON_BIN" -m app.worker
-WORKER_PID=$LAST_PID
-start_bg "$SCHEDULER_PID_FILE" "$SCHEDULER_LOG" "$PYTHON_BIN" -m app.scheduler_runner
-SCHEDULER_PID=$LAST_PID
-start_bg "$TRADING_AGENTS_PID_FILE" "$TRADING_AGENTS_LOG" "$PYTHON_BIN" -m app.trading_agents.worker
-TRADING_AGENTS_PID=$LAST_PID
-
-cd "$FRONTEND_DIR"
-PATH="$NODE_BIN:$PATH"
-start_bg "$FRONTEND_PID_FILE" "$FRONTEND_LOG" npm run dev -- --host 127.0.0.1 --port 5173 --strictPort
-FRONTEND_PID=$LAST_PID
+assert_started_processes() {
+  local index
+  for index in "${!STARTED_PIDS[@]}"; do
+    if ! kill -0 "${STARTED_PIDS[$index]}" 2>/dev/null; then
+      echo "${STARTED_NAMES[$index]} failed to start; inspect ${STARTED_LOGS[$index]}"
+      return 1
+    fi
+  done
+}
 
 wait_for_http() {
   local name="$1"
@@ -212,13 +212,7 @@ wait_for_http() {
   local started_at=$SECONDS
 
   while ! /usr/bin/curl -fsS "$url" >/dev/null 2>&1; do
-    for process in "backend:$BACKEND_PID:$BACKEND_LOG" "worker:$WORKER_PID:$WORKER_LOG" "scheduler:$SCHEDULER_PID:$SCHEDULER_LOG" "tradingagents-worker:$TRADING_AGENTS_PID:$TRADING_AGENTS_LOG" "frontend:$FRONTEND_PID:$FRONTEND_LOG"; do
-      IFS=: read -r process_name pid log_file <<< "$process"
-      if ! kill -0 "$pid" 2>/dev/null; then
-        echo "$process_name failed to start; inspect $log_file"
-        return 1
-      fi
-    done
+    assert_started_processes
     if [ $((SECONDS - started_at)) -ge "$timeout_seconds" ]; then
       echo "$name did not become ready within ${timeout_seconds}s: $url"
       return 1
@@ -227,8 +221,38 @@ wait_for_http() {
   done
 }
 
+cd "$BACKEND_DIR"
+start_bg "$BACKEND_PID_FILE" "$BACKEND_LOG" "$PYTHON_BIN" -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+BACKEND_PID=$LAST_PID
+STARTED_NAMES+=("backend")
+STARTED_LOGS+=("$BACKEND_LOG")
+
 STARTUP_TIMEOUT_SECONDS="${GUPIAO_STARTUP_TIMEOUT_SECONDS:-45}"
 wait_for_http "backend" "http://127.0.0.1:8000/api/health" "$STARTUP_TIMEOUT_SECONDS"
+
+start_bg "$WORKER_PID_FILE" "$WORKER_LOG" "$PYTHON_BIN" -m app.worker
+WORKER_PID=$LAST_PID
+STARTED_NAMES+=("worker")
+STARTED_LOGS+=("$WORKER_LOG")
+start_bg "$SCHEDULER_PID_FILE" "$SCHEDULER_LOG" "$PYTHON_BIN" -m app.scheduler_runner
+SCHEDULER_PID=$LAST_PID
+STARTED_NAMES+=("scheduler")
+STARTED_LOGS+=("$SCHEDULER_LOG")
+start_bg "$TRADING_AGENTS_PID_FILE" "$TRADING_AGENTS_LOG" "$PYTHON_BIN" -m app.trading_agents.worker
+TRADING_AGENTS_PID=$LAST_PID
+STARTED_NAMES+=("tradingagents-worker")
+STARTED_LOGS+=("$TRADING_AGENTS_LOG")
+start_bg "$QUANT_STRATEGY_PID_FILE" "$QUANT_STRATEGY_LOG" "$PYTHON_BIN" -m app.quant_strategies.worker
+QUANT_STRATEGY_PID=$LAST_PID
+STARTED_NAMES+=("quant-strategy-worker")
+STARTED_LOGS+=("$QUANT_STRATEGY_LOG")
+
+cd "$FRONTEND_DIR"
+PATH="$NODE_BIN:$PATH"
+start_bg "$FRONTEND_PID_FILE" "$FRONTEND_LOG" npm run dev -- --host 127.0.0.1 --port 5173 --strictPort
+FRONTEND_PID=$LAST_PID
+STARTED_NAMES+=("frontend")
+STARTED_LOGS+=("$FRONTEND_LOG")
 wait_for_http "frontend" "http://127.0.0.1:5173" "$STARTUP_TIMEOUT_SECONDS"
 
 if [ "${GUPIAO_ATTACHED:-false}" = "true" ]; then
@@ -236,7 +260,7 @@ if [ "${GUPIAO_ATTACHED:-false}" = "true" ]; then
   VERIFIED=false
   ATTACHED_STARTED_AT=$SECONDS
   while true; do
-    for process in "backend:$BACKEND_PID:$BACKEND_LOG" "worker:$WORKER_PID:$WORKER_LOG" "scheduler:$SCHEDULER_PID:$SCHEDULER_LOG" "tradingagents-worker:$TRADING_AGENTS_PID:$TRADING_AGENTS_LOG" "frontend:$FRONTEND_PID:$FRONTEND_LOG"; do
+    for process in "backend:$BACKEND_PID:$BACKEND_LOG" "worker:$WORKER_PID:$WORKER_LOG" "scheduler:$SCHEDULER_PID:$SCHEDULER_LOG" "tradingagents-worker:$TRADING_AGENTS_PID:$TRADING_AGENTS_LOG" "quant-strategy-worker:$QUANT_STRATEGY_PID:$QUANT_STRATEGY_LOG" "frontend:$FRONTEND_PID:$FRONTEND_LOG"; do
       IFS=: read -r name pid log_file <<< "$process"
       if ! kill -0 "$pid" 2>/dev/null; then
         echo "$name stopped; inspect $log_file"
@@ -259,6 +283,7 @@ echo "Backend PID:   $BACKEND_PID"
 echo "Worker PID:    $WORKER_PID"
 echo "Scheduler PID: $SCHEDULER_PID"
 echo "Agents PID:    $TRADING_AGENTS_PID"
+echo "Quant PID:     $QUANT_STRATEGY_PID"
 echo "Frontend PID:  $FRONTEND_PID"
 
 echo
@@ -267,6 +292,7 @@ echo "  $BACKEND_LOG"
 echo "  $WORKER_LOG"
 echo "  $SCHEDULER_LOG"
 echo "  $TRADING_AGENTS_LOG"
+echo "  $QUANT_STRATEGY_LOG"
 echo "  $FRONTEND_LOG"
 
 echo

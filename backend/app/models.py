@@ -40,6 +40,9 @@ class Stock(Base, TimestampMixin):
     pinyin: Mapped[str] = mapped_column(String(128), default="")
     pinyin_initials: Mapped[str] = mapped_column(String(32), default="", index=True)
     status: Mapped[str] = mapped_column(String(24), default="active")
+    instrument_type: Mapped[str] = mapped_column(String(16), default="STOCK")
+    lot_size: Mapped[int] = mapped_column(Integer, default=100)
+    settlement_days: Mapped[int] = mapped_column(Integer, default=1)
     listing_date: Mapped[str | None] = mapped_column(String(10))
     float_shares: Mapped[float | None] = mapped_column(Float)
     last_price: Mapped[float | None] = mapped_column(Float)
@@ -88,8 +91,50 @@ class MarketDailyBar(Base):
     close: Mapped[float] = mapped_column(Float)
     volume: Mapped[float] = mapped_column(Float, default=0)
     amount: Mapped[float] = mapped_column(Float, default=0)
+    adjusted_close: Mapped[float | None] = mapped_column(Float)
+    adjustment_factor: Mapped[float | None] = mapped_column(Float)
+    quality_status: Mapped[str] = mapped_column(String(24), default="valid")
     source: Mapped[str] = mapped_column(String(32))
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class MarketDailyMetric(Base):
+    __tablename__ = "market_daily_metrics"
+    __table_args__ = (UniqueConstraint("stock_id", "trade_date"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    stock_id: Mapped[int] = mapped_column(ForeignKey("stocks.id"), index=True)
+    trade_date: Mapped[str] = mapped_column(String(10), index=True)
+    pe_ttm: Mapped[float | None] = mapped_column(Float)
+    pb: Mapped[float | None] = mapped_column(Float)
+    dividend_yield: Mapped[float | None] = mapped_column(Float)
+    total_market_value: Mapped[float | None] = mapped_column(Float)
+    float_market_value: Mapped[float | None] = mapped_column(Float)
+    source: Mapped[str] = mapped_column(String(32))
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class FinancialReportSnapshot(Base):
+    __tablename__ = "financial_report_snapshots"
+    __table_args__ = (
+        UniqueConstraint("stock_id", "report_period", "actual_announcement_date"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    stock_id: Mapped[int] = mapped_column(ForeignKey("stocks.id"), index=True)
+    report_period: Mapped[str] = mapped_column(String(10), index=True)
+    report_type: Mapped[str] = mapped_column(String(24), default="quarterly")
+    announcement_date: Mapped[str] = mapped_column(String(10), index=True)
+    actual_announcement_date: Mapped[str] = mapped_column(String(10), index=True)
+    available_on: Mapped[str] = mapped_column(String(10), index=True)
+    eps: Mapped[float | None] = mapped_column(Float)
+    roe: Mapped[float | None] = mapped_column(Float)
+    gross_margin: Mapped[float | None] = mapped_column(Float)
+    operating_cash_flow: Mapped[float | None] = mapped_column(Float)
+    net_profit: Mapped[float | None] = mapped_column(Float)
+    revenue: Mapped[float | None] = mapped_column(Float)
+    total_assets: Mapped[float | None] = mapped_column(Float)
+    total_liabilities: Mapped[float | None] = mapped_column(Float)
+    source: Mapped[str] = mapped_column(String(32))
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
 class WatchlistItem(Base):
@@ -361,10 +406,167 @@ class StrategyPositionLot(Base):
     status: Mapped[str] = mapped_column(String(24), default="open")
     last_exit_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     close_order_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
+    strategy_metadata: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSON, default=dict
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=now, onupdate=now
     )
+
+
+class QuantStrategyTask(Base, TimestampMixin):
+    __tablename__ = "quant_strategy_tasks"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    strategy_config_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_configs.id"), index=True
+    )
+    simulation_account_id: Mapped[int] = mapped_column(
+        ForeignKey("simulation_accounts.id"), index=True
+    )
+    task_type: Mapped[str] = mapped_column(String(32), index=True)
+    trading_date: Mapped[str] = mapped_column(String(10), index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(160), unique=True, index=True)
+    status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    result: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    worker_id: Mapped[str | None] = mapped_column(String(128))
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3)
+    deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error_message: Mapped[str | None] = mapped_column(Text)
+
+
+class QuantPortfolioDecision(Base):
+    __tablename__ = "quant_portfolio_decisions"
+    __table_args__ = (
+        UniqueConstraint(
+            "strategy_config_id",
+            "trading_date",
+            "decision_type",
+            "config_fingerprint",
+        ),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    strategy_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("strategy_runs.id"), unique=True, index=True
+    )
+    strategy_config_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_configs.id"), index=True
+    )
+    simulation_account_id: Mapped[int] = mapped_column(
+        ForeignKey("simulation_accounts.id"), index=True
+    )
+    trading_date: Mapped[str] = mapped_column(String(10), index=True)
+    decision_type: Mapped[str] = mapped_column(String(24), default="signal")
+    status: Mapped[str] = mapped_column(String(24), default="pending")
+    data_as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    snapshot_sha256: Mapped[str | None] = mapped_column(String(64), index=True)
+    snapshot_payload: Mapped[dict[str, Any]] = mapped_column(
+        "snapshot", JSON, default=dict
+    )
+    config_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    strategy_version: Mapped[str] = mapped_column(String(32))
+    data_version: Mapped[str] = mapped_column(String(32), default="1")
+    target_weights: Mapped[dict[str, float]] = mapped_column(JSON, default=dict)
+    order_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class QuantCandidateScore(Base):
+    __tablename__ = "quant_candidate_scores"
+    __table_args__ = (UniqueConstraint("decision_id", "stock_id"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    decision_id: Mapped[int] = mapped_column(
+        ForeignKey("quant_portfolio_decisions.id"), index=True
+    )
+    stock_id: Mapped[int] = mapped_column(ForeignKey("stocks.id"), index=True)
+    status: Mapped[str] = mapped_column(String(24), default="rejected")
+    rank: Mapped[int | None] = mapped_column(Integer)
+    features: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    score: Mapped[float | None] = mapped_column(Float)
+    target_weight: Mapped[float | None] = mapped_column(Float)
+    rejection_reasons: Mapped[list[str]] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class StrategyRiskProfile(Base, TimestampMixin):
+    __tablename__ = "strategy_risk_profiles"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    strategy_config_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_configs.id"), unique=True, index=True
+    )
+    daily_loss_limit_pct: Mapped[float] = mapped_column(Float, default=0.02)
+    max_drawdown_pct: Mapped[float] = mapped_column(Float, default=0.15)
+    max_consecutive_errors: Mapped[int] = mapped_column(Integer, default=3)
+    max_daily_orders: Mapped[int] = mapped_column(Integer, default=30)
+    max_order_notional_pct: Mapped[float] = mapped_column(Float, default=0.35)
+    emergency_stop_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    consecutive_errors: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class StrategyPerformanceDaily(Base):
+    __tablename__ = "strategy_performance_daily"
+    __table_args__ = (UniqueConstraint("strategy_config_id", "trading_date"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    strategy_config_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_configs.id"), index=True
+    )
+    simulation_account_id: Mapped[int] = mapped_column(
+        ForeignKey("simulation_accounts.id"), index=True
+    )
+    trading_date: Mapped[str] = mapped_column(String(10), index=True)
+    cash_balance: Mapped[float] = mapped_column(Float)
+    market_value: Mapped[float] = mapped_column(Float)
+    total_asset: Mapped[float] = mapped_column(Float)
+    daily_return: Mapped[float] = mapped_column(Float, default=0)
+    cumulative_return: Mapped[float] = mapped_column(Float, default=0)
+    drawdown: Mapped[float] = mapped_column(Float, default=0)
+    exposure: Mapped[float] = mapped_column(Float, default=0)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class StrategyBacktestQualification(Base):
+    __tablename__ = "strategy_backtest_qualifications"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    strategy_config_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_configs.id"), index=True
+    )
+    backtest_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("backtest_runs.id"), index=True
+    )
+    config_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    strategy_version: Mapped[str] = mapped_column(String(32))
+    data_version: Mapped[str] = mapped_column(String(32), default="1")
+    trading_days: Mapped[int] = mapped_column(Integer)
+    data_completeness: Mapped[float] = mapped_column(Float)
+    out_of_sample_annualized_return: Mapped[float] = mapped_column(Float)
+    sharpe_ratio: Mapped[float] = mapped_column(Float)
+    max_drawdown: Mapped[float] = mapped_column(Float)
+    trade_count: Mapped[int] = mapped_column(Integer)
+    qualified: Mapped[bool] = mapped_column(Boolean, default=False)
+    evaluated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class StrategyDryRunApproval(Base):
+    __tablename__ = "strategy_dry_run_approvals"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    strategy_config_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_configs.id"), index=True
+    )
+    decision_id: Mapped[int] = mapped_column(
+        ForeignKey("quant_portfolio_decisions.id"), unique=True
+    )
+    config_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    strategy_version: Mapped[str] = mapped_column(String(32))
+    data_version: Mapped[str] = mapped_column(String(32), default="1")
+    validated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
 class BacktestRun(Base, TimestampMixin):

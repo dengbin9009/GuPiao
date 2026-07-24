@@ -12,6 +12,7 @@ from app.database import Base
 from app.models import (
     DataSourceState,
     Position,
+    QuantPortfolioDecision,
     SimulationAccount,
     Stock,
     StockEvent,
@@ -709,6 +710,84 @@ def test_worker_exit_poll_refreshes_only_open_position_symbols(tmp_path: Path):
 
     assert requested == ["000001.SZ"]
     assert result == {"updated": 1, "missing": 0, "errors": 0}
+
+
+def test_worker_quant_execution_poll_refreshes_holdings_and_pending_targets(
+    tmp_path: Path,
+):
+    from app.quant_strategies.readiness import configuration_fingerprint
+    from app.quant_strategies.runtime import seed_quant_strategy_runtimes
+    from app.worker import poll_quant_execution_quotes
+
+    engine = make_db(tmp_path)
+    requested = []
+    current = datetime(2026, 7, 27, 9, 35, tzinfo=ZoneInfo("Asia/Shanghai"))
+    with Session(engine) as db:
+        settings = Settings(
+            database_url=f"sqlite:///{tmp_path / 'poll.db'}",
+            live_enabled=False,
+            broker_adapter="simulation",
+        )
+        seed_database(db, settings)
+        configs = seed_quant_strategy_runtimes(db, settings)
+        config = configs["multi_factor_core"]
+        definition = db.get(StrategyDefinition, config.strategy_definition_id)
+        held = db.scalar(select(Stock).where(Stock.symbol == "000001.SZ"))
+        target = db.scalar(select(Stock).where(Stock.symbol == "000858.SZ"))
+        db.add(
+            Position(
+                account_id=config.simulation_account_id,
+                mode="SIMULATION",
+                stock_id=held.id,
+                quantity=100,
+                available_quantity=100,
+                average_cost=10,
+                market_value=1000,
+            )
+        )
+        db.add(
+            QuantPortfolioDecision(
+                strategy_config_id=config.id,
+                simulation_account_id=config.simulation_account_id,
+                trading_date="2026-07-24",
+                decision_type="signal",
+                status="ready",
+                data_as_of=current,
+                config_fingerprint=configuration_fingerprint(
+                    config.parameters,
+                    simulation_account_id=config.simulation_account_id,
+                    strategy_version=definition.version,
+                ),
+                strategy_version=definition.version,
+                data_version="1",
+                target_weights={target.symbol: 0.10},
+            )
+        )
+        db.commit()
+
+    class QuoteProvider:
+        name = "mootdx"
+
+        def quotes(self, symbols):
+            requested.extend(symbols)
+            return [
+                {
+                    "代码": symbol.split(".")[0],
+                    "最新价": 10.1,
+                    "涨跌幅": 1.0,
+                    "成交额": 100_000_000,
+                }
+                for symbol in symbols
+            ]
+
+    result = poll_quant_execution_quotes(
+        provider=QuoteProvider(),
+        session_factory=lambda: Session(engine),
+        current=current,
+    )
+
+    assert requested == ["000001.SZ", "000858.SZ"]
+    assert result == {"updated": 2, "missing": 0, "errors": 0}
 
 
 def test_worker_quote_failure_rolls_back_before_marking_provider(tmp_path: Path):

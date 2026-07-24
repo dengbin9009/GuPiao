@@ -181,3 +181,93 @@ def test_probability_portfolio_mysql_migration_contains_all_new_tables_and_colum
     ):
         assert f"ADD COLUMN {column}" in migration
     assert "config_fingerprint VARCHAR(64)" in migration
+
+
+def test_runtime_migration_adds_independent_strategy_columns(tmp_path):
+    from sqlalchemy import text
+
+    from app.database import apply_runtime_migrations, create_database_engine
+
+    database_url = f"sqlite:///{tmp_path / 'legacy-quant.db'}"
+    engine = create_database_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE stocks ("
+                "id INTEGER PRIMARY KEY, "
+                "symbol VARCHAR(24)"
+                ")"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE TABLE market_daily_bars ("
+                "id INTEGER PRIMARY KEY, "
+                "stock_id INTEGER, "
+                "trade_date VARCHAR(10), "
+                "close FLOAT"
+                ")"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE TABLE quant_strategy_tasks ("
+                "id INTEGER PRIMARY KEY, "
+                "status VARCHAR(24), "
+                "lease_until DATETIME"
+                ")"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE TABLE quant_portfolio_decisions ("
+                "id INTEGER PRIMARY KEY, "
+                "snapshot_sha256 VARCHAR(64)"
+                ")"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE TABLE strategy_position_lots ("
+                "id INTEGER PRIMARY KEY, "
+                "status VARCHAR(24)"
+                ")"
+            )
+        )
+
+    apply_runtime_migrations(database_engine=engine, database_url=database_url)
+
+    with engine.connect() as connection:
+        stock_columns = {
+            row[1] for row in connection.exec_driver_sql("PRAGMA table_info(stocks)")
+        }
+        bar_columns = {
+            row[1]
+            for row in connection.exec_driver_sql(
+                "PRAGMA table_info(market_daily_bars)"
+            )
+        }
+        task_columns = {
+            row[1]
+            for row in connection.exec_driver_sql(
+                "PRAGMA table_info(quant_strategy_tasks)"
+            )
+        }
+        lot_columns = {
+            row[1]
+            for row in connection.exec_driver_sql(
+                "PRAGMA table_info(strategy_position_lots)"
+            )
+        }
+        decision_columns = {
+            row[1]
+            for row in connection.exec_driver_sql(
+                "PRAGMA table_info(quant_portfolio_decisions)"
+            )
+        }
+
+    assert {"instrument_type", "lot_size", "settlement_days"} <= stock_columns
+    assert {"adjusted_close", "adjustment_factor", "quality_status"} <= bar_columns
+    assert "next_retry_at" in task_columns
+    assert "metadata" in lot_columns
+    assert "snapshot" in decision_columns

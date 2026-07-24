@@ -46,6 +46,94 @@ def test_stock_master_sync_generates_search_metadata(db: Session):
     assert stock.pinyin_initials == "zgpa"
 
 
+def test_stock_master_sources_merge_listing_date_without_erasing_primary_data(
+    db: Session,
+):
+    from app.data_sync import sync_stock_master_sources
+
+    class Primary:
+        name = "akshare"
+        capabilities = {"stock_master"}
+
+        @staticmethod
+        def health():
+            return True, None
+
+        @staticmethod
+        def stock_master():
+            return [{"code": "601318", "name": "中国平安"}]
+
+    class Supplement:
+        name = "tushare"
+        capabilities = {"stock_master"}
+
+        @staticmethod
+        def health():
+            return True, None
+
+        @staticmethod
+        def stock_master():
+            return [
+                {
+                    "ts_code": "601318.SH",
+                    "name": "中国平安",
+                    "list_date": "20070301",
+                }
+            ]
+
+    result = sync_stock_master_sources(
+        db,
+        [Primary(), Supplement()],
+        pinyin_resolver=lambda _: ("zhongguopingan", "zgpa"),
+    )
+
+    stock = db.scalar(select(Stock).where(Stock.symbol == "601318.SH"))
+    assert result.providers == ("akshare", "tushare")
+    assert result.created == 1
+    assert result.updated == 1
+    assert stock.name == "中国平安"
+    assert stock.listing_date == "2007-03-01"
+    assert stock.pinyin_initials == "zgpa"
+
+
+def test_stock_master_sources_keep_successful_rows_when_supplement_fails(db: Session):
+    from app.data_sync import sync_stock_master_sources
+
+    class Primary:
+        name = "akshare"
+        capabilities = {"stock_master"}
+
+        @staticmethod
+        def health():
+            return True, None
+
+        @staticmethod
+        def stock_master():
+            return [{"code": "601318", "name": "中国平安"}]
+
+    class BrokenSupplement:
+        name = "tushare"
+        capabilities = {"stock_master"}
+
+        @staticmethod
+        def health():
+            return True, None
+
+        @staticmethod
+        def stock_master():
+            raise RuntimeError("补充源暂不可用")
+
+    result = sync_stock_master_sources(
+        db,
+        [Primary(), BrokenSupplement()],
+        pinyin_resolver=lambda _: ("zhongguopingan", "zgpa"),
+    )
+
+    assert result.providers == ("akshare",)
+    assert "tushare" in result.failures
+    assert db.scalar(select(Stock).where(Stock.symbol == "601318.SH")) is not None
+
+
 def test_quote_refresh_marks_requested_missing_symbol(db: Session):
     from app.data_sync import refresh_quotes
 
