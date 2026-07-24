@@ -186,6 +186,35 @@ def test_low_vol_quality_requires_only_sixty_completed_returns():
     assert result.rejected["000002.SZ"] == ("已完成复权日线不足61根",)
 
 
+def test_twelve_month_momentum_requires_253_completed_prices():
+    financial = quality_financial()
+    short = CandidateInput(
+        "000001.SZ",
+        "动量历史不足",
+        "STOCK",
+        bars("000001.SZ", 252),
+        financial,
+        {"pe_ttm": 10, "pb": 1},
+    )
+    enough = CandidateInput(
+        "000002.SZ",
+        "动量历史充足",
+        "STOCK",
+        bars("000002.SZ", 253),
+        financial,
+        {"pe_ttm": 10, "pb": 1},
+    )
+
+    result = build_target_portfolio(
+        "multi_factor_core",
+        [short, enough],
+        as_of=date(2024, 9, 30),
+    )
+
+    assert result.rejected["000001.SZ"] == ("已完成复权日线不足253根",)
+    assert result.target_weights == {"000002.SZ": pytest.approx(0.15)}
+
+
 def test_breakout_requires_prior_55_day_high_and_volume_confirmation():
     source = candidate("000001.SZ")
     series = list(source.bars)

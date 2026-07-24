@@ -138,8 +138,8 @@ def _capped_weights(
 
 def _common_features(item: CandidateInput) -> tuple[dict[str, float], tuple[str, ...]]:
     values = _prices(item)
-    if len(values) < 252:
-        return {}, ("已完成复权日线不足252根",)
+    if len(values) < 253:
+        return {}, ("已完成复权日线不足253根",)
     features = {
         "momentum_12_1": _return_between(values, 252, 21),
         "momentum_6_1": _return_between(values, 126, 21),
