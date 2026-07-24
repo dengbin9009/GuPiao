@@ -22,6 +22,29 @@ class FakeProvider:
         return self.value
 
 
+def test_market_http_timeout_is_added_without_overriding_explicit_value(monkeypatch):
+    import requests
+
+    from app.market_data import install_default_requests_timeout
+
+    calls = []
+
+    def fake_request(_session, method, url, **kwargs):
+        calls.append((method, url, kwargs.get("timeout")))
+        return object()
+
+    monkeypatch.setattr(requests.sessions.Session, "request", fake_request)
+    install_default_requests_timeout(connect_seconds=1, read_seconds=2)
+
+    requests.get("https://example.test/default")
+    requests.get("https://example.test/explicit", timeout=9)
+
+    assert calls == [
+        ("get", "https://example.test/default", (1, 2)),
+        ("get", "https://example.test/explicit", 9),
+    ]
+
+
 def test_router_falls_back_to_healthy_provider():
     from app.market_data import ProviderRouter
 

@@ -47,6 +47,8 @@ class Settings:
     tushare_token: str = ""
     realtime_poll_seconds: int = 5
     market_stale_seconds: int = 15
+    market_http_connect_timeout_seconds: int = 5
+    market_http_read_timeout_seconds: int = 20
     corporate_event_sync_seconds: int = 300
     corporate_event_stale_seconds: int = 1800
     simulation_initial_cash: float = 10000
@@ -101,6 +103,8 @@ class Settings:
         object.__setattr__(self, "tushare_token", os.getenv("TUSHARE_TOKEN", self.tushare_token))
         object.__setattr__(self, "realtime_poll_seconds", _int("REALTIME_POLL_INTERVAL_SECONDS", self.realtime_poll_seconds))
         object.__setattr__(self, "market_stale_seconds", _int("MARKET_DATA_STALE_AFTER_SECONDS", self.market_stale_seconds))
+        object.__setattr__(self, "market_http_connect_timeout_seconds", _int("MARKET_DATA_HTTP_CONNECT_TIMEOUT_SECONDS", self.market_http_connect_timeout_seconds))
+        object.__setattr__(self, "market_http_read_timeout_seconds", _int("MARKET_DATA_HTTP_READ_TIMEOUT_SECONDS", self.market_http_read_timeout_seconds))
         object.__setattr__(self, "corporate_event_sync_seconds", _int("CORPORATE_EVENT_SYNC_INTERVAL_SECONDS", self.corporate_event_sync_seconds))
         object.__setattr__(self, "corporate_event_stale_seconds", _int("CORPORATE_EVENT_STALE_AFTER_SECONDS", self.corporate_event_stale_seconds))
         object.__setattr__(self, "simulation_initial_cash", _float("SIMULATION_INITIAL_CASH", self.simulation_initial_cash))

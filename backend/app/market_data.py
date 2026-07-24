@@ -11,6 +11,26 @@ import math
 import re
 
 
+def install_default_requests_timeout(
+    *,
+    connect_seconds: float = 5,
+    read_seconds: float = 20,
+) -> None:
+    """Bound third-party requests calls that omit their own timeout."""
+    import requests
+
+    original_request = requests.sessions.Session.request
+    if getattr(original_request, "_gupiao_default_timeout", False):
+        return
+
+    def request_with_timeout(session, method, url, **kwargs):
+        kwargs.setdefault("timeout", (connect_seconds, read_seconds))
+        return original_request(session, method, url, **kwargs)
+
+    request_with_timeout._gupiao_default_timeout = True
+    requests.sessions.Session.request = request_with_timeout
+
+
 class MarketDataError(RuntimeError):
     pass
 
