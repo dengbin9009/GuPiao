@@ -159,3 +159,28 @@
   ]
 }
 ```
+
+```json
+{
+  "run_id": "2026-07-24-independent-strategy-production-gates",
+  "pattern": "daily-triage",
+  "mode": "manual-approved-fix",
+  "iteration": 6,
+  "items_found": 9,
+  "actions_taken": 9,
+  "same_error_attempt": 0,
+  "escalations": 0,
+  "worktree": ".worktrees/independent-strategy-suite",
+  "safety": "LIVE=false; BROKER=simulation; 八账户真实订单数为0; 已启用实盘账户数为0",
+  "outcome": "done-with-next-session-simulation-orders",
+  "evidence": [
+    "main与origin/main均为44a4f8e，六个本地服务以该提交重启并持续存活，后端与前端均返回HTTP 200",
+    "真实点时同步覆盖800只沪深股票和6只ETF，五项量化数据状态健康，抓取线程跨会话错误已修复",
+    "Python 3.12后端全套496 passed；Ruff、git diff格式、Node 20前端5项测试与1562模块生产构建通过",
+    "八套策略均完成至少500交易日回测；多因子核心、突破趋势、业绩公告漂移、市场状态配置和风险平价组合通过并完成无下单演练",
+    "相对强弱轮动、短期反转T+1和低波质量未通过回测门槛，计划保持关闭，未绕过闸门",
+    "2026-07-24突破趋势与业绩公告漂移信号为空；市场状态配置目标为511010.SH 50%与518880.SH 20%，周一09:41实时复检后才允许模拟成交",
+    "八个独立账户均为200万元现金、无持仓、无订单；本轮没有补造历史成交、没有连接券商、没有发送真实订单"
+  ]
+}
+```
