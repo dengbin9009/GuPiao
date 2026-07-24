@@ -127,6 +127,7 @@ class QuantStockFetchPlan:
     daily_complete: bool = False
     metric_complete: bool = False
     financial_complete: bool = False
+    security_profile_required: bool = False
 
 
 @dataclass(frozen=True)
@@ -466,6 +467,9 @@ def poll_quant_market_data(
                     daily_complete=daily_complete,
                     metric_complete=metric_complete,
                     financial_complete=financial_complete,
+                    security_profile_required=(
+                        not stock.listing_date or not stock.float_shares
+                    ),
                 )
             )
 
@@ -563,13 +567,14 @@ def poll_quant_market_data(
                     financial = list(source.financial_reports(plan.symbol))
             except Exception as exc:
                 financial_error = str(exc)[:1000]
-            if stock_daily_source.name == "mootdx":
-                stock = stock_by_id[plan.stock_id]
-                if not stock.listing_date or not stock.float_shares:
-                    try:
-                        security_profile = stock_daily_source.finance(plan.symbol)
-                    except Exception as exc:
-                        security_profile_error = str(exc)[:1000]
+            if (
+                stock_daily_source.name == "mootdx"
+                and plan.security_profile_required
+            ):
+                try:
+                    security_profile = stock_daily_source.finance(plan.symbol)
+                except Exception as exc:
+                    security_profile_error = str(exc)[:1000]
             return QuantStockPayload(
                 plan=plan,
                 daily_source=daily_source,

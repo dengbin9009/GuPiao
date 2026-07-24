@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event, current_thread
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -1126,6 +1126,142 @@ def test_quant_sync_uses_mootdx_only_for_stock_daily_and_adjustment(tmp_path: Pa
         stock = db.scalar(select(Stock).where(Stock.symbol == "000001.SZ"))
         assert stock.listing_date == "1991-04-03"
         assert stock.float_shares == 19_405_601_250
+
+
+def test_quant_sync_fetch_threads_do_not_access_the_database_session(
+    tmp_path: Path,
+):
+    from app.worker import poll_quant_market_data
+
+    database_url = f"sqlite:///{tmp_path / 'fetch-session-isolation.db'}"
+    engine = create_engine(database_url)
+    Base.metadata.create_all(engine)
+    symbols = [f"00000{index}.SZ" for index in range(1, 5)]
+    with Session(engine) as db:
+        for index, symbol in enumerate(symbols):
+            db.add(
+                Stock(
+                    code=symbol.split(".")[0],
+                    exchange="SZSE",
+                    symbol=symbol,
+                    name=f"测试股票{index}",
+                    instrument_type="STOCK",
+                    status="active",
+                    turnover_amount=400_000_000 - index,
+                )
+            )
+        db.commit()
+
+    first_profile_requested = Event()
+    release_slow_fetches = Event()
+    worker_stock_selects: list[str] = []
+
+    def record_worker_stock_select(_conn, _cursor, statement, *_args):
+        if (
+            current_thread().name.startswith("quant-stock-fetch")
+            and "FROM stocks" in statement
+        ):
+            worker_stock_selects.append(statement)
+
+    event.listen(engine, "before_cursor_execute", record_worker_stock_select)
+
+    class PublicSource:
+        name = "akshare"
+        capabilities = frozenset(
+            {"daily", "adjustment", "daily_metric", "financial", "etf_master"}
+        )
+
+        def health(self):
+            return True, None
+
+        def etf_master(self):
+            return []
+
+        def bars(self, **_kwargs):
+            raise AssertionError("股票日线应由 mootdx 提供")
+
+        def adjustment_factors(self, *_args, **_kwargs):
+            raise AssertionError("股票复权应由 mootdx 提供")
+
+        def daily_metrics(self, _symbol, *, start, end):
+            return [{"trade_date": end, "pe_ttm": 10, "pb": 1}]
+
+        def financial_reports(self, symbol):
+            if symbol != symbols[0]:
+                assert release_slow_fetches.wait(timeout=5)
+            return [
+                {
+                    "report_period": "2026-06-30",
+                    "actual_announcement_date": "2026-07-20",
+                    "roe": 0.15,
+                    "gross_margin": 0.3,
+                    "operating_cash_flow": 10,
+                    "total_assets": 100,
+                    "total_liabilities": 30,
+                }
+            ]
+
+    class TdxSource:
+        name = "mootdx"
+        capabilities = frozenset({"daily", "adjustment", "finance"})
+
+        def health(self):
+            return True, None
+
+        def bars(self, *, symbol, timeframe, start, end):
+            return [
+                {
+                    "trade_date": end,
+                    "open": 10,
+                    "high": 11,
+                    "low": 9,
+                    "close": 10,
+                    "volume": 100,
+                    "amount": 200_000_000,
+                }
+            ]
+
+        def adjustment_factors(self, _symbol, *, start, end):
+            return [{"trade_date": end, "adjustment_factor": 1.2}]
+
+        def finance(self, symbol):
+            if symbol == symbols[0]:
+                first_profile_requested.set()
+            return {
+                "listing_date": "2000-01-01",
+                "float_shares": 1_000_000_000,
+            }
+
+    def session_factory():
+        session = Session(engine)
+
+        def release_after_first_profile_commit(_session):
+            if first_profile_requested.is_set():
+                release_slow_fetches.set()
+
+        event.listen(session, "after_commit", release_after_first_profile_commit)
+        return session
+
+    try:
+        result = poll_quant_market_data(
+            router=ProviderRouter([PublicSource(), TdxSource()]),
+            trading_days={"2026-07-21", "2026-07-24"},
+            session_factory=session_factory,
+            current=datetime(
+                2026,
+                7,
+                24,
+                16,
+                15,
+                tzinfo=ZoneInfo("Asia/Shanghai"),
+            ),
+            stock_fetch_workers=4,
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", record_worker_stock_select)
+
+    assert result["stocks"] == 4, result
+    assert worker_stock_selects == []
 
 
 def test_quant_sync_skips_complete_current_stock_datasets_on_restart(tmp_path: Path):
