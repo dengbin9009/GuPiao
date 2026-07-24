@@ -140,6 +140,8 @@ class QuantStockPayload:
     metric_error: str | None
     financial: list[dict]
     financial_error: str | None
+    security_profile: dict | None = None
+    security_profile_error: str | None = None
 
 
 def poll_due_quant_data_sync(
@@ -476,6 +478,8 @@ def poll_quant_market_data(
             metric_error = None
             financial = []
             financial_error = None
+            security_profile = None
+            security_profile_error = None
             try:
                 if plan.daily_complete:
                     daily_source = stock_daily_source.name
@@ -559,6 +563,13 @@ def poll_quant_market_data(
                     financial = list(source.financial_reports(plan.symbol))
             except Exception as exc:
                 financial_error = str(exc)[:1000]
+            if stock_daily_source.name == "mootdx":
+                stock = stock_by_id[plan.stock_id]
+                if not stock.listing_date or not stock.float_shares:
+                    try:
+                        security_profile = stock_daily_source.finance(plan.symbol)
+                    except Exception as exc:
+                        security_profile_error = str(exc)[:1000]
             return QuantStockPayload(
                 plan=plan,
                 daily_source=daily_source,
@@ -569,6 +580,8 @@ def poll_quant_market_data(
                 metric_error=metric_error,
                 financial=financial,
                 financial_error=financial_error,
+                security_profile=security_profile,
+                security_profile_error=security_profile_error,
             )
 
         def store_stock_payload(payload: QuantStockPayload) -> None:
@@ -579,6 +592,14 @@ def poll_quant_market_data(
             daily_ok = False
             metric_ok = False
             financial_ok = False
+            if payload.security_profile:
+                listing_date = payload.security_profile.get("listing_date")
+                float_shares = payload.security_profile.get("float_shares")
+                if not stock.listing_date and listing_date:
+                    stock.listing_date = str(listing_date)[:10]
+                if not stock.float_shares and float_shares:
+                    stock.float_shares = float(float_shares)
+                db.commit()
             try:
                 if payload.daily_error:
                     raise RuntimeError(payload.daily_error)

@@ -1066,7 +1066,7 @@ def test_quant_sync_uses_mootdx_only_for_stock_daily_and_adjustment(tmp_path: Pa
 
     class TdxSource:
         name = "mootdx"
-        capabilities = frozenset({"daily", "adjustment"})
+        capabilities = frozenset({"daily", "adjustment", "finance"})
 
         def health(self):
             return True, None
@@ -1090,6 +1090,13 @@ def test_quant_sync_uses_mootdx_only_for_stock_daily_and_adjustment(tmp_path: Pa
             calls.append(("adjustment", symbol))
             return [{"trade_date": end, "adjustment_factor": 1.2}]
 
+        def finance(self, symbol):
+            calls.append(("finance", symbol))
+            return {
+                "listing_date": "1991-04-03",
+                "float_shares": 19_405_601_250,
+            }
+
     result = poll_quant_market_data(
         router=ProviderRouter([PublicSource(), TdxSource()]),
         trading_days={"2026-07-21", "2026-07-24"},
@@ -1099,12 +1106,15 @@ def test_quant_sync_uses_mootdx_only_for_stock_daily_and_adjustment(tmp_path: Pa
     )
 
     assert result["stocks"] == 1, result
-    assert calls == [
-        ("daily", "000001.SZ"),
-        ("adjustment", "000001.SZ"),
-        ("metrics", "000001.SZ"),
-        ("financial", "000001.SZ"),
-    ]
+    assert sorted(calls) == sorted(
+        [
+            ("daily", "000001.SZ"),
+            ("adjustment", "000001.SZ"),
+            ("finance", "000001.SZ"),
+            ("metrics", "000001.SZ"),
+            ("financial", "000001.SZ"),
+        ]
+    )
     with Session(engine) as db:
         bar = db.scalar(select(MarketDailyBar))
         metric = db.scalar(select(MarketDailyMetric))
@@ -1113,6 +1123,9 @@ def test_quant_sync_uses_mootdx_only_for_stock_daily_and_adjustment(tmp_path: Pa
         assert bar.adjustment_factor == 1.2
         assert metric.source == "akshare"
         assert report.source == "akshare"
+        stock = db.scalar(select(Stock).where(Stock.symbol == "000001.SZ"))
+        assert stock.listing_date == "1991-04-03"
+        assert stock.float_shares == 19_405_601_250
 
 
 def test_quant_sync_skips_complete_current_stock_datasets_on_restart(tmp_path: Path):
