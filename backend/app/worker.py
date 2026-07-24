@@ -106,7 +106,7 @@ def quant_data_sync_scope(current: datetime | None = None) -> bool:
     if current.weekday() >= 5:
         return False
     current_time = current.time().replace(tzinfo=None)
-    return wall_time(16, 15) <= current_time < wall_time(16, 30)
+    return wall_time(16, 15) <= current_time < wall_time(23, 0)
 
 
 @dataclass(frozen=True)

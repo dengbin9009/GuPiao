@@ -32,10 +32,12 @@ def test_signal_frequency_uses_next_trading_day_boundary():
     )
 
 
-def test_quant_data_sync_retries_until_the_first_signal_window_on_weekdays():
+def test_quant_data_sync_retries_until_the_evening_recovery_deadline_on_weekdays():
     assert quant_data_sync_scope(datetime(2026, 7, 24, 16, 15, 0, tzinfo=SHANGHAI))
     assert quant_data_sync_scope(datetime(2026, 7, 24, 16, 29, 59, tzinfo=SHANGHAI))
-    assert not quant_data_sync_scope(datetime(2026, 7, 24, 16, 30, 0, tzinfo=SHANGHAI))
+    assert quant_data_sync_scope(datetime(2026, 7, 24, 19, 17, 0, tzinfo=SHANGHAI))
+    assert quant_data_sync_scope(datetime(2026, 7, 24, 22, 59, 59, tzinfo=SHANGHAI))
+    assert not quant_data_sync_scope(datetime(2026, 7, 24, 23, 0, 0, tzinfo=SHANGHAI))
     assert not quant_data_sync_scope(datetime(2026, 7, 25, 16, 15, 0, tzinfo=SHANGHAI))
 
 
