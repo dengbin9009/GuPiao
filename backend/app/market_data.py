@@ -7,6 +7,7 @@ from threading import local
 from urllib.parse import parse_qs, urlparse
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo
+import math
 import re
 
 
@@ -158,7 +159,10 @@ def _date_text(value: Any) -> str:
 
 
 def _optional_number(value: Any) -> float | None:
-    return float(value) if value not in {None, ""} else None
+    if value in {None, ""}:
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
 
 
 def _normalize_bars(
@@ -214,6 +218,9 @@ class AKShareProvider(MarketDataProvider):
     capabilities = frozenset({
         "stock_master",
         "daily",
+        "adjustment",
+        "daily_metric",
+        "financial",
         "minute",
         "realtime",
         "trading_calendar",
@@ -227,9 +234,13 @@ class AKShareProvider(MarketDataProvider):
 
             self.client = ak
             self.import_error = None
+            self._stock_raw_cache: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+            self._etf_spot_rows: dict[str, dict[str, Any]] = {}
         except ImportError as exc:
             self.client = None
             self.import_error = str(exc)
+            self._stock_raw_cache = {}
+            self._etf_spot_rows = {}
 
     def health(self) -> tuple[bool, str | None]:
         return self.client is not None, self.import_error
@@ -262,28 +273,226 @@ class AKShareProvider(MarketDataProvider):
                 )
             if timeframe == "1d":
                 if symbol == "000300.SH":
-                    return _records(
-                        self.client.index_zh_a_hist(
-                            symbol="000300",
-                            period="daily",
-                            start_date=(start or "19900101").replace("-", ""),
-                            end_date=(
-                                end or datetime.now(SHANGHAI).date().isoformat()
-                            ).replace("-", ""),
+                    try:
+                        return _records(
+                            self.client.stock_zh_index_daily_tx(
+                                symbol="sh000300",
+                                start_date=(start or "19900101").replace("-", ""),
+                                end_date=(
+                                    end or datetime.now(SHANGHAI).date().isoformat()
+                                ).replace("-", ""),
+                            )
+                        )
+                    except (AttributeError, TypeError):
+                        return _records(
+                            self.client.index_zh_a_hist(
+                                symbol="000300",
+                                period="daily",
+                                start_date=(start or "19900101").replace("-", ""),
+                                end_date=(
+                                    end or datetime.now(SHANGHAI).date().isoformat()
+                                ).replace("-", ""),
+                            )
+                        )
+                start_text = (start or "19900101").replace("-", "")
+                end_text = (
+                    end or datetime.now(SHANGHAI).date().isoformat()
+                ).replace("-", "")
+                market_symbol = f"{'sh' if symbol.endswith('.SH') else 'sz'}{code}"
+                try:
+                    rows = _records(
+                        self.client.stock_zh_a_daily(
+                            symbol=market_symbol,
+                            start_date=start_text,
+                            end_date=end_text,
+                            adjust="",
                         )
                     )
-                return _records(
-                    self.client.stock_zh_a_hist(
-                        symbol=code,
-                        period="daily",
-                        start_date=(start or "19900101").replace("-", ""),
-                        end_date=(end or datetime.now(SHANGHAI).date().isoformat()).replace("-", ""),
-                        adjust="",
+                except (AttributeError, TypeError):
+                    rows = _records(
+                        self.client.stock_zh_a_hist(
+                            symbol=code,
+                            period="daily",
+                            start_date=start_text,
+                            end_date=end_text,
+                            adjust="",
+                        )
                     )
-                )
+                cache = getattr(self, "_stock_raw_cache", None)
+                if cache is not None:
+                    cache[(symbol, start_text, end_text)] = rows
+                return rows
         except Exception as exc:
             raise MarketDataError(f"AKShare K 线获取失败: {exc}") from exc
         raise MarketDataError(f"AKShare 不支持时间粒度 {timeframe}")
+
+    def adjustment_factors(
+        self,
+        symbol: str,
+        *,
+        start: str,
+        end: str,
+    ) -> list[dict[str, Any]]:
+        if not self.client:
+            raise MarketDataError("AKShare 未安装")
+        start_text = start.replace("-", "")
+        end_text = end.replace("-", "")
+        code = symbol.split(".")[0]
+        market_symbol = f"{'sh' if symbol.endswith('.SH') else 'sz'}{code}"
+        raw = getattr(self, "_stock_raw_cache", {}).get(
+            (symbol, start_text, end_text)
+        )
+        try:
+            if raw is None:
+                raw = _records(
+                    self.client.stock_zh_a_daily(
+                        symbol=market_symbol,
+                        start_date=start_text,
+                        end_date=end_text,
+                        adjust="",
+                    )
+                )
+            adjusted = _records(
+                self.client.stock_zh_a_daily(
+                    symbol=market_symbol,
+                    start_date=start_text,
+                    end_date=end_text,
+                    adjust="hfq",
+                )
+            )
+        except Exception as exc:
+            raise MarketDataError(f"AKShare 复权因子获取失败: {exc}") from exc
+        adjusted_by_date = {
+            _date_text(row.get("date") or row.get("日期")): row
+            for row in adjusted
+        }
+        result = []
+        for row in raw:
+            trade_date = _date_text(row.get("date") or row.get("日期"))
+            raw_close = row.get("close", row.get("收盘"))
+            adjusted_row = adjusted_by_date.get(trade_date)
+            adjusted_close = (
+                adjusted_row.get("close", adjusted_row.get("收盘"))
+                if adjusted_row
+                else None
+            )
+            if (
+                not trade_date
+                or raw_close in {None, ""}
+                or adjusted_close in {None, ""}
+                or float(raw_close) <= 0
+                or float(adjusted_close) <= 0
+            ):
+                continue
+            result.append(
+                {
+                    "trade_date": trade_date,
+                    "adjustment_factor": float(adjusted_close) / float(raw_close),
+                }
+            )
+        if not result:
+            raise MarketDataError("AKShare 复权因子返回为空")
+        return result
+
+    def daily_metrics(
+        self,
+        symbol: str,
+        *,
+        start: str,
+        end: str,
+    ) -> list[dict[str, Any]]:
+        if not self.client:
+            raise MarketDataError("AKShare 未安装")
+        code = symbol.split(".")[0]
+        series: dict[str, dict[str, float]] = {}
+        for indicator, field, multiplier in (
+            ("市盈率(TTM)", "pe_ttm", 1.0),
+            ("市净率", "pb", 1.0),
+            ("总市值", "total_market_value", 100_000_000.0),
+        ):
+            try:
+                rows = _records(
+                    self.client.stock_zh_valuation_baidu(
+                        symbol=code,
+                        indicator=indicator,
+                        period="近十年",
+                    )
+                )
+            except Exception as exc:
+                raise MarketDataError(
+                    f"AKShare 历史估值获取失败 ({indicator}): {exc}"
+                ) from exc
+            for row in rows:
+                trade_date = _date_text(row.get("date") or row.get("日期"))
+                value = _optional_number(row.get("value", row.get("值")))
+                if (
+                    not trade_date
+                    or not start <= trade_date <= end
+                    or value is None
+                ):
+                    continue
+                series.setdefault(trade_date, {})[field] = value * multiplier
+        return [
+            {"trade_date": trade_date, **series[trade_date]}
+            for trade_date in sorted(series)
+            if series[trade_date]
+        ]
+
+    def financial_reports(self, symbol: str) -> list[dict[str, Any]]:
+        if not self.client:
+            raise MarketDataError("AKShare 未安装")
+        try:
+            rows = _records(
+                self.client.stock_financial_analysis_indicator_em(
+                    symbol=symbol,
+                    indicator="按报告期",
+                )
+            )
+        except Exception as exc:
+            raise MarketDataError(f"AKShare 财务指标获取失败: {exc}") from exc
+        result = []
+        for row in rows:
+            report_period = _date_text(row.get("REPORT_DATE"))
+            announcement = _date_text(row.get("NOTICE_DATE"))
+            if not report_period or not announcement:
+                continue
+            revenue = _optional_number(row.get("TOTALOPERATEREVE"))
+            cashflow_to_revenue = _optional_number(row.get("JYXJLYYSR"))
+            operating_cash_flow = (
+                revenue * (cashflow_to_revenue / 100)
+                if revenue is not None and cashflow_to_revenue is not None
+                else None
+            )
+            total_liabilities = _optional_number(row.get("LIABILITY"))
+            debt_ratio = _optional_number(row.get("ZCFZL"))
+            roe = _optional_number(row.get("ROEJQ"))
+            gross_margin = _optional_number(row.get("XSMLL"))
+            total_assets = (
+                total_liabilities / (debt_ratio / 100)
+                if total_liabilities is not None
+                and debt_ratio is not None
+                and debt_ratio > 0
+                else None
+            )
+            result.append(
+                {
+                    "report_period": report_period,
+                    "report_type": str(row.get("REPORT_TYPE") or "quarterly"),
+                    "announcement_date": announcement,
+                    "actual_announcement_date": announcement,
+                    "eps": _optional_number(row.get("EPSJB")),
+                    "roe": roe / 100 if roe is not None else None,
+                    "gross_margin": (
+                        gross_margin / 100 if gross_margin is not None else None
+                    ),
+                    "operating_cash_flow": operating_cash_flow,
+                    "net_profit": _optional_number(row.get("PARENTNETPROFIT")),
+                    "revenue": revenue,
+                    "total_assets": total_assets,
+                    "total_liabilities": total_liabilities,
+                }
+            )
+        return result
 
     def quotes(self, symbols: list[str]) -> list[dict[str, Any]]:
         if not self.client:
@@ -306,27 +515,56 @@ class AKShareProvider(MarketDataProvider):
     def etf_master(self) -> list[dict[str, Any]]:
         if not self.client:
             raise MarketDataError("AKShare 未安装")
+        rows = []
+        failures = []
         try:
-            rows = _records(self.client.fund_etf_spot_em())
+            eastmoney_rows = _records(self.client.fund_etf_spot_em())
+            for row in eastmoney_rows:
+                row["_master_source"] = "eastmoney"
+            rows.extend(eastmoney_rows)
         except Exception as exc:
-            raise MarketDataError(f"AKShare ETF 主数据获取失败: {exc}") from exc
-        result = []
+            failures.append(f"东方财富: {exc}")
+        try:
+            sina_rows = _records(
+                self.client.fund_etf_category_sina(symbol="ETF基金")
+            )
+            captured_date = datetime.now(SHANGHAI).date().isoformat()
+            for row in sina_rows:
+                row["_master_source"] = "sina"
+                row["_captured_date"] = captured_date
+            rows.extend(sina_rows)
+        except Exception as exc:
+            failures.append(f"新浪: {exc}")
+        if not rows:
+            raise MarketDataError(
+                f"AKShare ETF 主数据获取失败: {'; '.join(failures)}"
+            )
+        result_by_symbol = {}
         for row in rows:
-            code = str(row.get("代码") or row.get("code") or "")
+            raw_code = str(row.get("代码") or row.get("code") or "").lower()
+            code = raw_code.removeprefix("sh").removeprefix("sz")
             name = str(row.get("名称") or row.get("name") or "")
             if not code or not name:
                 continue
             suffix = "SH" if code.startswith(("5", "6")) else "SZ"
-            result.append(
-                {
-                    "ts_code": f"{code}.{suffix}",
-                    "name": name,
-                    "instrument_type": "ETF",
-                    "lot_size": 100,
-                    "settlement_days": 1,
-                }
-            )
-        return result
+            ts_code = f"{code}.{suffix}"
+            spot_rows = getattr(self, "_etf_spot_rows", None)
+            if spot_rows is not None:
+                existing = spot_rows.get(ts_code)
+                if (
+                    existing is None
+                    or existing.get("_master_source") != "eastmoney"
+                    or row.get("_master_source") == "eastmoney"
+                ):
+                    spot_rows[ts_code] = row
+            result_by_symbol[ts_code] = {
+                "ts_code": ts_code,
+                "name": name,
+                "instrument_type": "ETF",
+                "lot_size": 100,
+                "settlement_days": 1,
+            }
+        return [result_by_symbol[key] for key in sorted(result_by_symbol)]
 
     def etf_bars(
         self,
@@ -338,20 +576,34 @@ class AKShareProvider(MarketDataProvider):
         if not self.client:
             raise MarketDataError("AKShare 未安装")
         try:
-            rows = _records(
-                self.client.fund_etf_hist_em(
-                    symbol=symbol.split(".")[0],
-                    period="daily",
-                    start_date=start.replace("-", ""),
-                    end_date=end.replace("-", ""),
-                    adjust="",
-                )
+            market_symbol = (
+                f"{'sh' if symbol.endswith('.SH') else 'sz'}{symbol.split('.')[0]}"
             )
+            rows = _records(self.client.fund_etf_hist_sina(symbol=market_symbol))
         except Exception as exc:
-            raise MarketDataError(f"AKShare ETF 日线获取失败: {exc}") from exc
-        return [
-            {
-                "trade_date": _date_text(row.get("日期") or row.get("trade_date")),
+            try:
+                rows = _records(
+                    self.client.fund_etf_hist_em(
+                        symbol=symbol.split(".")[0],
+                        period="daily",
+                        start_date=start.replace("-", ""),
+                        end_date=end.replace("-", ""),
+                        adjust="",
+                    )
+                )
+            except Exception as fallback_exc:
+                raise MarketDataError(
+                    f"AKShare ETF 日线获取失败: {exc}; 东方财富: {fallback_exc}"
+                ) from fallback_exc
+        normalized: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            trade_date = _date_text(
+                row.get("date") or row.get("日期") or row.get("trade_date")
+            )
+            if not trade_date or not start <= trade_date <= end:
+                continue
+            normalized[trade_date] = {
+                "trade_date": trade_date,
                 "open": float(row.get("开盘") or row.get("open") or 0),
                 "high": float(row.get("最高") or row.get("high") or 0),
                 "low": float(row.get("最低") or row.get("low") or 0),
@@ -359,8 +611,25 @@ class AKShareProvider(MarketDataProvider):
                 "volume": float(row.get("成交量") or row.get("volume") or 0),
                 "amount": float(row.get("成交额") or row.get("amount") or 0),
             }
-            for row in rows
-        ]
+        spot = getattr(self, "_etf_spot_rows", {}).get(symbol)
+        spot_date = (
+            _date_text(spot.get("数据日期") or spot.get("_captured_date"))
+            if spot
+            else ""
+        )
+        if spot and start <= spot_date <= end:
+            close = spot.get("最新价", spot.get("close"))
+            if close not in {None, ""} and float(close) > 0:
+                normalized[spot_date] = {
+                    "trade_date": spot_date,
+                    "open": float(spot.get("开盘价", spot.get("今开", close)) or close),
+                    "high": float(spot.get("最高价", spot.get("最高", close)) or close),
+                    "low": float(spot.get("最低价", spot.get("最低", close)) or close),
+                    "close": float(close),
+                    "volume": float(spot.get("成交量", 0) or 0),
+                    "amount": float(spot.get("成交额", 0) or 0),
+                }
+        return [normalized[key] for key in sorted(normalized)]
 
 
 class TushareProvider(MarketDataProvider):

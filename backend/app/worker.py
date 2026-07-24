@@ -140,7 +140,7 @@ def poll_due_quant_data_sync(
             result = future.result()
         except Exception as exc:
             result = {"stocks": 0, "errors": 1, "message": str(exc)[:200]}
-        if not result.get("errors"):
+        if not result.get("errors") or result.get("attempt_completed"):
             last_sync_date = current.date()
         return QuantDataSyncPoll(
             None,
@@ -206,10 +206,28 @@ def poll_quant_market_data(
         route = router or (None if provider is not None else market_router())
         source = provider
         if source is None:
-            try:
-                source = route.select("adjustment")
-            except Exception as exc:
-                return {"stocks": 0, "errors": 1, "message": str(exc)[:200]}
+            for candidate in route.providers:
+                if (
+                    candidate.name == "tushare"
+                    and "adjustment" in candidate.capabilities
+                    and candidate.health()[0]
+                ):
+                    source = candidate
+                    break
+            selection_errors = []
+            for capability in ("adjustment", "etf_daily", "daily") if source is None else ():
+                try:
+                    source = route.select(capability)
+                    break
+                except Exception as exc:
+                    selection_errors.append(str(exc))
+            if source is None:
+                return {
+                    "stocks": 0,
+                    "etfs": 0,
+                    "errors": 1,
+                    "message": "; ".join(selection_errors)[:200],
+                }
             route.providers = [
                 source,
                 *(item for item in route.providers if item is not source),
@@ -663,6 +681,7 @@ def poll_quant_market_data(
             "etfs": etfs_updated if etf_count or etfs else 0,
             "daily_rows": daily_rows,
             "errors": errors,
+            "attempt_completed": True,
             "performance_recorded": performance["recorded"],
             "performance_paused": performance["paused"],
         }

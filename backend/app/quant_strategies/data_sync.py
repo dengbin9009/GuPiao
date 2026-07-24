@@ -355,6 +355,9 @@ def sync_financial_rows(
     trading_days: set[str] | None = None,
 ) -> int:
     changed = 0
+    first_trading_day = (
+        date.fromisoformat(min(trading_days)) if trading_days else None
+    )
     for row in rows:
         period = str(row.get("report_period", ""))[:10]
         actual = str(
@@ -363,6 +366,12 @@ def sync_financial_rows(
             or ""
         )[:10]
         if not period or not actual:
+            continue
+        if (
+            first_trading_day
+            and date.fromisoformat(actual) + timedelta(days=14)
+            < first_trading_day
+        ):
             continue
         snapshot = db.scalar(
             select(FinancialReportSnapshot).where(

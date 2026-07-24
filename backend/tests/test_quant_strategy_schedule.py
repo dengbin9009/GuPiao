@@ -123,3 +123,26 @@ def test_quant_data_sync_records_date_only_after_successful_completion():
     assert state.result == result
     assert state.started is False
     assert future.result_calls == 1
+
+
+def test_quant_data_sync_records_partial_completed_attempt_without_hot_loop():
+    result = {
+        "stocks": 780,
+        "etfs": 6,
+        "errors": 20,
+        "attempt_completed": True,
+    }
+    future = FakeFuture(completed=True, result=result)
+    current = datetime(2026, 7, 24, 19, 30, tzinfo=SHANGHAI)
+
+    state = poll_due_quant_data_sync(
+        current=current,
+        current_seconds=500,
+        future=future,
+        last_sync_date=None,
+        last_attempt_seconds=100,
+        submit=lambda _value: None,
+    )
+
+    assert state.last_sync_date == current.date()
+    assert state.result == result

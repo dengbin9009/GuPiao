@@ -157,6 +157,81 @@ def test_tushare_exposes_quant_and_etf_capabilities():
     assert source.etf_bars("510300.SH", start="2026-07-01", end="2026-07-23")[0]["close"] == 4.05
 
 
+def test_akshare_exposes_point_in_time_metrics_and_financial_reports():
+    calls = []
+
+    class Client:
+        @staticmethod
+        def stock_zh_valuation_baidu(**kwargs):
+            calls.append(("metric", kwargs))
+            values = {
+                "市盈率(TTM)": 12.5,
+                "市净率": 1.2,
+                "总市值": 2500,
+            }
+            return Frame(
+                [
+                    {"date": "2026-07-24", "value": values[kwargs["indicator"]]},
+                    {"date": "2026-07-23", "value": values[kwargs["indicator"]] - 0.1},
+                ]
+            )
+
+        @staticmethod
+        def stock_financial_analysis_indicator_em(**kwargs):
+            calls.append(("financial", kwargs))
+            return Frame(
+                [
+                    {
+                        "REPORT_DATE": "2026-03-31 00:00:00",
+                        "NOTICE_DATE": "2026-04-25 00:00:00",
+                        "REPORT_TYPE": "一季报",
+                        "EPSJB": 0.67,
+                        "ROEJQ": 2.83,
+                        "XSMLL": 35.0,
+                        "TOTALOPERATEREVE": 35_277_000_000,
+                        "PARENTNETPROFIT": 14_523_000_000,
+                        "JYXJLYYSR": 1.0715,
+                        "LIABILITY": 5_489_879_000_000,
+                        "ZCFZL": 90.9829892863,
+                    }
+                ]
+            )
+
+    source = AKShareProvider()
+    source.client = Client()
+
+    metrics = source.daily_metrics(
+        "000001.SZ",
+        start="2026-07-23",
+        end="2026-07-24",
+    )
+    reports = source.financial_reports("000001.SZ")
+
+    assert {"adjustment", "daily_metric", "financial"} <= source.capabilities
+    assert metrics[-1] == {
+        "trade_date": "2026-07-24",
+        "pe_ttm": 12.5,
+        "pb": 1.2,
+        "total_market_value": 250_000_000_000.0,
+    }
+    assert reports[0]["report_period"] == "2026-03-31"
+    assert reports[0]["actual_announcement_date"] == "2026-04-25"
+    assert reports[0]["roe"] == pytest.approx(0.0283)
+    assert reports[0]["gross_margin"] == pytest.approx(0.35)
+    assert reports[0]["operating_cash_flow"] == pytest.approx(
+        35_277_000_000 * 0.010715
+    )
+    assert reports[0]["total_assets"] == pytest.approx(
+        5_489_879_000_000 / 0.909829892863
+    )
+    assert [name for name, _kwargs in calls] == [
+        "metric",
+        "metric",
+        "metric",
+        "financial",
+    ]
+
+
 def test_tushare_normalizes_daily_cross_sections_for_batch_incremental_sync():
     calls = []
 
@@ -357,7 +432,7 @@ def test_tushare_financial_cross_section_merges_four_vip_datasets_by_symbol():
     assert all(kwargs == {"period": "20260630"} for _name, kwargs in calls)
 
 
-def test_akshare_exposes_etf_fallback_without_claiming_financial_capability():
+def test_akshare_exposes_etf_and_point_in_time_quant_fallback_capabilities():
     source = object.__new__(AKShareProvider)
     source.client = type(
         "FakeAkshare",
@@ -383,8 +458,13 @@ def test_akshare_exposes_etf_fallback_without_claiming_financial_capability():
     )()
     source.import_error = None
 
-    assert {"etf_master", "etf_daily"} <= source.capabilities
-    assert "financial" not in source.capabilities
+    assert {
+        "adjustment",
+        "daily_metric",
+        "financial",
+        "etf_master",
+        "etf_daily",
+    } <= source.capabilities
     assert source.etf_master()[0]["ts_code"] == "510300.SH"
     assert source.etf_bars(
         "510300.SH",
@@ -412,6 +492,47 @@ def test_financial_date_only_uses_next_exchange_trading_day():
         "2026-09-30",
         trading_days=trading_days,
     ) == "2026-10-09"
+
+
+def test_financial_sync_skips_reports_before_exchange_calendar_coverage(
+    tmp_path: Path,
+):
+    database_url = f"sqlite:///{tmp_path / 'financial-window.db'}"
+    engine = create_engine(database_url)
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        stock = Stock(
+            code="000001",
+            exchange="SZSE",
+            symbol="000001.SZ",
+            name="平安银行",
+            status="active",
+        )
+        db.add(stock)
+        db.commit()
+        sync_financial_rows(
+            db,
+            stock,
+            [
+                {
+                    "report_period": "2010-12-31",
+                    "actual_announcement_date": "2011-03-01",
+                    "eps": 0.1,
+                },
+                {
+                    "report_period": "2026-03-31",
+                    "actual_announcement_date": "2026-04-25",
+                    "eps": 0.67,
+                },
+            ],
+            source="akshare",
+            trading_days={"2026-04-27", "2026-04-28"},
+        )
+
+        rows = list(db.scalars(select(FinancialReportSnapshot)))
+        assert [(row.report_period, row.available_on) for row in rows] == [
+            ("2026-03-31", "2026-04-27")
+        ]
 
 
 def test_quant_rows_are_upserted_without_deleting_history(tmp_path: Path):
@@ -1002,7 +1123,9 @@ def test_quant_worker_prioritizes_tushare_then_falls_back_for_daily_and_etf(
 
     class Fallback:
         name = "akshare"
-        capabilities = frozenset({"daily", "etf_master", "etf_daily"})
+        capabilities = frozenset(
+            {"daily", "adjustment", "etf_master", "etf_daily"}
+        )
 
         def health(self):
             return True, None
@@ -1020,6 +1143,10 @@ def test_quant_worker_prioritizes_tushare_then_falls_back_for_daily_and_etf(
                     "amount": 200_000_000,
                 }
             ]
+
+        def adjustment_factors(self, symbol, *, start, end):
+            calls.append(("fallback_adjustment", {"symbol": symbol}))
+            return [{"trade_date": end, "adjustment_factor": 9.9}]
 
         def etf_master(self):
             calls.append(("fallback_etf_master", {}))
@@ -1065,7 +1192,82 @@ def test_quant_worker_prioritizes_tushare_then_falls_back_for_daily_and_etf(
         assert result["errors"] == 0
         assert bar.source == "akshare"
         assert bar.adjustment_factor == 1.2
+        assert not any(name == "fallback_adjustment" for name, _kwargs in calls)
         assert db.scalar(select(Stock.id).where(Stock.symbol == "512000.SH")) is None
+
+
+def test_quant_worker_keeps_etf_sync_independent_when_stock_adjustment_is_missing(
+    tmp_path: Path,
+):
+    from app.worker import poll_quant_market_data
+
+    database_url = f"sqlite:///{tmp_path / 'etf-independent.db'}"
+    engine = create_engine(database_url)
+    Base.metadata.create_all(engine)
+    settings = Settings(
+        database_url=database_url,
+        live_enabled=False,
+        broker_adapter="simulation",
+    )
+    with Session(engine) as db:
+        seed_database(db, settings)
+        seed_quant_strategy_runtimes(db, settings)
+        for stock in db.scalars(select(Stock).where(Stock.instrument_type == "STOCK")):
+            stock.status = "inactive"
+        db.commit()
+
+    class PublicSource:
+        name = "akshare"
+        capabilities = frozenset({"daily", "etf_master", "etf_daily"})
+
+        def health(self):
+            return True, None
+
+        def etf_master(self):
+            return [{"ts_code": "510300.SH", "name": "沪深300ETF"}]
+
+        def etf_bars(self, symbol, *, start, end):
+            return [
+                {
+                    "trade_date": end,
+                    "open": 4,
+                    "high": 4.1,
+                    "low": 3.9,
+                    "close": 4,
+                    "volume": 100,
+                    "amount": 200_000_000,
+                }
+            ]
+
+        def bars(self, **kwargs):
+            return [
+                {
+                    "trade_date": kwargs["end"],
+                    "open": 4600,
+                    "high": 4700,
+                    "low": 4550,
+                    "close": 4650,
+                    "volume": 100,
+                    "amount": 200_000_000,
+                }
+            ]
+
+    current = datetime(2026, 7, 24, 16, 15, tzinfo=ZoneInfo("Asia/Shanghai"))
+    result = poll_quant_market_data(
+        router=ProviderRouter([PublicSource()]),
+        trading_days={"2026-07-24", "2026-07-27"},
+        session_factory=lambda: Session(engine),
+        current=current,
+    )
+
+    with Session(engine) as db:
+        state = db.scalar(
+            select(DataSourceState).where(
+                DataSourceState.provider == "quant_etf_daily"
+            )
+        )
+        assert result["etfs"] == 1
+        assert state.healthy is True
 
 
 def test_quant_worker_uses_one_cross_section_request_per_mature_daily_dataset(

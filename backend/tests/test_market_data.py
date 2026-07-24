@@ -34,6 +34,14 @@ def test_router_falls_back_to_healthy_provider():
     assert result.data == [{"close": 10.2}]
 
 
+def test_optional_market_number_rejects_non_finite_values():
+    from app.market_data import _optional_number
+
+    assert _optional_number(float("nan")) is None
+    assert _optional_number(float("inf")) is None
+    assert _optional_number("12.5") == 12.5
+
+
 def test_router_can_fall_back_to_mootdx_provider():
     from app.market_data import ProviderRouter
 
@@ -195,6 +203,208 @@ def test_akshare_stock_daily_returns_raw_prices_for_external_adjustment():
     )
 
     assert calls[0]["adjust"] == ""
+
+
+def test_akshare_stock_daily_and_adjustment_fall_back_to_sina():
+    from app.market_data import AKShareProvider
+
+    calls = []
+
+    class Client:
+        @staticmethod
+        def stock_zh_a_hist(**_kwargs):
+            raise ConnectionError("eastmoney unavailable")
+
+        @staticmethod
+        def stock_zh_a_daily(**kwargs):
+            calls.append(kwargs)
+            if kwargs["adjust"] == "hfq":
+                return [
+                    {
+                        "date": "2026-07-23",
+                        "open": 12,
+                        "high": 13.2,
+                        "low": 10.8,
+                        "close": 12.6,
+                        "volume": 100,
+                        "amount": 200_000_000,
+                    }
+                ]
+            return [
+                {
+                    "date": "2026-07-23",
+                    "open": 10,
+                    "high": 11,
+                    "low": 9,
+                    "close": 10.5,
+                    "volume": 100,
+                    "amount": 200_000_000,
+                }
+            ]
+
+    provider = AKShareProvider()
+    provider.client = Client()
+
+    bars = provider.bars(
+        symbol="000001.SZ",
+        timeframe="1d",
+        start="2026-07-01",
+        end="2026-07-23",
+    )
+    factors = provider.adjustment_factors(
+        "000001.SZ",
+        start="2026-07-01",
+        end="2026-07-23",
+    )
+
+    assert bars[0]["close"] == 10.5
+    assert bars[0]["volume"] == 100
+    assert factors == [
+        {"trade_date": "2026-07-23", "adjustment_factor": 1.2}
+    ]
+    assert [call["adjust"] for call in calls] == ["", "hfq"]
+
+
+def test_akshare_csi300_and_etf_history_use_public_fallbacks():
+    from app.market_data import AKShareProvider
+
+    class Client:
+        @staticmethod
+        def index_zh_a_hist(**_kwargs):
+            raise ConnectionError("eastmoney index unavailable")
+
+        @staticmethod
+        def stock_zh_index_daily_tx(**_kwargs):
+            return [
+                {
+                    "date": "2026-07-24",
+                    "open": 4600,
+                    "high": 4700,
+                    "low": 4550,
+                    "close": 4650,
+                    "amount": 200_000_000,
+                }
+            ]
+
+        @staticmethod
+        def fund_etf_spot_em():
+            return [
+                {
+                    "代码": "510300",
+                    "名称": "沪深300ETF",
+                    "数据日期": "2026-07-24 00:00:00",
+                    "开盘价": 4.70,
+                    "最高价": 4.80,
+                    "最低价": 4.65,
+                    "最新价": 4.78,
+                    "成交量": 1000,
+                    "成交额": 4_780_000,
+                }
+            ]
+
+        @staticmethod
+        def fund_etf_hist_em(**_kwargs):
+            raise ConnectionError("eastmoney ETF unavailable")
+
+        @staticmethod
+        def fund_etf_hist_sina(**_kwargs):
+            return [
+                {
+                    "date": "2026-07-23",
+                    "open": 4.60,
+                    "high": 4.72,
+                    "low": 4.58,
+                    "close": 4.70,
+                    "volume": 900,
+                    "amount": 4_200_000,
+                }
+            ]
+
+    provider = AKShareProvider()
+    provider.client = Client()
+
+    provider.etf_master()
+    benchmark = provider.bars(
+        symbol="000300.SH",
+        timeframe="1d",
+        start="2026-07-01",
+        end="2026-07-24",
+    )
+    etf = provider.etf_bars(
+        "510300.SH",
+        start="2026-07-01",
+        end="2026-07-24",
+    )
+
+    assert benchmark[0]["close"] == 4650
+    assert [row["trade_date"] for row in etf] == ["2026-07-23", "2026-07-24"]
+    assert etf[-1]["close"] == 4.78
+
+
+def test_akshare_etf_master_merges_eastmoney_and_sina_universes():
+    from app.market_data import AKShareProvider
+
+    class Client:
+        @staticmethod
+        def fund_etf_spot_em():
+            return [
+                {
+                    "代码": "510300",
+                    "名称": "沪深300ETF",
+                    "数据日期": "2026-07-24 00:00:00",
+                    "最新价": 4.78,
+                    "开盘价": 4.70,
+                    "最高价": 4.80,
+                    "最低价": 4.65,
+                    "成交量": 1000,
+                    "成交额": 4_780_000,
+                }
+            ]
+
+        @staticmethod
+        def fund_etf_category_sina(**_kwargs):
+            return [
+                {"代码": "sh510300", "名称": "沪深300ETF"},
+                {
+                    "代码": "sh511010",
+                    "名称": "国债ETF",
+                    "最新价": 140.9,
+                    "今开": 140.8,
+                    "最高": 141.0,
+                    "最低": 140.7,
+                    "成交量": 100,
+                    "成交额": 14_090,
+                },
+            ]
+
+        @staticmethod
+        def fund_etf_hist_sina(**_kwargs):
+            return [
+                {
+                    "date": "2026-07-23",
+                    "open": 140.7,
+                    "high": 140.9,
+                    "low": 140.6,
+                    "close": 140.8,
+                    "volume": 90,
+                    "amount": 12_672,
+                }
+            ]
+
+    provider = AKShareProvider()
+    provider.client = Client()
+
+    rows = provider.etf_master()
+    quote_date = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+    bond_rows = provider.etf_bars(
+        "511010.SH",
+        start="2026-07-23",
+        end=quote_date,
+    )
+
+    assert {row["ts_code"] for row in rows} == {"510300.SH", "511010.SH"}
+    assert bond_rows[-1]["trade_date"] == quote_date
+    assert bond_rows[-1]["close"] == 140.9
 
 
 def test_tushare_uses_index_daily_for_csi300_benchmark():
