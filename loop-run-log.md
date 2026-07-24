@@ -174,7 +174,7 @@
   "safety": "LIVE=false; BROKER=simulation; 八账户真实订单数为0; 已启用实盘账户数为0",
   "outcome": "done-with-next-session-simulation-orders",
   "evidence": [
-    "main与origin/main均为44a4f8e，六个本地服务以该提交重启并持续存活，后端与前端均返回HTTP 200",
+    "六个本地服务以业务代码基线44a4f8e重启并持续存活；后续main提交仅更新Loop状态文档，后端与前端均返回HTTP 200",
     "真实点时同步覆盖800只沪深股票和6只ETF，五项量化数据状态健康，抓取线程跨会话错误已修复",
     "Python 3.12后端全套496 passed；Ruff、git diff格式、Node 20前端5项测试与1562模块生产构建通过",
     "八套策略均完成至少500交易日回测；多因子核心、突破趋势、业绩公告漂移、市场状态配置和风险平价组合通过并完成无下单演练",
