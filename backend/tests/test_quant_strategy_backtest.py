@@ -1,25 +1,31 @@
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import Session
 
 from app.config import Settings
 from app.database import Base
 from app.models import (
     BacktestRun,
+    FinancialReportSnapshot,
     MarketDailyBar,
+    MarketDailyMetric,
     Stock,
+    StockEvent,
     StrategyBacktestQualification,
     StrategyConfig,
     StrategyDefinition,
 )
 from app.quant_strategies.backtest import (
     BacktestMetrics,
+    _PointInTimeCache,
+    _build_cached_historical_target_portfolio,
     _schedule_matches,
+    build_historical_target_portfolio,
     qualification_passes,
     run_quant_backtest,
 )
@@ -92,7 +98,7 @@ def test_short_reversal_backtest_applies_same_next_day_exit_policy(
 ):
     engine, _config_id, start = setup_backtest_db(tmp_path)
 
-    def raw_portfolio(_db, _config, *, as_of):
+    def raw_portfolio(_cache, _config, _definition, *, as_of):
         return TargetPortfolio(
             "short_term_reversal_t1",
             {"000858.SZ": 0.10},
@@ -103,7 +109,7 @@ def test_short_reversal_backtest_applies_same_next_day_exit_policy(
         )
 
     monkeypatch.setattr(
-        "app.quant_strategies.backtest.build_historical_target_portfolio",
+        "app.quant_strategies.backtest._build_cached_historical_target_portfolio",
         raw_portfolio,
     )
     with Session(engine) as db:
@@ -266,3 +272,171 @@ def test_backtest_carries_last_close_for_missing_held_open_without_trading(
         assert missing_day["rebalance_applied"] is False
         assert missing_day["equity"] > 1_900_000
         assert metrics.data_completeness < 1
+
+
+def test_default_backtest_preloads_point_in_time_inputs_with_constant_queries(
+    tmp_path: Path,
+):
+    engine, _config_id, start = setup_backtest_db(tmp_path)
+    select_statements: list[str] = []
+
+    def capture_select(_conn, _cursor, statement, *_args):
+        if statement.lstrip().upper().startswith("SELECT"):
+            select_statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", capture_select)
+    try:
+        with Session(engine) as db:
+            config = db.scalar(
+                select(StrategyConfig)
+                .join(StrategyDefinition)
+                .where(StrategyDefinition.key == "breakout_trend")
+            )
+            select_statements.clear()
+
+            metrics, _qualification = run_quant_backtest(
+                db,
+                config,
+                start_date=start.isoformat(),
+                end_date=(start + timedelta(days=59)).isoformat(),
+            )
+    finally:
+        event.remove(engine, "before_cursor_execute", capture_select)
+
+    assert metrics.trading_days == 59
+    assert len(select_statements) <= 20
+
+
+def test_backtest_point_in_time_cache_never_exposes_future_inputs(tmp_path: Path):
+    engine, _config_id, start = setup_backtest_db(tmp_path)
+    before = start + timedelta(days=5)
+    future = start + timedelta(days=10)
+    with Session(engine) as db:
+        config = db.scalar(
+            select(StrategyConfig)
+            .join(StrategyDefinition)
+            .where(StrategyDefinition.key == "breakout_trend")
+        )
+        definition = db.get(StrategyDefinition, config.strategy_definition_id)
+        stock = db.scalar(select(Stock).where(Stock.symbol == "000858.SZ"))
+        db.add_all(
+            [
+                MarketDailyMetric(
+                    stock_id=stock.id,
+                    trade_date=start.isoformat(),
+                    pb=1.0,
+                    source="point-in-time-test",
+                    captured_at=datetime.combine(start, time(16, 15)),
+                ),
+                MarketDailyMetric(
+                    stock_id=stock.id,
+                    trade_date=future.isoformat(),
+                    pb=99.0,
+                    source="point-in-time-test",
+                    captured_at=datetime.combine(future, time(16, 15)),
+                ),
+                FinancialReportSnapshot(
+                    stock_id=stock.id,
+                    report_period="2023-09-30",
+                    announcement_date=start.isoformat(),
+                    actual_announcement_date=start.isoformat(),
+                    available_on=start.isoformat(),
+                    roe=0.1,
+                    source="point-in-time-test",
+                ),
+                FinancialReportSnapshot(
+                    stock_id=stock.id,
+                    report_period="2023-12-31",
+                    announcement_date=future.isoformat(),
+                    actual_announcement_date=future.isoformat(),
+                    available_on=future.isoformat(),
+                    roe=0.9,
+                    source="point-in-time-test",
+                ),
+                StockEvent(
+                    stock_id=stock.id,
+                    event_type="major_announcement",
+                    title="未来风险公告",
+                    source="point-in-time-test",
+                    source_event_id="future-risk-event",
+                    published_at=datetime.combine(future, time(16, 0)),
+                    fetched_at=datetime.combine(future, time(16, 5)),
+                ),
+            ]
+        )
+        db.commit()
+
+        cache = _PointInTimeCache.load(
+            db,
+            config,
+            definition,
+            end_date=(future + timedelta(days=1)).isoformat(),
+            candidate_stocks={stock.symbol: stock},
+        )
+        candidate = cache.candidate(stock, before)
+
+        assert candidate.bars[-1].trade_date == before
+        assert candidate.metric["pb"] == 1.0
+        assert candidate.financial.roe == 0.1
+        assert candidate.financial_history == ()
+        assert not cache.has_blocking_event(
+            stock.id,
+            cutoff=datetime.combine(before, time(16, 30)),
+        )
+        assert cache.candidate(stock, future).metric["pb"] == 99.0
+        assert cache.has_blocking_event(
+            stock.id,
+            cutoff=datetime.combine(future, time(16, 30)),
+        )
+
+
+@pytest.mark.parametrize(
+    "strategy_key",
+    [
+        "multi_factor_core",
+        "relative_strength_rotation",
+        "breakout_trend",
+        "short_term_reversal_t1",
+        "low_vol_quality",
+        "earnings_drift",
+    ],
+)
+def test_cached_backtest_portfolio_matches_point_in_time_queries(
+    tmp_path: Path,
+    strategy_key: str,
+):
+    engine, _config_id, start = setup_backtest_db(tmp_path)
+    as_of = start + timedelta(days=300)
+    with Session(engine) as db:
+        config = db.scalar(
+            select(StrategyConfig)
+            .join(StrategyDefinition)
+            .where(StrategyDefinition.key == strategy_key)
+        )
+        definition = db.get(StrategyDefinition, config.strategy_definition_id)
+        stocks = {
+            stock.symbol: stock
+            for stock in db.scalars(
+                select(Stock).where(
+                    Stock.status == "active",
+                    Stock.instrument_type == "STOCK",
+                )
+            )
+        }
+        cache = _PointInTimeCache.load(
+            db,
+            config,
+            definition,
+            end_date=as_of.isoformat(),
+            candidate_stocks=stocks,
+        )
+
+        queried = build_historical_target_portfolio(db, config, as_of=as_of)
+        cached = _build_cached_historical_target_portfolio(
+            cache,
+            config,
+            definition,
+            as_of=as_of,
+        )
+
+        assert cached == queried

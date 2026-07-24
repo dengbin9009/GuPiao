@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 import math
@@ -11,7 +12,9 @@ from sqlalchemy.orm import Session
 
 from ..models import (
     BacktestRun,
+    FinancialReportSnapshot,
     MarketDailyBar,
+    MarketDailyMetric,
     SimulationAccount,
     Stock,
     StockEvent,
@@ -19,8 +22,14 @@ from ..models import (
     StrategyConfig,
     StrategyDefinition,
 )
-from .algorithms import TargetPortfolio, build_target_portfolio
-from .catalog import QUANT_STRATEGY_SPECS
+from .algorithms import (
+    CandidateInput,
+    FinancialPoint,
+    PriceBar,
+    TargetPortfolio,
+    build_target_portfolio,
+)
+from .catalog import DEFAULT_ETF_UNIVERSE, QUANT_STRATEGY_SPECS
 from .holding_policy import HoldingContext, apply_holding_policy
 from .readiness import configuration_fingerprint
 from .signals import BLOCKING_EVENTS, _benchmark, _candidate, _universe
@@ -36,6 +45,311 @@ class BacktestMetrics:
     trade_count: int
     final_equity: float
     equity_curve: tuple[dict[str, object], ...]
+
+
+@dataclass(frozen=True)
+class _PointInTimeCache:
+    stocks_by_symbol: dict[str, Stock]
+    candidate_stocks: tuple[Stock, ...]
+    bars_by_stock: dict[int, tuple[PriceBar, ...]]
+    adjusted_bars_by_stock: dict[int, tuple[PriceBar, ...]]
+    financial_by_stock: dict[int, tuple[FinancialPoint, ...]]
+    metrics_by_stock: dict[int, tuple[tuple[date, dict[str, float]], ...]]
+    blocking_events_by_stock: dict[int, tuple[datetime, ...]]
+
+    @classmethod
+    def load(
+        cls,
+        db: Session,
+        config: StrategyConfig,
+        definition: StrategyDefinition,
+        *,
+        end_date: str,
+        candidate_stocks: dict[str, Stock],
+    ) -> _PointInTimeCache:
+        stocks_by_symbol = dict(candidate_stocks)
+        if definition.key in {"short_term_reversal_t1", "regime_allocator"}:
+            benchmark_symbol = str(
+                (config.parameters or {}).get("benchmark_symbol", "000300.SH")
+            )
+            benchmark = db.scalar(
+                select(Stock).where(Stock.symbol == benchmark_symbol)
+            )
+            if benchmark is not None:
+                stocks_by_symbol[benchmark.symbol] = benchmark
+        stock_ids = [stock.id for stock in stocks_by_symbol.values()]
+
+        bars_by_stock: dict[int, list[PriceBar]] = {
+            stock_id: [] for stock_id in stock_ids
+        }
+        adjusted_bars_by_stock: dict[int, list[PriceBar]] = {
+            stock_id: [] for stock_id in stock_ids
+        }
+        bar_rows = db.scalars(
+            select(MarketDailyBar)
+            .where(
+                MarketDailyBar.stock_id.in_(stock_ids),
+                MarketDailyBar.trade_date <= end_date,
+                MarketDailyBar.quality_status == "valid",
+                ~func.lower(MarketDailyBar.source).like("%demo%"),
+            )
+            .order_by(MarketDailyBar.stock_id, MarketDailyBar.trade_date)
+        )
+        for row in bar_rows:
+            price_bar = PriceBar(
+                trade_date=date.fromisoformat(row.trade_date),
+                open=float(row.open),
+                high=float(row.high),
+                low=float(row.low),
+                close=float(row.close),
+                volume=float(row.volume),
+                amount=float(row.amount),
+                adjusted_close=float(row.adjusted_close or row.close),
+            )
+            bars_by_stock[row.stock_id].append(price_bar)
+            if (
+                row.adjusted_close is not None
+                and row.adjustment_factor is not None
+                and row.adjustment_factor > 0
+            ):
+                adjusted_bars_by_stock[row.stock_id].append(price_bar)
+
+        financial_by_stock: dict[int, list[FinancialPoint]] = {
+            stock_id: [] for stock_id in stock_ids
+        }
+        financial_rows = db.scalars(
+            select(FinancialReportSnapshot)
+            .where(
+                FinancialReportSnapshot.stock_id.in_(stock_ids),
+                FinancialReportSnapshot.available_on <= end_date,
+                FinancialReportSnapshot.actual_announcement_date <= end_date,
+            )
+            .order_by(
+                FinancialReportSnapshot.stock_id,
+                FinancialReportSnapshot.report_period,
+                FinancialReportSnapshot.actual_announcement_date,
+                FinancialReportSnapshot.id,
+            )
+        )
+        for row in financial_rows:
+            financial_by_stock[row.stock_id].append(
+                FinancialPoint(
+                    report_period=date.fromisoformat(row.report_period),
+                    actual_announcement_date=date.fromisoformat(
+                        row.actual_announcement_date
+                    ),
+                    available_on=date.fromisoformat(row.available_on),
+                    eps=row.eps,
+                    roe=row.roe,
+                    gross_margin=row.gross_margin,
+                    operating_cash_flow=row.operating_cash_flow,
+                    net_profit=row.net_profit,
+                    revenue=row.revenue,
+                    total_assets=row.total_assets,
+                    total_liabilities=row.total_liabilities,
+                )
+            )
+
+        metrics_by_stock: dict[
+            int,
+            list[tuple[date, dict[str, float]]],
+        ] = {stock_id: [] for stock_id in stock_ids}
+        metric_rows = db.scalars(
+            select(MarketDailyMetric)
+            .where(
+                MarketDailyMetric.stock_id.in_(stock_ids),
+                MarketDailyMetric.trade_date <= end_date,
+            )
+            .order_by(
+                MarketDailyMetric.stock_id,
+                MarketDailyMetric.trade_date,
+                MarketDailyMetric.id,
+            )
+        )
+        for row in metric_rows:
+            metrics_by_stock[row.stock_id].append(
+                (
+                    date.fromisoformat(row.trade_date),
+                    {
+                        key: float(value)
+                        for key in (
+                            "pe_ttm",
+                            "pb",
+                            "dividend_yield",
+                            "total_market_value",
+                            "float_market_value",
+                        )
+                        if (value := getattr(row, key)) is not None
+                    },
+                )
+            )
+
+        blocking_events_by_stock: dict[int, list[datetime]] = {
+            stock_id: [] for stock_id in stock_ids
+        }
+        event_rows = db.execute(
+            select(StockEvent.stock_id, StockEvent.published_at)
+            .where(
+                StockEvent.stock_id.in_(stock_ids),
+                StockEvent.event_type.in_(BLOCKING_EVENTS),
+                StockEvent.published_at
+                <= datetime.combine(date.fromisoformat(end_date), time.max),
+            )
+            .order_by(StockEvent.stock_id, StockEvent.published_at)
+        )
+        for stock_id, published_at in event_rows:
+            blocking_events_by_stock[stock_id].append(published_at)
+
+        return cls(
+            stocks_by_symbol=stocks_by_symbol,
+            candidate_stocks=tuple(candidate_stocks.values()),
+            bars_by_stock={
+                stock_id: tuple(rows) for stock_id, rows in bars_by_stock.items()
+            },
+            adjusted_bars_by_stock={
+                stock_id: tuple(rows)
+                for stock_id, rows in adjusted_bars_by_stock.items()
+            },
+            financial_by_stock={
+                stock_id: tuple(rows)
+                for stock_id, rows in financial_by_stock.items()
+            },
+            metrics_by_stock={
+                stock_id: tuple(rows)
+                for stock_id, rows in metrics_by_stock.items()
+            },
+            blocking_events_by_stock={
+                stock_id: tuple(rows)
+                for stock_id, rows in blocking_events_by_stock.items()
+            },
+        )
+
+    @staticmethod
+    def _through_date(rows, as_of: date):
+        return rows[: bisect_right(rows, as_of, key=lambda row: row.trade_date)]
+
+    def bars(self, stock: Stock, as_of: date) -> tuple[PriceBar, ...]:
+        source = (
+            self.adjusted_bars_by_stock
+            if stock.instrument_type == "STOCK"
+            else self.bars_by_stock
+        )
+        visible = self._through_date(source.get(stock.id, ()), as_of)[-300:]
+        if not visible or visible[-1].trade_date != as_of:
+            return ()
+        return tuple(visible)
+
+    def financial(self, stock_id: int, as_of: date) -> tuple[FinancialPoint, ...]:
+        latest_by_period: dict[date, FinancialPoint] = {}
+        for row in self.financial_by_stock.get(stock_id, ()):
+            if row.available_on <= as_of and row.actual_announcement_date <= as_of:
+                latest_by_period[row.report_period] = row
+        return tuple(latest_by_period[key] for key in sorted(latest_by_period))
+
+    def metric(self, stock_id: int, as_of: date) -> dict[str, float]:
+        rows = self.metrics_by_stock.get(stock_id, ())
+        index = bisect_right(rows, as_of, key=lambda row: row[0])
+        return dict(rows[index - 1][1]) if index else {}
+
+    def candidate(self, stock: Stock, as_of: date) -> CandidateInput:
+        financial = self.financial(stock.id, as_of)
+        return CandidateInput(
+            symbol=stock.symbol,
+            name=stock.name,
+            instrument_type=stock.instrument_type,
+            bars=self.bars(stock, as_of),
+            financial=financial[-1] if financial else None,
+            metric=self.metric(stock.id, as_of),
+            financial_history=financial[:-1],
+        )
+
+    def has_blocking_event(
+        self,
+        stock_id: int,
+        *,
+        cutoff: datetime,
+    ) -> bool:
+        start = cutoff - timedelta(days=7)
+        return any(
+            start <= published_at <= cutoff
+            for published_at in self.blocking_events_by_stock.get(stock_id, ())
+        )
+
+    def universe(
+        self,
+        config: StrategyConfig,
+        key: str,
+        as_of: date,
+        *,
+        decision_at: datetime | None = None,
+    ) -> tuple[list[Stock], dict[str, tuple[str, ...]]]:
+        spec = QUANT_STRATEGY_SPECS[key]
+        parameters = config.parameters or {}
+        if spec.asset_type == "ETF":
+            symbols = list(
+                parameters.get("etf_universe") or DEFAULT_ETF_UNIVERSE
+            )
+            return [
+                self.stocks_by_symbol[symbol]
+                for symbol in sorted(symbols)
+                if symbol in self.stocks_by_symbol
+                and self.stocks_by_symbol[symbol].status == "active"
+                and self.stocks_by_symbol[symbol].instrument_type == "ETF"
+            ], {}
+
+        prefilter_size = min(
+            800,
+            max(1, int(parameters.get("prefilter_size", 800))),
+        )
+        cutoff = decision_at or datetime.combine(as_of, time.max)
+        blocked: dict[str, tuple[str, ...]] = {}
+        eligible: list[tuple[Stock, float]] = []
+        for stock in self.candidate_stocks:
+            reasons = []
+            if "ST" in stock.name.upper():
+                reasons.append("ST股票")
+            if stock.listing_date is None:
+                reasons.append("缺少上市日期")
+            elif (as_of - date.fromisoformat(stock.listing_date[:10])).days < 120:
+                reasons.append("上市不足120日")
+            if self.has_blocking_event(stock.id, cutoff=cutoff):
+                reasons.append("命中风险公告")
+            visible = self._through_date(
+                self.bars_by_stock.get(stock.id, ()),
+                as_of,
+            )
+            recent = visible[-20:]
+            average_amount = (
+                sum(row.amount for row in recent) / len(recent)
+                if recent
+                else 0.0
+            )
+            if len(recent) < 20:
+                reasons.append("20日成交额历史不足")
+            if average_amount < float(
+                parameters.get("min_average_turnover", 100_000_000)
+            ):
+                reasons.append("20日平均成交额不足1亿元")
+            if reasons:
+                blocked[stock.symbol] = tuple(dict.fromkeys(reasons))
+            else:
+                eligible.append((stock, average_amount))
+        eligible.sort(key=lambda row: (-row[1], row[0].symbol))
+        return [row[0] for row in eligible[:prefilter_size]], blocked
+
+    def benchmark(
+        self,
+        config: StrategyConfig,
+        key: str,
+        as_of: date,
+    ) -> CandidateInput | None:
+        if key not in {"short_term_reversal_t1", "regime_allocator"}:
+            return None
+        symbol = str(
+            (config.parameters or {}).get("benchmark_symbol", "000300.SH")
+        )
+        stock = self.stocks_by_symbol.get(symbol)
+        return self.candidate(stock, as_of) if stock is not None else None
 
 
 def qualification_passes(metrics: BacktestMetrics) -> bool:
@@ -97,6 +411,28 @@ def build_historical_target_weights(
     ).target_weights
 
 
+def _build_cached_historical_target_portfolio(
+    cache: _PointInTimeCache,
+    config: StrategyConfig,
+    definition: StrategyDefinition,
+    *,
+    as_of: date,
+) -> TargetPortfolio:
+    stocks, _ = cache.universe(
+        config,
+        definition.key,
+        as_of,
+        decision_at=datetime.combine(as_of, time(16, 30)),
+    )
+    return build_target_portfolio(
+        definition.key,
+        [cache.candidate(stock, as_of) for stock in stocks],
+        benchmark=cache.benchmark(config, definition.key, as_of),
+        as_of=as_of,
+        parameters=config.parameters or {},
+    )
+
+
 def _backtest_holding_contexts(
     db: Session,
     *,
@@ -106,6 +442,7 @@ def _backtest_holding_contexts(
     stocks: dict[str, Stock],
     cash: float,
     as_of: date,
+    point_in_time_cache: _PointInTimeCache | None = None,
 ) -> list[HoldingContext]:
     visible = {
         symbol: [
@@ -135,12 +472,16 @@ def _backtest_holding_contexts(
         prior_window = rows[-21:-1] or rows[-20:]
         stock = stocks[symbol]
         cutoff = datetime.combine(as_of, time(16, 30))
-        risk_event = db.scalar(
-            select(StockEvent.id).where(
-                StockEvent.stock_id == stock.id,
-                StockEvent.event_type.in_(BLOCKING_EVENTS),
-                StockEvent.published_at >= cutoff - timedelta(days=7),
-                StockEvent.published_at <= cutoff,
+        risk_event = (
+            point_in_time_cache.has_blocking_event(stock.id, cutoff=cutoff)
+            if point_in_time_cache is not None
+            else db.scalar(
+                select(StockEvent.id).where(
+                    StockEvent.stock_id == stock.id,
+                    StockEvent.event_type.in_(BLOCKING_EVENTS),
+                    StockEvent.published_at >= cutoff - timedelta(days=7),
+                    StockEvent.published_at <= cutoff,
+                )
             )
         )
         contexts.append(
@@ -270,6 +611,13 @@ def run_quant_backtest(
             histories[symbol].append(row)
     for rows in histories.values():
         rows.sort(key=lambda item: item.trade_date)
+    point_in_time_cache = _PointInTimeCache.load(
+        db,
+        config,
+        definition,
+        end_date=end_date,
+        candidate_stocks=stocks,
+    )
 
     account = db.get(SimulationAccount, config.simulation_account_id)
     initial_cash = float(account.initial_cash if account else 2_000_000)
@@ -310,9 +658,10 @@ def run_quant_backtest(
                     else {}
                 )
             else:
-                raw = build_historical_target_portfolio(
-                    db,
+                raw = _build_cached_historical_target_portfolio(
+                    point_in_time_cache,
                     config,
+                    definition,
                     as_of=signal_date,
                 )
                 adjusted = apply_holding_policy(
@@ -325,6 +674,7 @@ def run_quant_backtest(
                         stocks=stocks,
                         cash=cash,
                         as_of=signal_date,
+                        point_in_time_cache=point_in_time_cache,
                     ),
                     consumed_reports=consumed_reports,
                     parameters=config.parameters or {},
