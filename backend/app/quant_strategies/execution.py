@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from ..config import get_settings
 from ..models import (
     Fill,
+    MarketDailyBar,
     Order,
     Position,
     QuantPortfolioDecision,
@@ -209,6 +210,43 @@ def _quote_readiness_reason(
     return None
 
 
+def _completed_close_prices(
+    db: Session,
+    *,
+    account: SimulationAccount,
+    targets: dict[str, float],
+    trading_date: str,
+) -> tuple[dict[str, float], str | None]:
+    held_symbols = set(
+        db.scalars(
+            select(Stock.symbol)
+            .join(Position, Position.stock_id == Stock.id)
+            .where(
+                Position.account_id == account.id,
+                Position.mode == "SIMULATION",
+                Position.quantity > 0,
+            )
+        )
+    )
+    symbols = set(targets) | held_symbols
+    rows = db.execute(
+        select(Stock.symbol, MarketDailyBar.close)
+        .join(MarketDailyBar, MarketDailyBar.stock_id == Stock.id)
+        .where(
+            Stock.symbol.in_(symbols),
+            MarketDailyBar.trade_date == trading_date,
+            MarketDailyBar.quality_status == "valid",
+            MarketDailyBar.close > 0,
+            ~func.lower(MarketDailyBar.source).like("%demo%"),
+        )
+    )
+    prices = {str(symbol): float(close) for symbol, close in rows}
+    missing = sorted(symbols - prices.keys())
+    if missing:
+        return prices, f"{missing[0]} 缺少决策日有效收盘价"
+    return prices, None
+
+
 def _plan_orders(
     db: Session,
     *,
@@ -218,6 +256,7 @@ def _plan_orders(
     risk: StrategyRiskProfile,
     targets: dict[str, float],
     current: datetime,
+    planning_prices: dict[str, float] | None = None,
 ) -> list[PlannedOrder]:
     spec = QUANT_STRATEGY_SPECS[definition.key]
     if len(targets) > spec.max_positions:
@@ -272,11 +311,16 @@ def _plan_orders(
     plans: list[PlannedOrder] = []
     for symbol in symbols:
         stock = stocks[symbol]
-        if stock.status != "active" or not stock.last_price:
+        market_price = (
+            planning_prices.get(symbol)
+            if planning_prices is not None
+            else stock.last_price
+        )
+        if stock.status != "active" or not market_price:
             raise ValueError(f"{symbol} 当前不可交易或行情缺失")
-        if _quote_is_stale(stock, current=current):
+        if planning_prices is None and _quote_is_stale(stock, current=current):
             raise ValueError(f"{symbol} 行情已过期")
-        market_price = float(stock.last_price)
+        market_price = float(market_price)
         lot_size = max(int(stock.lot_size), 1)
         slippage = float(account.slippage_bps) / 10_000
         sizing_price = market_price * (1 + slippage)
@@ -464,6 +508,8 @@ def execute_quant_rebalance(
         str(key): float(value)
         for key, value in decision.target_weights.items()
     }
+    planning_prices = None
+    planning_price_source = "realtime_quote"
     quote_reason = _quote_readiness_reason(
         db,
         account=account,
@@ -471,7 +517,17 @@ def execute_quant_rebalance(
         current=current,
     )
     if quote_reason:
-        return _retryable_blocked(db, run, decision, quote_reason)
+        if not dry_run:
+            return _retryable_blocked(db, run, decision, quote_reason)
+        planning_prices, close_reason = _completed_close_prices(
+            db,
+            account=account,
+            targets=targets,
+            trading_date=decision.trading_date,
+        )
+        if close_reason:
+            return _retryable_blocked(db, run, decision, close_reason)
+        planning_price_source = "completed_daily_close"
     revalue_account(db, account)
     try:
         plans = _plan_orders(
@@ -482,6 +538,7 @@ def execute_quant_rebalance(
             risk=risk,
             targets=targets,
             current=current,
+            planning_prices=planning_prices,
         )
     except ValueError as exc:
         reason = str(exc)
@@ -493,6 +550,8 @@ def execute_quant_rebalance(
         "accepted": len(plans),
         "precheck_passed": True,
         "dry_run": dry_run,
+        "planning_price_source": planning_price_source,
+        "execution_quote_recheck_required": dry_run,
         "decision_id": decision.id,
         "target_weights": decision.target_weights,
         "planned_orders": [

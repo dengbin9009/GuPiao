@@ -100,6 +100,53 @@ def test_dry_run_records_decision_without_orders(tmp_path: Path):
         assert db.scalar(select(func.count()).select_from(Order)) == 0
 
 
+def test_after_close_dry_run_uses_completed_daily_close_when_quote_is_stale(
+    tmp_path: Path,
+):
+    engine, current, config_ids = setup_runtime(tmp_path)
+    current = current.replace(hour=22)
+    with Session(engine) as db:
+        config = db.get(StrategyConfig, config_ids["multi_factor_core"])
+        stock = db.scalar(select(Stock).where(Stock.symbol == "000001.SZ"))
+        stock.quote_updated_at = current - timedelta(hours=7)
+        event_source = db.scalar(
+            select(DataSourceState).where(
+                DataSourceState.provider == "akshare_events"
+            )
+        )
+        event_source.last_checked_at = current
+        db.add(
+            MarketDailyBar(
+                stock_id=stock.id,
+                trade_date=current.date().isoformat(),
+                open=11.8,
+                high=12.2,
+                low=11.7,
+                close=12.0,
+                adjusted_close=12.0,
+                adjustment_factor=1.0,
+                volume=1_000_000,
+                amount=12_000_000,
+                quality_status="valid",
+                source="akshare",
+                captured_at=current,
+            )
+        )
+        decision = decision_for(db, config, current, {stock.symbol: 0.10})
+        decision.trading_date = current.date().isoformat()
+        db.commit()
+
+        run = execute_quant_rebalance(db, decision, current=current, dry_run=True)
+
+        assert run.summary["precheck_passed"] is True
+        assert run.summary["planning_price_source"] == "completed_daily_close"
+        assert run.summary["planned_orders"] == [
+            {"symbol": stock.symbol, "side": "buy", "quantity": 16_600}
+        ]
+        assert run.summary["order_ids"] == []
+        assert db.scalar(select(func.count()).select_from(Order)) == 0
+
+
 def test_rebalance_uses_only_bound_account_and_applies_fees_and_lot_size(tmp_path: Path):
     engine, current, config_ids = setup_runtime(tmp_path)
     with Session(engine) as db:
