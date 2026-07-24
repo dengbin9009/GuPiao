@@ -1155,6 +1155,7 @@ def test_quant_sync_skips_complete_current_stock_datasets_on_restart(tmp_path: P
             )
             for trade_date in dates
         )
+        metric_dates = dates[-241:]
         db.add_all(
             MarketDailyMetric(
                 stock_id=stock.id,
@@ -1162,8 +1163,9 @@ def test_quant_sync_skips_complete_current_stock_datasets_on_restart(tmp_path: P
                 pe_ttm=10,
                 pb=1,
                 source="akshare",
+                captured_at=current,
             )
-            for trade_date in dates
+            for trade_date in metric_dates
         )
         db.add(
             FinancialReportSnapshot(

@@ -424,14 +424,18 @@ def poll_quant_market_data(
                 )
                 is not None
             )
-            metric_count, latest_metric_date = db.execute(
+            metric_count, latest_metric_date, latest_metric_capture = db.execute(
                 select(
                     func.count(MarketDailyMetric.id),
                     func.max(MarketDailyMetric.trade_date),
+                    func.max(MarketDailyMetric.captured_at),
                 ).where(MarketDailyMetric.stock_id == stock.id)
             ).one()
             metric_complete = bool(
-                int(metric_count or 0) >= 500 and latest_metric_date == end
+                int(metric_count or 0) > 0
+                and latest_metric_date == end
+                and latest_metric_capture
+                and latest_metric_capture.date() == current.date()
             )
             latest_financial_fetch = db.scalar(
                 select(func.max(FinancialReportSnapshot.fetched_at)).where(
