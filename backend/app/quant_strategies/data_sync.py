@@ -177,18 +177,28 @@ def sync_daily_rows(
     amount_multiplier: float = 1,
     volume_multiplier: float = 1,
 ) -> int:
+    rows = list(rows)
+    trade_dates = {
+        trade_date
+        for row in rows
+        if (trade_date := _date_text(_field(row, "trade_date", "date", "日期")))
+    }
+    existing = {
+        bar.trade_date: bar
+        for bar in db.scalars(
+            select(MarketDailyBar).where(
+                MarketDailyBar.stock_id == stock.id,
+                MarketDailyBar.trade_date.in_(trade_dates),
+            )
+        )
+    } if trade_dates else {}
     changed = 0
     for row in rows:
         trade_date = _date_text(_field(row, "trade_date", "date", "日期"))
         close = float(_field(row, "close", "收盘", default=0) or 0)
         if not trade_date or close <= 0:
             continue
-        bar = db.scalar(
-            select(MarketDailyBar).where(
-                MarketDailyBar.stock_id == stock.id,
-                MarketDailyBar.trade_date == trade_date,
-            )
-        )
+        bar = existing.get(trade_date)
         if bar is None:
             bar = MarketDailyBar(
                 stock_id=stock.id,
@@ -200,6 +210,7 @@ def sync_daily_rows(
                 source=source,
             )
             db.add(bar)
+            existing[trade_date] = bar
         bar.open = float(_field(row, "open", "开盘", default=close) or close)
         bar.high = float(_field(row, "high", "最高", default=close) or close)
         bar.low = float(_field(row, "low", "最低", default=close) or close)
@@ -285,18 +296,28 @@ def sync_adjustment_rows(
     *,
     source: str,
 ) -> int:
+    rows = list(rows)
+    trade_dates = {
+        str(row.get("trade_date", ""))[:10]
+        for row in rows
+        if row.get("trade_date")
+    }
+    existing = {
+        bar.trade_date: bar
+        for bar in db.scalars(
+            select(MarketDailyBar).where(
+                MarketDailyBar.stock_id == stock.id,
+                MarketDailyBar.trade_date.in_(trade_dates),
+            )
+        )
+    } if trade_dates else {}
     changed = 0
     for row in rows:
         trade_date = str(row.get("trade_date", ""))[:10]
         factor = row.get("adjustment_factor")
         if not trade_date or factor in {None, ""} or float(factor) <= 0:
             continue
-        bar = db.scalar(
-            select(MarketDailyBar).where(
-                MarketDailyBar.stock_id == stock.id,
-                MarketDailyBar.trade_date == trade_date,
-            )
-        )
+        bar = existing.get(trade_date)
         if bar is None:
             continue
         bar.adjustment_factor = float(factor)
@@ -313,17 +334,27 @@ def sync_metric_rows(
     *,
     source: str,
 ) -> int:
+    rows = list(rows)
+    trade_dates = {
+        str(row.get("trade_date", ""))[:10]
+        for row in rows
+        if row.get("trade_date")
+    }
+    existing = {
+        metric.trade_date: metric
+        for metric in db.scalars(
+            select(MarketDailyMetric).where(
+                MarketDailyMetric.stock_id == stock.id,
+                MarketDailyMetric.trade_date.in_(trade_dates),
+            )
+        )
+    } if trade_dates else {}
     changed = 0
     for row in rows:
         trade_date = str(row.get("trade_date", ""))[:10]
         if not trade_date:
             continue
-        metric = db.scalar(
-            select(MarketDailyMetric).where(
-                MarketDailyMetric.stock_id == stock.id,
-                MarketDailyMetric.trade_date == trade_date,
-            )
-        )
+        metric = existing.get(trade_date)
         if metric is None:
             metric = MarketDailyMetric(
                 stock_id=stock.id,
@@ -331,6 +362,7 @@ def sync_metric_rows(
                 source=source,
             )
             db.add(metric)
+            existing[trade_date] = metric
         for name in (
             "pe_ttm",
             "pb",
@@ -354,6 +386,30 @@ def sync_financial_rows(
     source: str,
     trading_days: set[str] | None = None,
 ) -> int:
+    rows = list(rows)
+    keys = {
+        (
+            str(row.get("report_period", ""))[:10],
+            str(
+                row.get("actual_announcement_date")
+                or row.get("announcement_date")
+                or ""
+            )[:10],
+        )
+        for row in rows
+    }
+    periods = {period for period, actual in keys if period and actual}
+    actual_dates = {actual for period, actual in keys if period and actual}
+    existing = {
+        (snapshot.report_period, snapshot.actual_announcement_date): snapshot
+        for snapshot in db.scalars(
+            select(FinancialReportSnapshot).where(
+                FinancialReportSnapshot.stock_id == stock.id,
+                FinancialReportSnapshot.report_period.in_(periods),
+                FinancialReportSnapshot.actual_announcement_date.in_(actual_dates),
+            )
+        )
+    } if periods and actual_dates else {}
     changed = 0
     first_trading_day = (
         date.fromisoformat(min(trading_days)) if trading_days else None
@@ -373,13 +429,7 @@ def sync_financial_rows(
             < first_trading_day
         ):
             continue
-        snapshot = db.scalar(
-            select(FinancialReportSnapshot).where(
-                FinancialReportSnapshot.stock_id == stock.id,
-                FinancialReportSnapshot.report_period == period,
-                FinancialReportSnapshot.actual_announcement_date == actual,
-            )
-        )
+        snapshot = existing.get((period, actual))
         if snapshot is None:
             earliest_available = financial_available_on(
                 actual,
@@ -394,6 +444,7 @@ def sync_financial_rows(
                 source=source,
             )
             db.add(snapshot)
+            existing[(period, actual)] = snapshot
         else:
             earliest_available = financial_available_on(
                 actual,

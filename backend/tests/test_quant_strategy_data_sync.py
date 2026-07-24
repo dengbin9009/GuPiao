@@ -5,7 +5,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import Session
 
 from app.config import Settings
@@ -42,6 +42,88 @@ class Frame:
     def to_dict(self, orient):
         assert orient == "records"
         return self.rows
+
+
+def test_quant_dataset_upserts_preload_existing_rows_in_bulk(tmp_path: Path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'bulk-upsert.db'}")
+    Base.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as db:
+        stock = Stock(
+            code="000001",
+            exchange="SZSE",
+            symbol="000001.SZ",
+            name="平安银行",
+            status="active",
+            instrument_type="STOCK",
+        )
+        db.add(stock)
+        db.commit()
+        dates = [f"2026-07-{day:02d}" for day in range(1, 21)]
+        select_statements = []
+
+        def record_select(_conn, _cursor, statement, *_args):
+            if statement.lstrip().upper().startswith("SELECT"):
+                select_statements.append(statement)
+
+        event.listen(engine, "before_cursor_execute", record_select)
+        try:
+            sync_daily_rows(
+                db,
+                stock,
+                [
+                    {
+                        "trade_date": trade_date,
+                        "open": 10,
+                        "high": 11,
+                        "low": 9,
+                        "close": 10,
+                        "volume": 100,
+                        "amount": 200_000_000,
+                    }
+                    for trade_date in dates
+                ],
+                source="akshare",
+            )
+            sync_adjustment_rows(
+                db,
+                stock,
+                [
+                    {"trade_date": trade_date, "adjustment_factor": 1.2}
+                    for trade_date in dates
+                ],
+                source="akshare",
+            )
+            sync_metric_rows(
+                db,
+                stock,
+                [
+                    {"trade_date": trade_date, "pe_ttm": 10, "pb": 1}
+                    for trade_date in dates
+                ],
+                source="akshare",
+            )
+            sync_financial_rows(
+                db,
+                stock,
+                [
+                    {
+                        "report_period": "2025-12-31",
+                        "actual_announcement_date": "2026-03-20",
+                        "eps": 1,
+                    },
+                    {
+                        "report_period": "2026-03-31",
+                        "actual_announcement_date": "2026-04-25",
+                        "eps": 0.3,
+                    },
+                ],
+                source="akshare",
+                trading_days={"2026-03-23", "2026-04-27"},
+            )
+        finally:
+            event.remove(engine, "before_cursor_execute", record_select)
+
+        assert len(select_statements) <= 4
 
 
 class FakeTushare:
