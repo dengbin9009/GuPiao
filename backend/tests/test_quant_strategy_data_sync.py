@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from pathlib import Path
+from threading import Barrier
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -925,6 +926,84 @@ def test_worker_quant_sync_includes_stock_and_etf_daily_data(tmp_path: Path):
             )
         )
         assert report.available_on == "2026-07-21"
+
+
+def test_worker_quant_sync_fetches_stock_payloads_concurrently(tmp_path: Path):
+    from app.worker import poll_quant_market_data
+
+    database_url = f"sqlite:///{tmp_path / 'parallel-fetch.db'}"
+    engine = create_engine(database_url)
+    Base.metadata.create_all(engine)
+    symbols = ("001201.SZ", "001202.SZ")
+    with Session(engine) as db:
+        for index, symbol in enumerate(symbols):
+            db.add(
+                Stock(
+                    code=symbol.split(".")[0],
+                    exchange="SZSE",
+                    symbol=symbol,
+                    name=f"并发测试{index}",
+                    instrument_type="STOCK",
+                    status="active",
+                    turnover_amount=300_000_000 - index,
+                )
+            )
+        db.commit()
+
+    barrier = Barrier(2)
+
+    class Source:
+        name = "fake"
+
+        def etf_master(self):
+            return []
+
+        def bars(self, *, symbol, timeframe, start, end):
+            assert timeframe == "1d"
+            barrier.wait(timeout=2)
+            return [
+                {
+                    "trade_date": end,
+                    "open": 10,
+                    "high": 11,
+                    "low": 9,
+                    "close": 10,
+                    "volume": 100,
+                    "amount": 200_000_000,
+                }
+            ]
+
+        def adjustment_factors(self, symbol, *, start, end):
+            return [{"trade_date": end, "adjustment_factor": 1.2}]
+
+        def daily_metrics(self, symbol, *, start, end):
+            return [{"trade_date": end, "pe_ttm": 10, "pb": 1}]
+
+        def financial_reports(self, symbol):
+            return [
+                {
+                    "report_period": "2026-06-30",
+                    "actual_announcement_date": "2026-07-20",
+                    "roe": 0.15,
+                    "gross_margin": 0.3,
+                    "operating_cash_flow": 10,
+                    "total_assets": 100,
+                    "total_liabilities": 30,
+                }
+            ]
+
+    result = poll_quant_market_data(
+        provider=Source(),
+        trading_days={"2026-07-21", "2026-07-24"},
+        session_factory=lambda: Session(engine),
+        current=datetime(2026, 7, 24, 16, 15, tzinfo=ZoneInfo("Asia/Shanghai")),
+        stock_fetch_workers=2,
+    )
+
+    assert result["stocks"] == 2
+    assert result["errors"] == 0
+    with Session(engine) as db:
+        assert db.scalar(select(MarketDailyBar).where(MarketDailyBar.adjusted_close.is_(None))) is None
 
 
 def test_quant_sync_stock_universe_uses_liquidity_but_always_keeps_holdings(

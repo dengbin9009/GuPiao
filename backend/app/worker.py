@@ -118,6 +118,27 @@ class QuantDataSyncPoll:
     started: bool
 
 
+@dataclass(frozen=True)
+class QuantStockFetchPlan:
+    stock_id: int
+    symbol: str
+    existing_count: int
+    start: str
+
+
+@dataclass(frozen=True)
+class QuantStockPayload:
+    plan: QuantStockFetchPlan
+    daily_source: str | None
+    bars: list[dict]
+    adjustments: list[dict]
+    daily_error: str | None
+    metrics: list[dict]
+    metric_error: str | None
+    financial: list[dict]
+    financial_error: str | None
+
+
 def poll_due_quant_data_sync(
     *,
     current: datetime,
@@ -181,6 +202,7 @@ def poll_quant_market_data(
     session_factory=SessionLocal,
     current: datetime | None = None,
     trading_days: set[str] | None = None,
+    stock_fetch_workers: int = 4,
 ) -> dict[str, int]:
     current = current or datetime.now(SHANGHAI)
     use_default_providers = provider is None and router is None
@@ -364,6 +386,8 @@ def poll_quant_market_data(
             except Exception as exc:
                 batch_financial = {}
                 batch_financial_error = str(exc)[:1000]
+        stock_by_id = {stock.id: stock for stock in stocks}
+        fetch_plans = []
         for stock in stocks:
             existing_count, latest_date = db.execute(
                 select(
@@ -377,52 +401,128 @@ def poll_quant_market_data(
                     current.date() - timedelta(days=30),
                     date.fromisoformat(str(latest_date)) - timedelta(days=5),
                 )
-            start = start_date.isoformat()
-            daily_ok = False
-            metric_ok = False
-            financial_ok = False
+            fetch_plans.append(
+                QuantStockFetchPlan(
+                    stock_id=stock.id,
+                    symbol=stock.symbol,
+                    existing_count=int(existing_count or 0),
+                    start=start_date.isoformat(),
+                )
+            )
+
+        def fetch_stock_payload(plan: QuantStockFetchPlan) -> QuantStockPayload:
+            daily_source = None
+            bars = []
+            adjustments = []
+            daily_error = None
+            metrics = []
+            metric_error = None
+            financial = []
+            financial_error = None
             try:
-                if int(existing_count or 0) >= 520 and batch_daily is not None:
+                if plan.existing_count >= 520 and batch_daily is not None:
                     daily_source = source.name
-                    bars = [batch_daily[stock.symbol]] if stock.symbol in batch_daily else []
+                    bars = (
+                        [batch_daily[plan.symbol]]
+                        if plan.symbol in batch_daily
+                        else []
+                    )
                 else:
                     daily_source, bars = routed_rows(
                         "daily",
                         "bars",
-                        symbol=stock.symbol,
+                        symbol=plan.symbol,
                         timeframe="1d",
-                        start=start,
+                        start=plan.start,
                         end=end,
                     )
-                daily_rows += sync_daily_rows(
-                    db,
-                    stock,
-                    bars,
-                    source=daily_source,
-                    amount_multiplier=(
-                        1
-                        if batch_daily is not None and int(existing_count or 0) >= 520
-                        else 1000 if daily_source == "tushare" else 1
-                    ),
-                    volume_multiplier=(
-                        1
-                        if batch_daily is not None and int(existing_count or 0) >= 520
-                        else 100 if daily_source == "tushare" else 1
-                    ),
-                )
-                if int(existing_count or 0) >= 520 and batch_adjustments is not None:
-                    adjusted = (
-                        [batch_adjustments[stock.symbol]]
-                        if stock.symbol in batch_adjustments
+                if plan.existing_count >= 520 and batch_adjustments is not None:
+                    adjustments = (
+                        [batch_adjustments[plan.symbol]]
+                        if plan.symbol in batch_adjustments
                         else []
                     )
                 else:
-                    adjusted = source.adjustment_factors(
-                        stock.symbol,
-                        start=start,
-                        end=end,
+                    adjustments = list(
+                        source.adjustment_factors(
+                            plan.symbol,
+                            start=plan.start,
+                            end=end,
+                        )
                     )
-                sync_adjustment_rows(db, stock, adjusted, source=source.name)
+            except Exception as exc:
+                daily_error = str(exc)[:1000]
+            try:
+                if plan.existing_count >= 520 and batch_metrics is not None:
+                    metrics = (
+                        [batch_metrics[plan.symbol]]
+                        if plan.symbol in batch_metrics
+                        else []
+                    )
+                else:
+                    metrics = list(
+                        source.daily_metrics(
+                            plan.symbol,
+                            start=plan.start,
+                            end=end,
+                        )
+                    )
+            except Exception as exc:
+                metric_error = str(exc)[:1000]
+            try:
+                if batch_financial is not None:
+                    if batch_financial_error:
+                        raise RuntimeError(batch_financial_error)
+                    financial = batch_financial.get(plan.symbol, [])
+                else:
+                    financial = list(source.financial_reports(plan.symbol))
+            except Exception as exc:
+                financial_error = str(exc)[:1000]
+            return QuantStockPayload(
+                plan=plan,
+                daily_source=daily_source,
+                bars=bars,
+                adjustments=adjustments,
+                daily_error=daily_error,
+                metrics=metrics,
+                metric_error=metric_error,
+                financial=financial,
+                financial_error=financial_error,
+            )
+
+        def store_stock_payload(payload: QuantStockPayload) -> None:
+            nonlocal updated, daily_rows
+            nonlocal stock_daily_errors, metric_errors, financial_errors
+            plan = payload.plan
+            stock = stock_by_id[plan.stock_id]
+            daily_ok = False
+            metric_ok = False
+            financial_ok = False
+            try:
+                if payload.daily_error:
+                    raise RuntimeError(payload.daily_error)
+                daily_rows += sync_daily_rows(
+                    db,
+                    stock,
+                    payload.bars,
+                    source=str(payload.daily_source),
+                    amount_multiplier=(
+                        1
+                        if batch_daily is not None and plan.existing_count >= 520
+                        else 1000 if payload.daily_source == "tushare" else 1
+                    ),
+                    volume_multiplier=(
+                        1
+                        if batch_daily is not None and plan.existing_count >= 520
+                        else 100 if payload.daily_source == "tushare" else 1
+                    ),
+                )
+                sync_adjustment_rows(
+                    db,
+                    stock,
+                    payload.adjustments,
+                    source=source.name,
+                )
                 daily_ok = db.scalar(
                     select(MarketDailyBar.id).where(
                         MarketDailyBar.stock_id == stock.id,
@@ -438,19 +538,9 @@ def poll_quant_market_data(
                 db.rollback()
                 stock_daily_errors += 1
             try:
-                if int(existing_count or 0) >= 520 and batch_metrics is not None:
-                    metrics = (
-                        [batch_metrics[stock.symbol]]
-                        if stock.symbol in batch_metrics
-                        else []
-                    )
-                else:
-                    metrics = source.daily_metrics(
-                        stock.symbol,
-                        start=start,
-                        end=end,
-                    )
-                sync_metric_rows(db, stock, metrics, source=source.name)
+                if payload.metric_error:
+                    raise RuntimeError(payload.metric_error)
+                sync_metric_rows(db, stock, payload.metrics, source=source.name)
                 metric_ok = db.scalar(
                     select(MarketDailyMetric.id).where(
                         MarketDailyMetric.stock_id == stock.id,
@@ -463,16 +553,12 @@ def poll_quant_market_data(
                 db.rollback()
                 metric_errors += 1
             try:
-                if batch_financial is not None:
-                    if batch_financial_error:
-                        raise RuntimeError(batch_financial_error)
-                    financial = batch_financial.get(stock.symbol, [])
-                else:
-                    financial = source.financial_reports(stock.symbol)
+                if payload.financial_error:
+                    raise RuntimeError(payload.financial_error)
                 sync_financial_rows(
                     db,
                     stock,
-                    financial,
+                    payload.financial,
                     source=source.name,
                     trading_days=trading_days,
                 )
@@ -491,6 +577,16 @@ def poll_quant_market_data(
                 db.commit()
             if daily_ok and metric_ok and financial_ok:
                 updated += 1
+
+        worker_count = max(1, min(int(stock_fetch_workers), 8))
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="quant-stock-fetch",
+        ) as executor:
+            for offset in range(0, len(fetch_plans), worker_count):
+                batch = fetch_plans[offset : offset + worker_count]
+                for payload in executor.map(fetch_stock_payload, batch):
+                    store_stock_payload(payload)
 
         benchmark_symbols = set(configured_benchmark_symbols(db)) - etf_symbols
         for symbol in sorted(benchmark_symbols):
