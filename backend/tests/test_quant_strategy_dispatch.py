@@ -192,8 +192,8 @@ def test_quant_worker_defines_one_realtime_lane_per_strategy_and_separate_backte
 
     realtime = [item for item in lanes if item.task_types == frozenset({"signal", "execute"})]
     backtests = [item for item in lanes if item.task_types == frozenset({"backtest"})]
-    assert len(realtime) == 8
-    assert len({item.strategy_config_id for item in realtime}) == 8
+    assert len(realtime) == 9
+    assert len({item.strategy_config_id for item in realtime}) == 9
     assert len(backtests) == 2
     assert all(item.strategy_config_id is None for item in backtests)
 

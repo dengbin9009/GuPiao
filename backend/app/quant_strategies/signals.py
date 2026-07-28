@@ -416,6 +416,14 @@ def _holding_contexts(
                 low_20d=low_20d,
                 highest_close=highest_close,
                 entry_atr=entry_atr,
+                entry_price=float(
+                    metadata.get("entry_price")
+                    or position.average_cost
+                    or 0
+                ),
+                anchor_support=float(
+                    metadata.get("anchor_support") or 0
+                ),
                 risk_blocked=(
                     stock.status != "active"
                     or "ST" in stock.name.upper()

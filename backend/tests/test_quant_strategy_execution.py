@@ -18,6 +18,7 @@ from app.models import (
     NotificationChannel,
     NotificationDelivery,
     Position,
+    QuantCandidateScore,
     QuantPortfolioDecision,
     SimulationAccount,
     Stock,
@@ -84,6 +85,40 @@ def decision_for(db: Session, config: StrategyConfig, current: datetime, weights
     db.commit()
     db.refresh(decision)
     return decision
+
+
+def add_volume_price_candidate(
+    db: Session,
+    decision: QuantPortfolioDecision,
+    stock: Stock,
+    *,
+    effective_stop: float = 9.70,
+) -> None:
+    decision.snapshot_payload = {
+        "metadata": {"signal_version": "volume-price-confirmation-v1"}
+    }
+    db.add(
+        QuantCandidateScore(
+            decision_id=decision.id,
+            stock_id=stock.id,
+            status="selected",
+            rank=1,
+            features={
+                "anchor_date": "2026-07-23",
+                "anchor_support": 9.60,
+                "anchor_resistance": 9.90,
+                "effective_stop": effective_stop,
+                "atr_20d": 0.30,
+                "confidence_score": 5.25,
+                "entry_reference_price": 10.0,
+                "stop_distance_pct": 0.03,
+            },
+            score=5.25,
+            target_weight=0.15,
+            rejection_reasons=[],
+        )
+    )
+    db.commit()
 
 
 def test_dry_run_records_decision_without_orders(tmp_path: Path):
@@ -611,6 +646,93 @@ def test_partial_sell_persists_remaining_settled_quantity_as_available(
         assert position.available_quantity == position.quantity
 
 
+def test_volume_price_confirmation_rechecks_risk_and_persists_entry_metadata(
+    tmp_path: Path,
+):
+    engine, current, config_ids = setup_runtime(tmp_path)
+    current = current.replace(hour=9, minute=43)
+    with Session(engine) as db:
+        config = db.get(
+            StrategyConfig,
+            config_ids["volume_price_confirmation"],
+        )
+        stock = db.scalar(select(Stock).where(Stock.symbol == "000001.SZ"))
+        stock.quote_updated_at = current
+        decision = decision_for(
+            db,
+            config,
+            current,
+            {stock.symbol: 0.15},
+        )
+        add_volume_price_candidate(db, decision, stock)
+
+        run = execute_quant_rebalance(
+            db,
+            decision,
+            current=current,
+            dry_run=False,
+        )
+
+        assert run.summary["precheck_passed"] is True
+        lot = db.scalar(
+            select(StrategyPositionLot).where(
+                StrategyPositionLot.strategy_config_id == config.id,
+                StrategyPositionLot.stock_id == stock.id,
+            )
+        )
+        fill = db.get(Fill, lot.buy_fill_id)
+        assert lot.strategy_metadata == {
+            "strategy_key": "volume_price_confirmation",
+            "decision_id": decision.id,
+            "entry_date": current.date().isoformat(),
+            "entry_price": fill.price,
+            "entry_atr": 0.30,
+            "anchor_date": "2026-07-23",
+            "anchor_support": 9.60,
+            "effective_stop": 9.70,
+            "confidence_score": 5.25,
+            "signal_version": "volume-price-confirmation-v1",
+            "report_period": None,
+        }
+
+
+def test_volume_price_confirmation_blocks_batch_when_fresh_quote_exceeds_risk_budget(
+    tmp_path: Path,
+):
+    engine, current, config_ids = setup_runtime(tmp_path)
+    current = current.replace(hour=9, minute=43)
+    with Session(engine) as db:
+        config = db.get(
+            StrategyConfig,
+            config_ids["volume_price_confirmation"],
+        )
+        stock = db.scalar(select(Stock).where(Stock.symbol == "000001.SZ"))
+        stock.last_price = 12.0
+        stock.quote_updated_at = current
+        decision = decision_for(
+            db,
+            config,
+            current,
+            {stock.symbol: 0.15},
+        )
+        add_volume_price_candidate(db, decision, stock)
+
+        run = execute_quant_rebalance(
+            db,
+            decision,
+            current=current,
+            dry_run=False,
+        )
+
+        assert run.summary["accepted"] == 0
+        assert "次日价格使单笔风险超过0.5%" in run.summary["reason"]
+        assert db.scalar(
+            select(func.count())
+            .select_from(Order)
+            .where(Order.strategy_run_id == run.id)
+        ) == 0
+
+
 def test_successful_rebalance_records_daily_performance(tmp_path: Path):
     engine, current, config_ids = setup_runtime(tmp_path)
     with Session(engine) as db:
@@ -713,10 +835,10 @@ def test_close_performance_replaces_morning_rebalance_valuation(tmp_path: Path):
             )
         )
 
-        assert result["recorded"] == 8
+        assert result["recorded"] == 9
         assert morning.total_asset > morning_asset
         assert morning.captured_at.replace(tzinfo=SHANGHAI) == close_time
-        assert len(deliveries) == 8
+        assert len(deliveries) == 9
 
 
 def test_daily_performance_marks_to_close_and_pauses_only_breached_strategy(
@@ -806,7 +928,7 @@ def test_daily_performance_marks_to_close_and_pauses_only_breached_strategy(
             )
         )
 
-        assert result["recorded"] == 8
+        assert result["recorded"] == 9
         assert performance.total_asset == pytest.approx(1_800_000)
         assert performance.daily_return == pytest.approx(-0.10)
         assert performance.drawdown == pytest.approx(-0.10)
@@ -842,6 +964,6 @@ def test_daily_performance_is_idempotent_for_notifications(tmp_path: Path):
             )
         )
 
-        assert first["recorded"] == 8
+        assert first["recorded"] == 9
         assert second["recorded"] == 0
-        assert len(deliveries) == 8
+        assert len(deliveries) == 9

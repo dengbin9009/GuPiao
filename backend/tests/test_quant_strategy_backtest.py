@@ -128,6 +128,53 @@ def test_short_reversal_backtest_applies_same_next_day_exit_policy(
         assert metrics.trade_count >= 6
 
 
+def test_volume_price_backtest_rechecks_next_open_risk_before_buy(
+    tmp_path: Path,
+):
+    engine, _config_id, start = setup_backtest_db(tmp_path)
+
+    def risky_target(_db, _config, *, as_of):
+        return TargetPortfolio(
+            "volume_price_confirmation",
+            {"000858.SZ": 0.15},
+            {"000858.SZ": 5.0},
+            {
+                "000858.SZ": {
+                    "effective_stop": 1.0,
+                    "atr_20d": 0.3,
+                    "anchor_support": 1.0,
+                    "anchor_date": as_of.isoformat(),
+                    "confidence_score": 5.0,
+                    "signal_version": "volume-price-confirmation-v1",
+                }
+            },
+            {},
+        )
+
+    with Session(engine) as db:
+        config = db.scalar(
+            select(StrategyConfig)
+            .join(StrategyDefinition)
+            .where(
+                StrategyDefinition.key
+                == "volume_price_confirmation"
+            )
+        )
+        metrics, _qualification = run_quant_backtest(
+            db,
+            config,
+            start_date=start.isoformat(),
+            end_date=(start + timedelta(days=9)).isoformat(),
+            portfolio_builder=risky_target,
+        )
+
+        assert metrics.trade_count == 0
+        assert {
+            row.get("rebalance_block_reason")
+            for row in metrics.equity_curve
+        } == {"000858.SZ 次日开盘使单笔风险超过0.5%"}
+
+
 def setup_backtest_db(tmp_path: Path):
     database_url = f"sqlite:///{tmp_path / 'backtest.db'}"
     engine = create_engine(database_url)

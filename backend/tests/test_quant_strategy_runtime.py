@@ -36,10 +36,11 @@ EXPECTED_KEYS = {
     "earnings_drift",
     "regime_allocator",
     "risk_parity_overlay",
+    "volume_price_confirmation",
 }
 
 
-def test_quant_strategy_catalog_defines_eight_simulation_strategies():
+def test_quant_strategy_catalog_defines_nine_simulation_strategies():
     assert set(QUANT_STRATEGY_SPECS) == EXPECTED_KEYS
     assert [spec.signal_time for spec in QUANT_STRATEGY_SPECS.values()] == [
         "16:30",
@@ -50,6 +51,7 @@ def test_quant_strategy_catalog_defines_eight_simulation_strategies():
         "16:35",
         "16:36",
         "16:37",
+        "16:38",
     ]
     assert [spec.execution_time for spec in QUANT_STRATEGY_SPECS.values()] == [
         "09:35",
@@ -60,6 +62,7 @@ def test_quant_strategy_catalog_defines_eight_simulation_strategies():
         "09:40",
         "09:41",
         "09:42",
+        "09:43",
     ]
     assert all(spec.simulation_only for spec in QUANT_STRATEGY_SPECS.values())
     assert {
@@ -73,6 +76,7 @@ def test_quant_strategy_catalog_defines_eight_simulation_strategies():
         "earnings_drift": "1.0.1",
         "regime_allocator": "1.0.0",
         "risk_parity_overlay": "1.0.0",
+        "volume_price_confirmation": "1.0.0",
     }
 
 
@@ -126,15 +130,31 @@ def test_quant_runtime_seeds_independent_accounts_and_disabled_schedules(tmp_pat
         assert {key: value.id for key, value in first.items()} == {
             key: value.id for key, value in second.items()
         }
-        assert len(definitions) == 8
-        assert len(configs) == 8
-        assert len({item.simulation_account_id for item in configs}) == 8
+        assert len(definitions) == 9
+        assert len(configs) == 9
+        assert len({item.simulation_account_id for item in configs}) == 9
         assert all(item.mode == "SIMULATION" for item in configs)
         assert all(db.get(SimulationAccount, item.simulation_account_id).initial_cash == INITIAL_CASH for item in configs)
-        assert len(schedules) == 16
+        confirmation_config = first["volume_price_confirmation"]
+        confirmation_account = db.get(
+            SimulationAccount,
+            confirmation_config.simulation_account_id,
+        )
+        assert confirmation_account.name == "量价三日确认模拟账户"
+        assert confirmation_account.initial_cash == 2_000_000
+        confirmation_schedules = {
+            schedule.trigger_type: schedule.run_time
+            for schedule in schedules
+            if schedule.strategy_config_id == confirmation_config.id
+        }
+        assert confirmation_schedules == {
+            "quant_signal": "16:38",
+            "quant_execute": "09:43",
+        }
+        assert len(schedules) == 18
         assert all(not item.enabled for item in schedules)
         assert {item.trigger_type for item in schedules} == {"quant_signal", "quant_execute"}
-        assert len(risks) == 8
+        assert len(risks) == 9
         assert all(item.daily_loss_limit_pct == 0.02 for item in risks)
         assert all(item.max_drawdown_pct == 0.15 for item in risks)
         assert all(item.max_consecutive_errors == 3 for item in risks)
@@ -183,7 +203,7 @@ def test_quant_runtime_repairs_only_a_missing_account_binding(tmp_path: Path):
                 config.simulation_account_id
                 for config in repaired.values()
             }
-        ) == 8
+        ) == 9
 
 
 def test_quant_runtime_updates_existing_definition_versions_without_resetting_state(

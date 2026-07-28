@@ -33,6 +33,8 @@ def holding(
     low_20d: float = 9,
     highest_close: float = 11,
     entry_atr: float = 1,
+    entry_price: float = 10,
+    anchor_support: float = 9.5,
     risk_blocked: bool = False,
 ) -> HoldingContext:
     return HoldingContext(
@@ -44,6 +46,8 @@ def holding(
         low_20d=low_20d,
         highest_close=highest_close,
         entry_atr=entry_atr,
+        entry_price=entry_price,
+        anchor_support=anchor_support,
         risk_blocked=risk_blocked,
     )
 
@@ -173,3 +177,113 @@ def test_regime_policy_preserves_fifty_percent_bond_allocation():
 
     assert adjusted.target_weights["511010.SH"] == pytest.approx(0.50)
     assert sum(adjusted.target_weights.values()) == pytest.approx(0.70)
+
+
+@pytest.mark.parametrize(
+    "position",
+    [
+        holding("000001.SZ", close=9.4, anchor_support=9.5),
+        holding(
+            "000001.SZ",
+            close=9.3,
+            anchor_support=9.0,
+            entry_price=10,
+        ),
+        holding(
+            "000001.SZ",
+            close=10.9,
+            highest_close=13,
+            entry_atr=1,
+            entry_price=10,
+            anchor_support=9,
+        ),
+        holding(
+            "000001.SZ",
+            held_days=10,
+            close=10.2,
+            highest_close=10.5,
+            entry_price=10,
+            anchor_support=9,
+        ),
+    ],
+)
+def test_volume_price_confirmation_exits_on_support_hard_atr_or_time_stop(
+    position: HoldingContext,
+):
+    source = result(
+        "volume_price_confirmation",
+        targets={},
+        scores={},
+    )
+
+    adjusted = apply_holding_policy(
+        source,
+        holdings=[position],
+        consumed_reports=set(),
+        parameters={
+            "hard_stop_pct": 0.07,
+            "atr_trailing_multiple": 2.0,
+            "max_holding_days": 10,
+            "min_holding_gain_pct": 0.03,
+        },
+    )
+
+    assert adjusted.target_weights == {}
+
+
+def test_volume_price_confirmation_retains_profitable_position_with_valid_metadata():
+    source = result(
+        "volume_price_confirmation",
+        targets={},
+        scores={},
+    )
+
+    adjusted = apply_holding_policy(
+        source,
+        holdings=[
+            holding(
+                "000001.SZ",
+                held_days=10,
+                close=10.4,
+                highest_close=10.5,
+                entry_price=10,
+                entry_atr=1,
+                anchor_support=9.5,
+            )
+        ],
+        consumed_reports=set(),
+        parameters={
+            "hard_stop_pct": 0.07,
+            "atr_trailing_multiple": 2.0,
+            "max_holding_days": 10,
+            "min_holding_gain_pct": 0.03,
+        },
+    )
+
+    assert adjusted.target_weights == {"000001.SZ": 0.10}
+
+
+def test_volume_price_confirmation_does_not_pyramid_an_existing_position():
+    source = result(
+        "volume_price_confirmation",
+        targets={"000001.SZ": 0.15},
+        scores={"000001.SZ": 8},
+    )
+
+    adjusted = apply_holding_policy(
+        source,
+        holdings=[
+            holding(
+                "000001.SZ",
+                weight=0.10,
+                close=10.4,
+                highest_close=10.5,
+                entry_price=10,
+                entry_atr=1,
+                anchor_support=9.5,
+            )
+        ],
+        consumed_reports=set(),
+    )
+
+    assert adjusted.target_weights == {"000001.SZ": 0.10}

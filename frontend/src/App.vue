@@ -131,7 +131,16 @@ const quantParameterLabel = (name) => ({
   atr_multiple: 'ATR退出倍数', volume_confirmation: '成交量确认倍数', one_day_residual: '1日残差门槛',
   five_day_residual: '5日残差门槛', benchmark_symbol: '基准证券', holding_days: '持有交易日',
   min_sue: '最低业绩意外值', etf_universe: 'ETF池', lookback_days: '协方差观察日',
-  target_volatility: '目标波动率', min_weight: '最低ETF权重'
+  target_volatility: '目标波动率', min_weight: '最低ETF权重',
+  anchor_lookback_days: '锚点确认日数', anchor_volume_multiple: '锚点放量倍数',
+  confirmation_volume_multiple: '确认日放量倍数', ma_fast_days: '快速均线日数',
+  ma_slow_days: '慢速均线日数', ma_slope_days: '均线斜率比较日数',
+  score_threshold: '最低置信分', risk_per_trade_pct: '单笔风险预算',
+  hard_stop_pct: '最大亏损止损', atr_trailing_multiple: 'ATR跟踪倍数',
+  max_holding_days: '最长持有日数', min_holding_gain_pct: '时间止损最低收益',
+  high_position_lookback: '高位观察日数', small_body_ratio: '小实体比例上限',
+  upper_shadow_body_multiple: '上影实体倍数', close_location_min: '最低收盘位置',
+  pullback_volume_ratio: '回踩缩量比例'
 }[name] || name)
 const quantEquityPoints = computed(() => {
   const rows = [...(selectedQuantStrategy.value?.performances || [])].reverse()
@@ -629,7 +638,7 @@ onMounted(async () => {
           <button v-else class="primary" @click="runStrategy"><Play :size="17" />运行模拟</button>
         </section>
         <section class="panel quant-suite">
-          <div class="section-head"><div><h2>八套独立量化策略</h2><span>8 个独立 200 万元模拟账户 · 自动计划默认关闭</span></div><span class="tag">总虚拟本金 {{ formatMoney(quantStrategies.reduce((sum, item) => sum + (item.initial_cash || 0), 0)) }}</span></div>
+          <div class="section-head"><div><h2>九套独立量化策略</h2><span>9 个独立 200 万元模拟账户 · 自动计划默认关闭</span></div><span class="tag">总虚拟本金 {{ formatMoney(quantStrategies.reduce((sum, item) => sum + (item.initial_cash || 0), 0)) }}</span></div>
           <div class="table-wrap"><table><thead><tr><th>策略</th><th>状态</th><th>总资产</th><th>累计收益</th><th>回撤</th><th>仓位</th><th>下一运行</th><th>持仓</th><th>操作</th></tr></thead><tbody>
             <tr v-for="item in quantStrategies" :key="item.strategy_key" :class="{ selected: selectedQuantStrategy?.strategy_key === item.strategy_key }" @click="selectQuantStrategy(item.strategy_key)"><td><strong>{{ item.name }}</strong><small>{{ item.strategy_key }} · v{{ item.version }}</small></td><td><span :class="['tag', ['FAILED','PAUSED','DATA_PENDING'].includes(item.status) ? 'danger-tag' : '']">{{ quantStatusText(item.status) }}</span><small v-if="item.reasons?.length">{{ item.reasons[0] }}</small><small v-if="item.consecutive_errors">连续错误 {{ item.consecutive_errors }}</small></td><td>{{ formatMoney(item.total_asset) }}</td><td :class="item.cumulative_return >= 0 ? 'positive' : 'negative'">{{ formatPct(item.cumulative_return) }}</td><td :class="item.drawdown < 0 ? 'negative' : ''">{{ formatPct(item.drawdown) }}</td><td>{{ formatPct(item.exposure) }}</td><td><span v-if="item.next_run_at">{{ shortTime(item.next_run_at) }}</span><span v-else>{{ item.schedule_times?.quant_signal }} / {{ item.schedule_times?.quant_execute }}</span></td><td>{{ item.position_count }}</td><td><div class="table-actions"><button class="icon-action" title="真实点时数据回测" @click.stop="runQuantBacktest(item)"><BookOpenCheck :size="15" /></button><button class="icon-action" title="无下单演练" @click.stop="quantOperation(runQuantDryRun, item)"><Gauge :size="15" /></button><button v-if="item.status !== 'ACTIVE'" class="icon-action" title="启用模拟自动计划" :disabled="!item.automation_ready" @click.stop="quantOperation(activateQuantStrategy, item)"><Play :size="15" /></button><button v-else class="icon-action danger-text" title="暂停策略" @click.stop="quantOperation(pauseQuantStrategy, item)"><Pause :size="15" /></button></div></td></tr>
             <tr v-if="!quantStrategies.length"><td colspan="9" class="empty">独立量化策略尚未初始化</td></tr>

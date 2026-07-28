@@ -2,11 +2,11 @@ openapi: 3.1.0
 info:
   title: GuPiao 独立量化策略 API
   version: 1.0.0
-  description: 八套仅模拟盘策略的管理员接口，全部需要管理员会话。
+  description: 九套仅模拟盘策略的管理员接口，全部需要管理员会话。
 paths:
   /api/quant-strategies:
     get:
-      summary: 查询八套策略的账户、状态、绩效和下一任务
+      summary: 查询九套策略的账户、状态、绩效和下一任务
       responses:
         '200': {description: 策略运营列表}
   /api/quant-strategies/compare:

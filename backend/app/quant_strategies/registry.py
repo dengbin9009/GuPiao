@@ -9,6 +9,7 @@ from .regime_allocator import RegimeAllocatorStrategy
 from .relative_strength_rotation import RelativeStrengthRotationStrategy
 from .risk_parity_overlay import RiskParityOverlayStrategy
 from .short_term_reversal_t1 import ShortTermReversalT1Strategy
+from .volume_price_confirmation import VolumePriceConfirmationStrategy
 
 
 STRATEGY_MODULES: dict[str, QuantStrategyModule] = {
@@ -22,5 +23,6 @@ STRATEGY_MODULES: dict[str, QuantStrategyModule] = {
         EarningsDriftStrategy(),
         RegimeAllocatorStrategy(),
         RiskParityOverlayStrategy(),
+        VolumePriceConfirmationStrategy(),
     )
 }

@@ -18,6 +18,8 @@ class HoldingContext:
     low_20d: float
     highest_close: float
     entry_atr: float
+    entry_price: float
+    anchor_support: float
     risk_blocked: bool = False
 
 
@@ -73,6 +75,51 @@ def apply_holding_policy(
         for symbol, item in current.items():
             if symbol in top_ten and not item.risk_blocked:
                 targets.setdefault(symbol, item.current_weight)
+    elif result.strategy_key == "volume_price_confirmation":
+        hard_stop_pct = float(parameters.get("hard_stop_pct", 0.07))
+        atr_multiple = float(parameters.get("atr_trailing_multiple", 2.0))
+        max_holding_days = int(parameters.get("max_holding_days", 10))
+        min_holding_gain = float(
+            parameters.get("min_holding_gain_pct", 0.03)
+        )
+        for symbol, item in current.items():
+            metadata_invalid = (
+                item.entry_price <= 0
+                or item.anchor_support <= 0
+                or item.entry_atr <= 0
+            )
+            support_stop = item.latest_close < item.anchor_support
+            hard_stop = item.latest_close <= (
+                item.entry_price * (1 - hard_stop_pct) + 1e-9
+            )
+            trailing_stop = (
+                item.highest_close > item.entry_price
+                and item.latest_close
+                <= item.highest_close - atr_multiple * item.entry_atr
+            )
+            holding_return = (
+                item.latest_close / item.entry_price - 1
+                if item.entry_price > 0
+                else -1
+            )
+            time_stop = (
+                item.held_trading_days >= max_holding_days
+                and holding_return < min_holding_gain
+            )
+            if (
+                item.risk_blocked
+                or metadata_invalid
+                or support_stop
+                or hard_stop
+                or trailing_stop
+                or time_stop
+            ):
+                targets.pop(symbol, None)
+            else:
+                targets[symbol] = min(
+                    targets.get(symbol, item.current_weight),
+                    item.current_weight,
+                )
 
     spec = QUANT_STRATEGY_SPECS[result.strategy_key]
     targets = {

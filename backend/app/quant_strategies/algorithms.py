@@ -410,6 +410,267 @@ def _breakout(
     )
 
 
+def _volume_price_confirmation(
+    items: list[CandidateInput],
+    as_of: date,
+    *,
+    parameters: dict[str, Any],
+) -> TargetPortfolio:
+    spec = QUANT_STRATEGY_SPECS["volume_price_confirmation"]
+    scores: dict[str, float] = {}
+    features_by_symbol: dict[str, dict[str, Any]] = {}
+    risk_weights: dict[str, float] = {}
+    rejected: dict[str, tuple[str, ...]] = {}
+
+    anchor_lookback = int(parameters["anchor_lookback_days"])
+    fast_days = int(parameters["ma_fast_days"])
+    slow_days = int(parameters["ma_slow_days"])
+    slope_days = int(parameters["ma_slope_days"])
+    high_lookback = int(parameters["high_position_lookback"])
+    required_bars = max(
+        slow_days + slope_days,
+        high_lookback + anchor_lookback + 1,
+        21 + anchor_lookback,
+    )
+
+    for item in items:
+        bars = tuple(bar for bar in item.bars if bar.trade_date <= as_of)
+        if len(bars) < required_bars:
+            rejected[item.symbol] = (
+                f"已完成日线不足{required_bars}根",
+            )
+            continue
+
+        current = bars[-1]
+        previous_twenty = bars[-21:-1]
+        average_turnover = _mean(bar.amount for bar in previous_twenty)
+        if average_turnover < float(parameters["min_average_turnover"]):
+            rejected[item.symbol] = ("20日平均成交额不足1亿元",)
+            continue
+
+        anchor_row: tuple[int, PriceBar, float, float] | None = None
+        for age in range(1, anchor_lookback + 1):
+            anchor_index = len(bars) - 1 - age
+            anchor = bars[anchor_index]
+            prior_twenty = bars[anchor_index - 20 : anchor_index]
+            prior_three = bars[anchor_index - 3 : anchor_index]
+            if len(prior_twenty) < 20 or len(prior_three) < 3:
+                continue
+            average_volume = _mean(bar.volume for bar in prior_twenty)
+            if (
+                average_volume <= 0
+                or anchor.volume
+                < average_volume * float(parameters["anchor_volume_multiple"])
+                or anchor.volume <= max(bar.volume for bar in prior_three)
+            ):
+                continue
+            anchor_row = (anchor_index, anchor, average_volume, anchor.volume / average_volume)
+            break
+
+        if anchor_row is None:
+            rejected[item.symbol] = ("最近3日无有效放量锚点",)
+            continue
+
+        anchor_index, anchor, anchor_average_volume, anchor_volume_ratio = anchor_row
+        support = min(anchor.open, anchor.close)
+        resistance = max(anchor.open, anchor.close)
+        reasons: list[str] = []
+
+        if any(bar.close < support for bar in bars[anchor_index + 1 :]):
+            reasons.append("锚点支撑失守")
+
+        latest_three = bars[-3:]
+        if (
+            len(latest_three) == 3
+            and latest_three[0].high > latest_three[1].high > latest_three[2].high
+            and latest_three[0].low > latest_three[1].low > latest_three[2].low
+        ):
+            reasons.append("最近3日高低点连续下移")
+
+        anchor_range = anchor.high - anchor.low
+        anchor_body = abs(anchor.close - anchor.open)
+        prior_highs = bars[max(0, anchor_index - high_lookback) : anchor_index]
+        if (
+            anchor_range > 0
+            and prior_highs
+            and anchor.high >= max(bar.high for bar in prior_highs)
+            and anchor_body / anchor_range
+            <= float(parameters["small_body_ratio"])
+        ):
+            reasons.append("60日高位放量小实体")
+
+        current_body = abs(current.close - current.open)
+        current_upper_shadow = current.high - max(current.open, current.close)
+        if (
+            current.high >= resistance
+            and current_upper_shadow
+            >= float(parameters["upper_shadow_body_multiple"])
+            * max(current_body, current.close * 1e-6)
+        ):
+            reasons.append("压力位附近长上影")
+
+        adjusted = [
+            float(bar.adjusted_close)
+            for bar in bars
+            if bar.adjusted_close > 0
+        ]
+        if len(adjusted) < required_bars:
+            rejected[item.symbol] = (
+                f"已完成复权日线不足{required_bars}根",
+            )
+            continue
+        adjusted_current = adjusted[-1]
+        ma20 = _mean(adjusted[-fast_days:])
+        ma60 = _mean(adjusted[-slow_days:])
+        ma20_before = _mean(
+            adjusted[-(fast_days + slope_days) : -slope_days]
+        )
+        if not (
+            adjusted_current > ma20 > ma60
+            and ma20 > ma20_before
+        ):
+            reasons.append("MA20与MA60趋势过滤未通过")
+        if current.close <= resistance:
+            reasons.append("确认日未突破锚点压力")
+
+        confirmation_average_volume = _mean(
+            bar.volume for bar in previous_twenty
+        )
+        confirmation_volume_ratio = (
+            current.volume / confirmation_average_volume
+            if confirmation_average_volume > 0
+            else 0
+        )
+        if confirmation_volume_ratio < float(
+            parameters["confirmation_volume_multiple"]
+        ):
+            reasons.append("确认日成交量不足")
+
+        current_range = current.high - current.low
+        close_location = (
+            (current.close - current.low) / current_range
+            if current_range > 0
+            else 0
+        )
+        if close_location < float(parameters["close_location_min"]):
+            reasons.append("确认日收盘位置不足")
+
+        atr = _atr(bars)
+        if atr <= 0:
+            reasons.append("ATR无效")
+        if reasons:
+            rejected[item.symbol] = tuple(dict.fromkeys(reasons))
+            continue
+
+        interim = bars[anchor_index + 1 : -1]
+        pullback_quality = (
+            0.5
+            if not interim
+            else float(
+                _mean(bar.volume for bar in interim)
+                <= anchor.volume * float(parameters["pullback_volume_ratio"])
+            )
+        )
+        score = (
+            min(
+                anchor_volume_ratio
+                / float(parameters["anchor_volume_multiple"]),
+                1.5,
+            )
+            + min(max((current.close - resistance) / atr, 0), 1.5)
+            + min(max((ma20 / ma60 - 1) / 0.01, 0), 1.0)
+            + min(max((ma20 / ma20_before - 1) / 0.005, 0), 1.0)
+            + min(max(close_location, 0), 1.0)
+            + pullback_quality
+        )
+        if score < float(parameters["score_threshold"]):
+            rejected[item.symbol] = ("综合置信分不足",)
+            continue
+
+        effective_stop = max(
+            support,
+            current.close * (1 - float(parameters["hard_stop_pct"])),
+        )
+        stop_distance_pct = (current.close - effective_stop) / current.close
+        if stop_distance_pct <= 0:
+            rejected[item.symbol] = ("止损距离无效",)
+            continue
+        target_weight = min(
+            spec.max_position_pct,
+            float(parameters["risk_per_trade_pct"]) / stop_distance_pct,
+        )
+        if target_weight < float(parameters["min_position_pct"]):
+            rejected[item.symbol] = ("风险反推仓位不足5%",)
+            continue
+
+        scores[item.symbol] = score
+        risk_weights[item.symbol] = target_weight
+        features_by_symbol[item.symbol] = {
+            "anchor_date": anchor.trade_date.isoformat(),
+            "anchor_age_days": len(bars) - 1 - anchor_index,
+            "anchor_support": support,
+            "anchor_resistance": resistance,
+            "anchor_average_volume_20d": anchor_average_volume,
+            "anchor_volume_ratio": anchor_volume_ratio,
+            "confirmation_average_volume_20d": confirmation_average_volume,
+            "confirmation_volume_ratio": confirmation_volume_ratio,
+            "average_turnover_20d": average_turnover,
+            "ma20": ma20,
+            "ma60": ma60,
+            "ma20_slope_reference": ma20_before,
+            "atr_20d": atr,
+            "close_location": close_location,
+            "pullback_quality": pullback_quality,
+            "confidence_score": score,
+            "signal_version": "volume-price-confirmation-v1",
+            "entry_reference_price": current.close,
+            "effective_stop": effective_stop,
+            "stop_distance_pct": stop_distance_pct,
+            "risk_weight": target_weight,
+        }
+
+    selected_symbols = [
+        symbol
+        for symbol, _ in sorted(
+            scores.items(),
+            key=lambda row: (-row[1], row[0]),
+        )[: spec.max_positions]
+    ]
+    selected_weights = {
+        symbol: risk_weights[symbol]
+        for symbol in selected_symbols
+    }
+    total_weight = sum(selected_weights.values())
+    if total_weight > spec.max_total_exposure_pct:
+        scale = spec.max_total_exposure_pct / total_weight
+        selected_weights = {
+            symbol: weight * scale
+            for symbol, weight in selected_weights.items()
+            if weight * scale + 1e-12
+            >= float(parameters["min_position_pct"])
+        }
+
+    return TargetPortfolio(
+        "volume_price_confirmation",
+        dict(sorted(selected_weights.items())),
+        scores,
+        features_by_symbol,
+        rejected,
+        metadata={
+            "signal_version": "volume-price-confirmation-v1",
+            "hard_stop_pct": float(parameters["hard_stop_pct"]),
+            "atr_trailing_multiple": float(
+                parameters["atr_trailing_multiple"]
+            ),
+            "max_holding_days": int(parameters["max_holding_days"]),
+            "min_holding_gain_pct": float(
+                parameters["min_holding_gain_pct"]
+            ),
+            "execution_risk_recheck": True,
+        },
+    )
+
+
 def _short_term_reversal(
     items: list[CandidateInput],
     benchmark: CandidateInput | None,

@@ -62,14 +62,14 @@ def setup_db(tmp_path: Path):
     return db
 
 
-def test_list_and_detail_return_eight_independent_strategies(tmp_path: Path):
+def test_list_and_detail_return_nine_independent_strategies(tmp_path: Path):
     db = setup_db(tmp_path)
     try:
         rows = list_quant_strategies(None, db)
         detail = get_quant_strategy("multi_factor_core", None, db)
 
-        assert len(rows) == 8
-        assert len({item["simulation_account_id"] for item in rows}) == 8
+        assert len(rows) == 9
+        assert len({item["simulation_account_id"] for item in rows}) == 9
         assert all(item["simulation_only"] for item in rows)
         assert detail["strategy_key"] == "multi_factor_core"
         assert detail["account"]["initial_cash"] == 2_000_000

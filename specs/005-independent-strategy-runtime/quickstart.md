@@ -1,4 +1,4 @@
-# 快速开始：八套独立量化策略
+# 快速开始：九套独立量化策略
 
 ## 安全前提
 
@@ -7,7 +7,7 @@ LIVE_TRADING_ENABLED=false
 BROKER_ADAPTER=simulation
 ```
 
-系统首次启动会幂等建立八个 200 万元模拟账户和十六条默认关闭计划，不会重置已有账户。
+系统首次启动会幂等建立九个 200 万元模拟账户和十八条默认关闭计划，不会重置已有账户。
 
 ## 本地启动
 
@@ -24,7 +24,7 @@ PATH=/Users/dengbin/.nvm/versions/node/v20.19.4/bin:/usr/bin:/bin:/usr/sbin:/sbi
 API 后端是唯一数据库初始化者；本地脚本和 Docker Compose 都会等待后端健康后再启动后台进程，
 避免并发种子化产生重复策略或账户。
 
-SQLite 开发库会在启动时自动执行幂等运行时迁移。首次启动只建立缺失的八个模拟账户，
+SQLite 开发库会在启动时自动执行幂等运行时迁移。首次启动只建立缺失的九个模拟账户，
 不会重置余额、持仓、订单或历史绩效。
 
 ## Linux Docker Compose 部署
@@ -52,8 +52,8 @@ docker compose ps
 ```
 
 `0004` 只用于尚未应用该版本的既有数据库，不得重复执行。升级后应先确认
-`LIVE_TRADING_ENABLED=false`、`BROKER_ADAPTER=simulation`，再检查策略中心中的八个账户均为
-200 万元初始本金且十六条计划仍为关闭状态。
+`LIVE_TRADING_ENABLED=false`、`BROKER_ADAPTER=simulation`，再检查策略中心中的九个账户均为
+200 万元初始本金且十八条计划仍为关闭状态。
 
 ## 启用顺序
 

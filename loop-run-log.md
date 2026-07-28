@@ -184,3 +184,28 @@
   ]
 }
 ```
+
+```json
+{
+  "run_id": "2026-07-28-volume-price-confirmation",
+  "pattern": "daily-triage",
+  "mode": "manual-approved-fix",
+  "iteration": 7,
+  "items_found": 9,
+  "actions_taken": 9,
+  "same_error_attempt": 0,
+  "escalations": 0,
+  "worktree": ".worktrees/volume-price-confirmation",
+  "safety": "LIVE=false; BROKER=simulation; 新策略计划默认关闭; 未执行任何订单",
+  "outcome": "done-with-readiness-gates",
+  "evidence": [
+    "新增量价三日确认独立模块、200万元模拟账户、16:38信号和下一交易日09:43执行计划，两条计划默认关闭",
+    "实现放量锚点、三日确认、趋势和成交量过滤、风险否决、0.5%风险仓位、四类退出及执行前整批风险复检",
+    "补充后复权价格尺度、复权数据失败关闭和持仓不重复加码保护",
+    "九策略专项212 passed；Python 3.12后端全套539 passed；Ruff与git diff格式检查通过",
+    "Node 20前端行为测试6 passed，Vite生产构建转换1562个模块并成功退出",
+    "功能保留在专用分支，未commit、push、merge、deploy、重启服务、读取.env或启用自动计划",
+    "启用前仍须完成真实数据同步、至少500交易日回测、闸门指标验收和当前配置无下单演练"
+  ]
+}
+```

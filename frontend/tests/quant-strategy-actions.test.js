@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
 import {
@@ -62,4 +63,15 @@ test('dry run, activate, pause, and save each reload authoritative state', async
       message,
     ])
   }
+})
+
+
+test('strategy center labels the nine independent simulation accounts', () => {
+  const appSource = readFileSync(
+    new URL('../src/App.vue', import.meta.url),
+    'utf8',
+  )
+
+  assert.match(appSource, /九套独立量化策略/)
+  assert.match(appSource, /9 个独立 200 万元模拟账户/)
 })

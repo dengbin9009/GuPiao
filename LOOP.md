@@ -3,7 +3,7 @@
 ## 目标与模式
 
 - 主模式：`daily-triage`。
-- 当前目标：交付并验证八套策略独立模拟运营平台。
+- 当前目标：交付并验证九套策略独立模拟运营平台。
 - 第一周级别：L1 `report-only`，只采集证据、更新 `STATE.md` 和 `loop-run-log.md`，不自动修改代码。
 - 本项目不创建 Codex Automation；循环由人工显式启动。
 - 代码修复仅能在专用 worktree 中进行，禁止在 `main` 分支直接修改。
@@ -26,7 +26,7 @@
 | 前端可达 | 前端入口返回 HTTP 200 |
 | 后台进程存活 | worker、scheduler、TradingAgents Worker 与量化策略 Worker 均持续存活 |
 | scheduler 可降级 | 交易日历数据源失败时 scheduler 不崩溃、主循环继续存活 |
-| 八策略专项测试 | 八套策略公式、数据、任务、执行、API 和闸门测试退出码为 0 |
+| 九策略专项测试 | 九套策略公式、数据、任务、执行、API 和闸门测试退出码为 0 |
 | 后端测试 | 后端全套 pytest 退出码为 0，无失败 |
 | 前端测试与构建 | Node 20 下 `npm test` 和 `npm run build` 退出码均为 0 |
 | 安全模式 | `LIVE_TRADING_ENABLED=false` 且 `BROKER_ADAPTER=simulation` |

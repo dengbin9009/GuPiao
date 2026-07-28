@@ -386,6 +386,49 @@ def _plan_orders(
     return plans
 
 
+def _volume_price_risk_recheck_reason(
+    db: Session,
+    decision: QuantPortfolioDecision,
+    plans: list[PlannedOrder],
+    *,
+    parameters: dict,
+) -> str | None:
+    buy_plans = [plan for plan in plans if plan.side == "buy"]
+    if not buy_plans:
+        return None
+    rows = {
+        row.stock_id: row
+        for row in db.scalars(
+            select(QuantCandidateScore).where(
+                QuantCandidateScore.decision_id == decision.id,
+                QuantCandidateScore.stock_id.in_(
+                    [plan.stock_id for plan in buy_plans]
+                ),
+            )
+        )
+    }
+    risk_budget = float(parameters.get("risk_per_trade_pct", 0.005))
+    for plan in buy_plans:
+        candidate = rows.get(plan.stock_id)
+        features = dict(candidate.features or {}) if candidate else {}
+        try:
+            effective_stop = float(features["effective_stop"])
+        except (KeyError, TypeError, ValueError):
+            return f"{plan.symbol} 缺少量价策略执行风险特征"
+        if not math.isfinite(effective_stop) or effective_stop <= 0:
+            return f"{plan.symbol} 量价策略止损价无效"
+        if plan.fill_price <= effective_stop:
+            return f"{plan.symbol} 次日成交价已触及量价策略止损"
+        position_risk = (
+            plan.target_weight
+            * (plan.fill_price - effective_stop)
+            / plan.fill_price
+        )
+        if position_risk > risk_budget + 1e-9:
+            return f"{plan.symbol} 次日价格使单笔风险超过0.5%"
+    return None
+
+
 def _record_performance(
     db: Session,
     config: StrategyConfig,
@@ -545,6 +588,15 @@ def execute_quant_rebalance(
         if "行情已过期" in reason or "行情缺失" in reason:
             return _retryable_blocked(db, run, decision, reason)
         return _blocked(db, run, decision, reason)
+    if definition.key == "volume_price_confirmation":
+        risk_reason = _volume_price_risk_recheck_reason(
+            db,
+            decision,
+            plans,
+            parameters=config.parameters or {},
+        )
+        if risk_reason:
+            return _blocked(db, run, decision, risk_reason)
 
     summary = {
         "accepted": len(plans),
@@ -677,6 +729,38 @@ def execute_quant_rebalance(
             candidate_features = (
                 dict(candidate_score.features or {}) if candidate_score else {}
             )
+            position_metadata = {
+                "strategy_key": definition.key,
+                "decision_id": decision.id,
+                "entry_date": current.date().isoformat(),
+                "entry_atr": candidate_features.get("atr_20d"),
+                "report_period": candidate_features.get("report_period"),
+            }
+            if definition.key == "volume_price_confirmation":
+                snapshot_metadata = dict(
+                    (decision.snapshot_payload or {}).get("metadata") or {}
+                )
+                position_metadata.update(
+                    {
+                        "entry_price": plan.fill_price,
+                        "anchor_date": candidate_features.get(
+                            "anchor_date"
+                        ),
+                        "anchor_support": candidate_features.get(
+                            "anchor_support"
+                        ),
+                        "effective_stop": candidate_features.get(
+                            "effective_stop"
+                        ),
+                        "confidence_score": candidate_features.get(
+                            "confidence_score"
+                        ),
+                        "signal_version": candidate_features.get(
+                            "signal_version"
+                        )
+                        or snapshot_metadata.get("signal_version"),
+                    }
+                )
             db.add(
                 StrategyPositionLot(
                     strategy_config_id=config.id,
@@ -689,13 +773,7 @@ def execute_quant_rebalance(
                     available_on=parsed_sellable_date.isoformat(),
                     planned_exit_at=current + timedelta(days=3650),
                     status="open",
-                    strategy_metadata={
-                        "strategy_key": definition.key,
-                        "decision_id": decision.id,
-                        "entry_date": current.date().isoformat(),
-                        "entry_atr": candidate_features.get("atr_20d"),
-                        "report_period": candidate_features.get("report_period"),
-                    },
+                    strategy_metadata=position_metadata,
                 )
             )
         account.cash_balance += plan.cash_delta

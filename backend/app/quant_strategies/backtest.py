@@ -504,6 +504,10 @@ def _backtest_holding_contexts(
                     if row.trade_date >= entry_date.isoformat()
                 ),
                 entry_atr=float(metadata.get("entry_atr") or 0),
+                entry_price=float(metadata.get("entry_price") or 0),
+                anchor_support=float(
+                    metadata.get("anchor_support") or 0
+                ),
                 risk_blocked=bool(
                     stock.status != "active"
                     or "ST" in stock.name.upper()
@@ -641,6 +645,7 @@ def run_quant_backtest(
     for index in range(len(dates) - 1):
         signal_date = date.fromisoformat(dates[index])
         execution_date = dates[index + 1]
+        rebalance_block_reason: str | None = None
         rebalance_applied = _schedule_matches(
             spec.rebalance_frequency,
             dates,
@@ -714,6 +719,56 @@ def run_quant_backtest(
         )
         quotes_complete = len(opening_prices) == len(symbols)
         rebalance_executed = rebalance_applied and quotes_complete
+        if (
+            rebalance_executed
+            and symbols
+            and definition.key == "volume_price_confirmation"
+        ):
+            risk_budget = float(
+                (config.parameters or {}).get(
+                    "risk_per_trade_pct",
+                    0.005,
+                )
+            )
+            for symbol, weight in sorted(targets.items()):
+                lot_size = max(stocks[symbol].lot_size, 1)
+                target_quantity = (
+                    math.floor(
+                        current_equity
+                        * weight
+                        / (opening_prices[symbol] * (1 + slippage))
+                        / lot_size
+                    )
+                    * lot_size
+                )
+                if target_quantity <= positions.get(symbol, 0):
+                    continue
+                features = target_features.get(symbol, {})
+                try:
+                    effective_stop = float(features["effective_stop"])
+                except (KeyError, TypeError, ValueError):
+                    rebalance_block_reason = (
+                        f"{symbol} 缺少量价策略执行风险特征"
+                    )
+                    break
+                fill_price = opening_prices[symbol] * (1 + slippage)
+                position_risk = (
+                    weight
+                    * (fill_price - effective_stop)
+                    / fill_price
+                )
+                if fill_price <= effective_stop:
+                    rebalance_block_reason = (
+                        f"{symbol} 次日开盘已触及量价策略止损"
+                    )
+                    break
+                if position_risk > risk_budget + 1e-9:
+                    rebalance_block_reason = (
+                        f"{symbol} 次日开盘使单笔风险超过0.5%"
+                    )
+                    break
+            if rebalance_block_reason:
+                rebalance_executed = False
         if rebalance_executed and symbols:
             target_quantities = {
                 symbol: math.floor(
@@ -759,7 +814,15 @@ def run_quant_backtest(
                     features = target_features.get(symbol, {})
                     metadata = {
                         "entry_date": execution_date,
+                        "entry_price": price,
                         "entry_atr": features.get("atr_20d"),
+                        "anchor_date": features.get("anchor_date"),
+                        "anchor_support": features.get("anchor_support"),
+                        "effective_stop": features.get("effective_stop"),
+                        "confidence_score": features.get(
+                            "confidence_score"
+                        ),
+                        "signal_version": features.get("signal_version"),
                         "report_period": features.get("report_period"),
                     }
                     entry_metadata[symbol] = metadata
@@ -774,18 +837,21 @@ def run_quant_backtest(
             quantity * valuation_prices.get(symbol, 0)
             for symbol, quantity in positions.items()
         )
-        curve.append(
-            {
-                "trade_date": execution_date,
-                "equity": equity,
-                "precision": (
-                    "carried_last_close"
-                    if carried_symbols
-                    else "next_day_open"
-                ),
-                "rebalance_applied": rebalance_executed,
-            }
-        )
+        curve_row = {
+            "trade_date": execution_date,
+            "equity": equity,
+            "precision": (
+                "carried_last_close"
+                if carried_symbols
+                else "next_day_open"
+            ),
+            "rebalance_applied": rebalance_executed,
+        }
+        if rebalance_block_reason:
+            curve_row["rebalance_block_reason"] = (
+                rebalance_block_reason
+            )
+        curve.append(curve_row)
 
     equity_values = [float(row["equity"]) for row in curve]
     final_equity = equity_values[-1] if equity_values else cash
