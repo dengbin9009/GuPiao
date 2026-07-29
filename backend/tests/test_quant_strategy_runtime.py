@@ -76,7 +76,7 @@ def test_quant_strategy_catalog_defines_nine_simulation_strategies():
         "earnings_drift": "1.0.1",
         "regime_allocator": "1.0.0",
         "risk_parity_overlay": "1.0.0",
-        "volume_price_confirmation": "1.0.0",
+        "volume_price_confirmation": "1.0.1",
     }
 
 

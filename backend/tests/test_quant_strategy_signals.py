@@ -291,6 +291,43 @@ def test_stock_universe_prefilter_uses_constant_query_count(tmp_path: Path):
         assert stocks[1].symbol in {stock.symbol for stock in selected}
 
 
+def test_volume_price_universe_rejects_same_day_limit_up_stock(tmp_path: Path):
+    engine, _config_id = setup_database(tmp_path)
+    as_of = date(2026, 7, 23)
+    current = datetime(2026, 7, 23, 16, 38, tzinfo=SHANGHAI)
+    with Session(engine) as db:
+        stocks = seed_signal_data(db, as_of)
+        blocked_stock = stocks[0]
+        latest_bar = db.scalar(
+            select(MarketDailyBar).where(
+                MarketDailyBar.stock_id == blocked_stock.id,
+                MarketDailyBar.trade_date == as_of.isoformat(),
+            )
+        )
+        blocked_stock.last_price = latest_bar.close
+        blocked_stock.limit_up_price = latest_bar.close
+        blocked_stock.quote_updated_at = current
+        db.commit()
+        config = db.scalar(
+            select(StrategyConfig).where(
+                StrategyConfig.name == "量价三日确认"
+            )
+        )
+
+        selected, blocked = _universe(
+            db,
+            config,
+            "volume_price_confirmation",
+            as_of,
+            decision_at=current,
+        )
+
+        assert blocked_stock.symbol not in {
+            stock.symbol for stock in selected
+        }
+        assert "确认日涨停不可买入" in blocked[blocked_stock.symbol]
+
+
 def test_signal_decision_is_deterministic_and_ignores_future_data(tmp_path: Path):
     engine, config_id = setup_database(tmp_path)
     as_of = date(2026, 7, 23)

@@ -281,6 +281,22 @@ def _universe(
             reasons.append("上市不足120日")
         if stock.id in event_stock_ids:
             reasons.append("命中风险公告")
+        if (
+            key == "volume_price_confirmation"
+            and stock.quote_updated_at is not None
+            and stock.quote_updated_at.date() == as_of
+            and stock.last_price is not None
+        ):
+            if (
+                stock.limit_up_price is not None
+                and stock.last_price >= stock.limit_up_price - 1e-9
+            ):
+                reasons.append("确认日涨停不可买入")
+            if (
+                stock.limit_down_price is not None
+                and stock.last_price <= stock.limit_down_price + 1e-9
+            ):
+                reasons.append("确认日跌停不可买入")
         amount_count, average_amount = turnover_by_stock.get(stock.id, (0, 0.0))
         if amount_count < 20:
             reasons.append("20日成交额历史不足")
