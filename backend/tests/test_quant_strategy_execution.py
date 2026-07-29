@@ -733,6 +733,55 @@ def test_volume_price_confirmation_blocks_batch_when_fresh_quote_exceeds_risk_bu
         ) == 0
 
 
+def test_volume_price_confirmation_rechecks_risk_from_rounded_order_quantity(
+    tmp_path: Path,
+):
+    engine, current, config_ids = setup_runtime(tmp_path)
+    current = current.replace(hour=9, minute=43)
+    with Session(engine) as db:
+        config = db.get(
+            StrategyConfig,
+            config_ids["volume_price_confirmation"],
+        )
+        stock = db.scalar(select(Stock).where(Stock.symbol == "000001.SZ"))
+        stock.last_price = 27.31
+        stock.quote_updated_at = current
+        decision = decision_for(
+            db,
+            config,
+            current,
+            {stock.symbol: 0.10924},
+        )
+        add_volume_price_candidate(
+            db,
+            decision,
+            stock,
+            effective_stop=26.06,
+        )
+
+        run = execute_quant_rebalance(
+            db,
+            decision,
+            current=current,
+            dry_run=False,
+        )
+
+        order = db.scalar(
+            select(Order).where(Order.strategy_run_id == run.id)
+        )
+        assert order is not None, run.summary
+        fill = db.scalar(select(Fill).where(Fill.order_id == order.id))
+        account = db.get(
+            SimulationAccount,
+            config.simulation_account_id,
+        )
+        actual_risk = (
+            order.quantity * (fill.price - 26.06) / account.initial_cash
+        )
+        assert actual_risk <= 0.005
+        assert run.summary["precheck_passed"] is True
+
+
 def test_successful_rebalance_records_daily_performance(tmp_path: Path):
     engine, current, config_ids = setup_runtime(tmp_path)
     with Session(engine) as db:

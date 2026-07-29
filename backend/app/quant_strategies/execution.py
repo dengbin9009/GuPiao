@@ -396,6 +396,9 @@ def _volume_price_risk_recheck_reason(
     buy_plans = [plan for plan in plans if plan.side == "buy"]
     if not buy_plans:
         return None
+    account = db.get(SimulationAccount, decision.simulation_account_id)
+    if account is None or account.total_asset <= 0:
+        return "量价策略模拟账户总资产无效"
     rows = {
         row.stock_id: row
         for row in db.scalars(
@@ -420,9 +423,9 @@ def _volume_price_risk_recheck_reason(
         if plan.fill_price <= effective_stop:
             return f"{plan.symbol} 次日成交价已触及量价策略止损"
         position_risk = (
-            plan.target_weight
+            plan.quantity
             * (plan.fill_price - effective_stop)
-            / plan.fill_price
+            / float(account.total_asset)
         )
         if position_risk > risk_budget + 1e-9:
             return f"{plan.symbol} 次日价格使单笔风险超过0.5%"

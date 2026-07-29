@@ -127,7 +127,7 @@ QUANT_STRATEGY_SPECS: dict[str, QuantStrategySpec] = {
             pullback_volume_ratio=0.80,
         ),
         ("daily", "adjustment", "events"),
-        version="1.0.1",
+        version="1.0.2",
     ),
 }
 
